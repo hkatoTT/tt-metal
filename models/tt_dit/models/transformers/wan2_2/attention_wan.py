@@ -60,6 +60,11 @@ class WanAttention(Module):
         self.ccl_manager = ccl_manager
         self.parallel_config = parallel_config
         self.is_self = is_self
+        # WAN_CROSS_KV_CACHE=1: cross-attention K/V depend only on the prompt, which is the same tensor for every
+        # denoising step, so keep the post-norm K and head-split V per prompt tensor. Cleared through
+        # clear_cross_kv_cache() whenever the transformer prepares new text conditioning.
+        self._cross_kv_cache = {}
+        self._cross_kv_cache_enabled = os.environ.get("WAN_CROSS_KV_CACHE", "0") == "1"
 
         self.n_local_heads = self.num_heads // self.parallel_config.tensor_parallel.factor
 
@@ -197,6 +202,16 @@ class WanAttention(Module):
                     }
                 }
             )
+
+    def clear_cross_kv_cache(self) -> None:
+        self._cross_kv_cache.clear()
+
+    def set_cross_kv_cache_enabled(self, enabled: bool) -> None:
+        # Must be off under trace: a trace captured on a cache hit has no K/V ops, so a replay after the prompt
+        # buffer is overwritten in place would keep using the previous prompt's K/V.
+        self._cross_kv_cache_enabled = enabled
+        if not enabled:
+            self._cross_kv_cache.clear()
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "to_out.0", "to_out")
@@ -360,6 +375,18 @@ class WanAttention(Module):
         spatial_1BND: fractured N on SP, fractured D on TP
         """
 
+        def create_heads(inp):
+            out, _, _ = ttnn.experimental.nlp_create_qkv_heads(
+                inp,
+                num_heads=self.n_local_heads,
+                num_kv_heads=0,
+                transpose_k_heads=False,
+            )
+            return out
+
+        cross_kv_key = None  # set in the cross-attention branch when the K/V cache is enabled
+        cached_kv = None
+
         if rope_cos is not None:
             # If ROPE is given, this is self-attention
             assert rope_sin is not None
@@ -390,7 +417,10 @@ class WanAttention(Module):
                 compute_kernel_config=self.mm_compute_kernel_config,
                 parallel_config=None if use_nonfused_agmm else self.parallel_config,
             )
-            k_1BNF, v_1BNF = self.to_kv(kv_input, compute_kernel_config=self.mm_compute_kernel_config)
+            cross_kv_key = id(prompt_1BLP) if self._cross_kv_cache_enabled else None
+            cached_kv = self._cross_kv_cache.get(cross_kv_key) if cross_kv_key is not None else None
+            if cached_kv is None:
+                k_1BNF, v_1BNF = self.to_kv(kv_input, compute_kernel_config=self.mm_compute_kernel_config)
 
         # Set norm output dtype to the input dtype required for ring self-attn.
         sdpa_input_dtype = getattr(self, "_sdpa_input_dtype", None)
@@ -406,25 +436,20 @@ class WanAttention(Module):
             trans_mat=trans_mat,
             dtype=norm_output_dtype,
         )
-        k_BHNE = self.norm_k(
-            k_1BNF,
-            num_heads_per_device=self.n_local_heads,
-            rope_cos=rope_cos,
-            rope_sin=rope_sin,
-            trans_mat=trans_mat,
-            dtype=norm_output_dtype,
-        )
-
-        def create_heads(inp):
-            out, _, _ = ttnn.experimental.nlp_create_qkv_heads(
-                inp,
-                num_heads=self.n_local_heads,
-                num_kv_heads=0,
-                transpose_k_heads=False,
+        if cached_kv is None:
+            k_BHNE = self.norm_k(
+                k_1BNF,
+                num_heads_per_device=self.n_local_heads,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                trans_mat=trans_mat,
+                dtype=norm_output_dtype,
             )
-            return out
-
-        v_BHNE = create_heads(v_1BNF)
+            v_BHNE = create_heads(v_1BNF)
+            if cross_kv_key is not None:
+                self._cross_kv_cache[cross_kv_key] = (k_BHNE, v_BHNE)
+        else:
+            k_BHNE, v_BHNE = cached_kv
 
         if prompt_1BLP is None:
             # Self attention

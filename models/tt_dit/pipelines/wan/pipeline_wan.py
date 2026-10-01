@@ -710,6 +710,12 @@ class WanPipeline(PipelineAPIMixin):
 
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 
+        # Cross-attention K/V caching (WAN_CROSS_KV_CACHE=1) is only valid without trace.
+        cross_kv_cache = os.environ.get("WAN_CROSS_KV_CACHE", "0") == "1" and not traced
+        for model in (self.transformer, self.transformer_2):
+            if model is not None:
+                model.set_cross_kv_cache_enabled(cross_kv_cache)
+
         # 6. Denoising loop
         if effective_boundary_ratio is not None:
             boundary_timestep = effective_boundary_ratio * self._solver.schedule.num_train_timesteps

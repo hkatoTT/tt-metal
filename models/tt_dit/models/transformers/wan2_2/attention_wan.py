@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 import ttnn
@@ -23,7 +25,7 @@ class WanAttention(Module):
     # Map from (is_blackhole, sp_factor, tp_factor) -> (q_chunk_size, k_chunk_size)
     sdpa_chunk_size_map = {
         (False, 2, 4): (256, 256),
-        (False, 8, 4): (256, 256),
+        (False, 8, 4): (256, 512),  # WH Galaxy 4x8: 480p ring SDPA 14.69 -> 13.06 ms (swept 2026-09-30)
         (True, 2, 2): (128, 512),
         (True, 8, 4): (288, 512),
         (True, 32, 4): (224, 512),
@@ -134,6 +136,9 @@ class WanAttention(Module):
             ),
             self.default_sdpa_chunk_size,
         )
+        # WAN_SDPA_CHUNK="q,k" overrides the ring SDPA (q_chunk, k_chunk), e.g. for chunk sweeps.
+        if os.environ.get("WAN_SDPA_CHUNK"):
+            ring_sdpa_chunk_size = tuple(int(v) for v in os.environ["WAN_SDPA_CHUNK"].split(","))
 
         self.ring_sdpa_program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=self.sdpa_worker_grid,

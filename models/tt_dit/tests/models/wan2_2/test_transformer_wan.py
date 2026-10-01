@@ -258,6 +258,7 @@ def test_wan_transformer_block(
         ccl_manager=ccl_manager,
         parallel_config=parallel_config,
         is_fsdp=is_fsdp,
+        ffn_fsdp=os.environ.get("WAN_BLOCK_FFN_RESIDENT", "0") != "1",  # block-level WAN_FFN_RESIDENT
     )
     logger.info(f"Loading TT model from torch state dict...")
     start = time.time()

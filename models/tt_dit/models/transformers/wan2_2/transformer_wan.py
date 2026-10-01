@@ -49,6 +49,7 @@ class WanTransformerBlock(Module):
         ccl_manager: CCLManager | None = None,
         parallel_config: DiTParallelConfig,
         is_fsdp: bool = False,
+        ffn_fsdp: bool = True,
         sdpa_chunk_size_overrides: dict | None = None,
         lora_enabled: bool = False,
     ) -> None:
@@ -123,7 +124,8 @@ class WanTransformerBlock(Module):
             mesh_device=mesh_device,
             mesh_axis=parallel_config.tensor_parallel.mesh_axis,
             ccl_manager=ccl_manager,
-            fsdp_mesh_axis=fsdp_mesh_axis,
+            # ffn_fsdp=False keeps the FFN weights resident (TP-sharded only) to skip their per-layer gathers
+            fsdp_mesh_axis=fsdp_mesh_axis if ffn_fsdp else None,
             lora_enabled=lora_enabled,
         )
 
@@ -291,6 +293,7 @@ class WanTransformer3DModel(Module):
         ccl_manager: CCLManager | None = None,
         parallel_config: DiTParallelConfig,
         is_fsdp: bool = True,
+        ffn_fsdp: bool = True,
         model_type: str = "t2v",
         output_dtype: ttnn.DataType = ttnn.float32,
         lora_enabled: bool = False,
@@ -354,6 +357,7 @@ class WanTransformer3DModel(Module):
                 ccl_manager=ccl_manager,
                 parallel_config=parallel_config,
                 is_fsdp=is_fsdp,
+                ffn_fsdp=ffn_fsdp,
                 lora_enabled=lora_enabled,
             )
             for i in range(num_layers)
@@ -764,6 +768,11 @@ class WanCheckpoint:
     def state_dict(self) -> dict[str, torch.Tensor]:
         return dict(self._state_dict)
 
+    def _ffn_resident(self, is_fsdp: bool) -> bool:
+        # WAN_FFN_RESIDENT=<subfolder>[,<subfolder>] keeps that checkpoint's FFN weights resident (no FSDP on
+        # ff1/ff2) while the rest of the model stays FSDP. Costs ~2.3 GiB/device for a 14B transformer.
+        return is_fsdp and self._subfolder in os.environ.get("WAN_FFN_RESIDENT", "").split(",")
+
     def build(
         self,
         *,
@@ -794,6 +803,7 @@ class WanCheckpoint:
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
             is_fsdp=is_fsdp,
+            ffn_fsdp=not self._ffn_resident(is_fsdp),
             model_type=model_type,
             lora_enabled=lora_enabled,
         )
@@ -810,7 +820,8 @@ class WanCheckpoint:
         cache.load_model(
             tt_model=model,
             get_torch_state_dict=lambda: self._state_dict,
-            model_name=os.path.basename(self._name),
+            # resident FFN weights are cached with a different sharding, so they get their own cache entry
+            model_name=os.path.basename(self._name) + ("-ffnresident" if self._ffn_resident(is_fsdp) else ""),
             subfolder=self._subfolder,
             parallel_config=parallel_config,
             mesh_shape=tuple(mesh_device.shape),

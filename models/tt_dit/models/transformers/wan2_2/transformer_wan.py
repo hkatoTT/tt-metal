@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -604,6 +605,10 @@ class WanTransformer3DModel(Module):
 
         return spatial_out
 
+    def _synced_time(self) -> float:
+        ttnn.synchronize_device(self.mesh_device)
+        return time.perf_counter()
+
     def inner_step(
         self, spatial_1BNI, prompt_1BLP, rope_cos_1HND, rope_sin_1HND, trans_mat, N, timestep, gather_output=True
     ):
@@ -618,9 +623,15 @@ class WanTransformer3DModel(Module):
         Spatial input is a tensor with layout `1 B (patch_F patch_H patch_W) (pF pH pW C)`.
         Spatial output is an fp32 ttnn.Tensor on device with same layout.
         """
+        # WAN_STEP_TIMING=1: synced wall time of each section of one forward (adds device syncs)
+        marks = [self._synced_time()] if os.environ.get("WAN_STEP_TIMING", "0") == "1" else None
         temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
+        if marks:
+            marks.append(self._synced_time())
 
         spatial_1BND = self.patch_embedding(spatial_1BNI)
+        if marks:
+            marks.append(self._synced_time())
 
         for block in self.blocks:
             spatial_1BND = block(
@@ -632,6 +643,8 @@ class WanTransformer3DModel(Module):
                 rope_sin=rope_sin_1HND,
                 trans_mat=trans_mat,
             )
+        if marks:
+            marks.append(self._synced_time())
         scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
         shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)
 
@@ -652,6 +665,16 @@ class WanTransformer3DModel(Module):
         if gather_output:
             spatial_1BNI = self.ccl_manager.all_gather_persistent_buffer(
                 spatial_1BNI, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
+            )
+
+        if marks:
+            marks.append(self._synced_time())
+            temb_ms, patch_ms, blocks_ms, post_ms = ((b - a) * 1e3 for a, b in zip(marks, marks[1:]))
+            # print: logger.info from this module did not reach the perf-test log
+            print(
+                f"WAN_TIMING inner temb={temb_ms:.2f} patch={patch_ms:.2f} blocks={blocks_ms:.2f} "
+                f"post={post_ms:.2f} ms",
+                flush=True,
             )
 
         return spatial_1BNI

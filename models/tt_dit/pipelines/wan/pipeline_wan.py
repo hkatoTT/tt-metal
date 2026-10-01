@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -31,6 +33,21 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from diffusers.schedulers import SchedulerMixin
+
+
+def _log_dram(mesh_device, label: str) -> None:
+    """WAN_MEM_LOG=1: log per-device DRAM usage (allocated / free / largest contiguous free)."""
+    if os.environ.get("WAN_MEM_LOG", "0") != "1":
+        return
+    view = ttnn.get_memory_view(mesh_device, ttnn.BufferType.DRAM)
+    gib = 1024**3
+    logger.info(
+        f"WAN_MEM[{label}] allocated={view.total_bytes_allocated_per_bank * view.num_banks / gib:.3f} GiB "
+        f"free={view.total_bytes_free_per_bank * view.num_banks / gib:.3f} GiB "
+        f"largest_contiguous={view.largest_contiguous_bytes_free_per_bank * view.num_banks / gib:.3f} GiB "
+        f"(per device, {view.num_banks} banks)"
+    )
+
 
 _UNSET = object()  # sentinel for "use config default" in WanPipelineConfig.default
 
@@ -447,6 +464,7 @@ class WanPipeline(PipelineAPIMixin):
         self._prepare_transformer(0)
         self._prepare_text_encoder()
         self._vae.reload_weights()
+        _log_dram(self.mesh_device, "after_init")
 
         self._boundary_ratio = config.boundary_ratio
         self._expand_timesteps = config.expand_timesteps
@@ -765,6 +783,11 @@ class WanPipeline(PipelineAPIMixin):
                 else:
                     ttnn.copy(permuted_latent_tt, self.latent_buffer)
 
+                # WAN_STEP_TIMING=1: synced wall time per denoising step (adds a device sync per step)
+                step_timing = os.environ.get("WAN_STEP_TIMING", "0") == "1"
+                if step_timing:
+                    ttnn.synchronize_device(self.mesh_device)
+                    step_start = time.perf_counter()
                 permuted_latent_tt = self._step(
                     step=i,
                     t=t,
@@ -778,8 +801,13 @@ class WanPipeline(PipelineAPIMixin):
                     cfg_enabled=self._cfg_enabled,
                     traced=traced,
                 )
+                if step_timing:
+                    ttnn.synchronize_device(self.mesh_device)
+                    logger.info(f"WAN_TIMING step {i} total={(time.perf_counter() - step_start) * 1e3:.2f} ms")
 
                 progress_bar.update()
+                if i < 2:
+                    _log_dram(self.mesh_device, f"after_step{i}")
                 on_event(DenoiseStep(step=i + 1, total=num_inference_steps, sigma=self._solver.sigmas[i]))
 
         self._current_timestep = None

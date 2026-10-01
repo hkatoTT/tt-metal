@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import statistics
 
 import numpy as np
@@ -143,6 +144,14 @@ def wan_pipeline_metrics_condimg(mesh_device, width, height, model_type, topolog
     return pipeline_cls, image_prompt, expected_metrics
 
 
+# WAN_TRACED=1 traces the denoise loop on WH 4x8 too, which needs the trace region from DEVICE_PARAMS
+WH_4X8_DEVICE_PARAMS = (
+    {**DEVICE_PARAMS, **ring_params_req_exact_devices}
+    if os.environ.get("WAN_TRACED") == "1"
+    else ring_params_req_exact_devices
+)
+
+
 @pytest.mark.parametrize(
     "mesh_device, mesh_shape, sp_axis, tp_axis, num_links, dynamic_load, device_params, topology, is_fsdp, quant_config_name",
     [
@@ -152,7 +161,7 @@ def wan_pipeline_metrics_condimg(mesh_device, width, height, model_type, topolog
         # BH on 2x4 with dynamic_load to avoid init-time DRAM OOM
         [(2, 4), (2, 4), 1, 0, 2, True, line_params_req_exact_devices, ttnn.Topology.Linear, False, None],
         # WH on 4x8
-        [(4, 8), (4, 8), 1, 0, 4, False, ring_params_req_exact_devices, ttnn.Topology.Ring, True, None],
+        [(4, 8), (4, 8), 1, 0, 4, False, WH_4X8_DEVICE_PARAMS, ttnn.Topology.Ring, True, None],
         # BH (ring) on 4x8
         [(4, 8), (4, 8), 1, 0, 2, False, ring_params_8k_req_exact_devices, ttnn.Topology.Ring, False, None],
         # BH (linear) on 4x8
@@ -223,7 +232,8 @@ def test_pipeline_performance(
     """Performance test for Wan pipeline with detailed timing analysis."""
 
     benchmark_profiler = BenchmarkProfiler()
-    traced = mesh_shape == (4, 32)  # trace only for quadx32
+    # trace only for quadx32; WAN_TRACED=1 opts WH 4x8 in
+    traced = mesh_shape == (4, 32) or (mesh_shape == (4, 8) and os.environ.get("WAN_TRACED") == "1")
 
     # Skip 4U.
     if galaxy_type == "4U":
@@ -260,7 +270,7 @@ def test_pipeline_performance(
     ]
 
     num_frames = 81
-    num_inference_steps = 40
+    num_inference_steps = int(os.environ.get("WAN_PERF_STEPS", "40"))  # fewer steps for quick perf screening
 
     print(f"Parameters: {height}x{width}, {num_frames} frames, {num_inference_steps} steps")
 

@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import time
 
 import pytest
@@ -287,15 +288,18 @@ def test_wan_transformer_block(
     logger.info(
         f"Running TT model with spatial shape {tt_spatial.shape}, prompt shape {tt_prompt.shape}, rope_cos shape {tt_rope_cos.shape}, rope_sin shape {tt_rope_sin.shape}"
     )
-    tt_spatial_out = tt_model(
-        spatial_1BND=tt_spatial,
-        prompt_1BLP=tt_prompt,
-        temb_1BTD=tt_temb,
-        N=spatial_seq_len,
-        rope_cos=tt_rope_cos,
-        rope_sin=tt_rope_sin,
-        trans_mat=tt_trans_mat,
-    )
+    # WAN_BLOCK_TEST_ITERS=N runs the block N times back to back, so a device profile of the last
+    # iteration shows warm (host-ahead-of-device) timing.
+    for _ in range(int(os.environ.get("WAN_BLOCK_TEST_ITERS", "1"))):
+        tt_spatial_out = tt_model(
+            spatial_1BND=tt_spatial,
+            prompt_1BLP=tt_prompt,
+            temb_1BTD=tt_temb,
+            N=spatial_seq_len,
+            rope_cos=tt_rope_cos,
+            rope_sin=tt_rope_sin,
+            trans_mat=tt_trans_mat,
+        )
 
     spatial_concat_dims = [None, None]
     spatial_concat_dims[sp_axis] = 2

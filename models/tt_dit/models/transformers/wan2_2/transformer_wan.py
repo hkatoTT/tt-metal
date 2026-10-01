@@ -27,6 +27,7 @@ from ....layers.normalization import DistributedLayerNorm
 from ....parallel.config import DiTParallelConfig
 from ....parallel.manager import CCLManager
 from ....utils import cache
+from ....utils.matmul import resolves_fused_mmrs_config
 from ....utils.mochi import get_rot_transformation_mat
 from ....utils.padding import pad_vision_seq_parallel
 from ....utils.substate import pop_substate, rename_substate
@@ -237,6 +238,22 @@ class WanTransformerBlock(Module):
             spatial_ff_1BND = self.ffn(spatial_normed_1BND, compute_kernel_config=self.ff_compute_kernel_config)
             # spatial_1BND = spatial_1BND + spatial_ff_1BND * c_gate_msa_1B1D
             # NOTE: higher precision compute config in addcmul may be needed for correctness
+            spatial_1BND = ttnn.addcmul(spatial_1BND, spatial_ff_1BND, c_gate_msa_1B1D)
+        elif os.environ.get("WAN_FFN2_UNFUSED", "0") == "1" or not resolves_fused_mmrs_config(
+            spatial_normed_1BND.padded_shape[-2],
+            self.ffn_dim // self.parallel_config.tensor_parallel.factor,
+            self.dim,
+            self.mesh_device.compute_with_storage_grid_size(),
+        ):
+            # Unfused ff1 (AGMM) -> ff2 (matmul + reduce-scatter) -> addcmul when no measured or rule-derived
+            # fused MM+RS blocking resolves for this (M, K, N) on the device grid: the fused op's default
+            # fallback is slower than not fusing (Wan 480p on WH: 5.18 ms vs 3.19 ms). Same gate as MiniMax-H3.
+            # WAN_FFN2_UNFUSED=1 forces this path.
+            spatial_ff_1BND = self.ffn(
+                spatial_normed_1BND,
+                compute_kernel_config=self.ff_compute_kernel_config,
+                parallel_config=self.parallel_config,
+            )
             spatial_1BND = ttnn.addcmul(spatial_1BND, spatial_ff_1BND, c_gate_msa_1B1D)
         else:
             # Fused FFN + addcmul at the RS final write step (Phase 2).

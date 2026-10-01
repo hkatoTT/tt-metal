@@ -79,6 +79,11 @@ grid_1d_configs: dict[tuple[int, int, int, int, int], tuple[int, int, int]] = {
 # Known best blockings for 8x8 core grid for specific (M, K, N) shapes
 # Each value is a tuple: (M_block_size, K_block_size, N_block_size)
 grid_88_configs = {
+    # Wan2.2 T2V 480p on WH Galaxy 4x8 (SP=8, TP=4 -> 4096 rows/device), AGMM worker grid 8x8.
+    # sweep_mm_block_sizes.py on wh_4x8_ring, 2026-09-30 (rank 1 of each sweep).
+    (4096, 5120, 3840): (8, 8, 10, (2, 2)),  # to_qkv, 2228.0 us (default 8x8x8: 2317.6)
+    (4096, 5120, 1280): (8, 8, 5, (4, 1)),  # to_out (addcmul) 1184.2 us / cross to_q, to_out (plain) 986.4 us
+    (4096, 5120, 3456): (8, 10, 8, (2, 2)),  # ff1 + GELU, 2053.3 us (default: 2096.4)
     (32, 2432, 7296): (2, 4, 8),
     (1024, 2432, 3648): (4, 4, 16),
     (352, 2432, 3648): (2, 4, 8),
@@ -162,6 +167,8 @@ grid_88_configs = {
 # Known best blockings for 8x9 core grid for specific (M, K, N) shapes
 # Each value is a tuple: (M_block_size, K_block_size, N_block_size)
 grid_89_configs = {
+    # Wan2.2 T2V 480p on WH Galaxy 4x8: ff2 plain minimal_matmul (unfused path), 1881.1 us.
+    (4096, 3456, 5120): (8, 6, 10, (2, 2)),
     # MiniMax-H3 ff2, 15 s @ 768P, plain minimal_matmul on the WH Galaxy 8x9 grid (13664 rows/device): rank 2/322; (12, 7, 8) is 1.5% faster but not PCC-validated, so not landed.
     (13664, 3584, 5376): (8, 7, 10, (2, 2)),  # ff2, 6770.7 us
     (32, 2432, 3648): (2, 4, 8),
@@ -1006,6 +1013,9 @@ else:
 # core_grid: {MKN: mm_core_grid, M, K, N, sub_h, sub_w, num_buffers_per_channel, chunk_width_in_mm_blocks, num_workers_per_link}
 fused_mmrs_configs = {
     ttnn.CoreCoord(8, 9): {
+        # Wan2.2 T2V 480p on WH Galaxy 4x8: ff2 fused MM+RS+addcmul on an 8x7 matmul grid, 2757.3 us
+        # (sweep rank 1/162; 8x6 best 2786.7). Replaces the warned default fallback.
+        (4096, 3456, 5120): FusedMMRSConfig(ttnn.CoreCoord(8, 7), 6, 4, 10, 2, 2, None, 1),
         (9472, 5120, 1280): FusedMMRSConfig(ttnn.CoreCoord(8, 7), 8, 8, 8, 2, 2, None, 1),
     },
     ttnn.CoreCoord(12, 10): {

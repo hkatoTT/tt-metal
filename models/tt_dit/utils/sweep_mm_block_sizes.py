@@ -156,6 +156,17 @@ SHAPES = [
     (3072, 5120, 3840, 8, 8, True, "plain"),
     (3072, 5120, 1280, 8, 8, True, "plain"),
     (3072, 5120, 3456, 8, 8, True, "plain_gelu"),
+    # Wan2.2 T2V 480p on WH Galaxy 4x8 (wh_4x8_ring), SP=8 / TP=4: 32760 tokens / 8 -> 4096 rows/device.
+    # Use cases match the model: self-attn to_qkv (chunks=3), self-attn to_out (fused addcmul),
+    # cross-attn to_q / to_out (plain AGMM, same (M, K, N) as to_out), ff1 (fused GELU),
+    # ff2 unfused plain matmul on the full 8x9 grid, and fused MM+RS candidates for ff2.
+    (4096, 5120, 3840, 8, 8, True, "qkv"),
+    (4096, 5120, 1280, 8, 8, True, "to_out"),
+    (4096, 5120, 1280, 8, 8, True, "plain"),
+    (4096, 5120, 3456, 8, 8, True, "ff1_gelu"),
+    (4096, 3456, 5120, 8, 9, False, "ff2"),
+    (4096, 3456, 5120, 8, 7, False, "mmrs"),
+    (4096, 3456, 5120, 8, 6, False, "mmrs"),
     # MiniMax-H3 AGMM shapes, BH Galaxy TP=4 / SP=8, 12x9 grid (the model reserves one core column
     # for CCL). M is the per-device packed sequence length at 768P; 4736 is the 5s case (with the perf
     # gate's 39-token prompt -- these were 4768/9216/13632 from an audio-undercounting harness until

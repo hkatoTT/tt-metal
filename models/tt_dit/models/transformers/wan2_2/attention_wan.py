@@ -16,7 +16,7 @@ from ....layers.module import Module
 from ....layers.normalization import DistributedRMSNorm
 from ....parallel.config import DiTParallelConfig
 from ....parallel.manager import CCLManager
-from ....utils.matmul import get_matmul_config
+from ....utils.matmul import get_matmul_config, register_matmul_configs
 from ....utils.substate import pop_substate, rename_substate
 from ....utils.tensor import bf16_tensor
 
@@ -177,13 +177,26 @@ class WanAttention(Module):
         device_grid = self.mesh_device.compute_with_storage_grid_size()
         self.core_grid = ttnn.CoreGrid(x=device_grid.x, y=device_grid.y)
 
+        # WAN_MM_FP32_DEST=attn|all: accumulate the attention projections in bf16 dest instead of fp32.
+        # Off by default: 480p gains only 0.7% and the generated video visibly changes.
+        mm_fp32_dest = os.environ.get("WAN_MM_FP32_DEST", "") not in ("attn", "all")
         self.mm_compute_kernel_config = ttnn.init_device_compute_kernel_config(
             self.mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=True,
-            fp32_dest_acc_en=True,
+            fp32_dest_acc_en=mm_fp32_dest,
             packer_l1_acc=True,
         )
+        if not mm_fp32_dest:
+            # attention projection blockings re-swept with 4x2 subblocks (bf16 dest, WH 4x8, 480p)
+            register_matmul_configs(
+                {
+                    "8x8": {
+                        (4096, 5120, 3840): (8, 4, 10, (4, 2)),  # to_qkv 2103.7 us (fp32 dest: 2228.0)
+                        (4096, 5120, 1280): (8, 8, 6, (4, 2)),  # to_out 1159.9 / cross to_q, to_out 957.0 us
+                    }
+                }
+            )
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "to_out.0", "to_out")

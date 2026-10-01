@@ -27,7 +27,12 @@ from ....layers.normalization import DistributedLayerNorm
 from ....parallel.config import DiTParallelConfig
 from ....parallel.manager import CCLManager
 from ....utils import cache
-from ....utils.matmul import resolves_fused_mmrs_config
+from ....utils.matmul import (
+    FusedMMRSConfig,
+    register_fused_mmrs_configs,
+    register_matmul_configs,
+    resolves_fused_mmrs_config,
+)
 from ....utils.mochi import get_rot_transformation_mat
 from ....utils.padding import pad_vision_seq_parallel
 from ....utils.substate import pop_substate, rename_substate
@@ -146,13 +151,33 @@ class WanTransformerBlock(Module):
             dtype=ttnn.float32,
         )
 
+        # WAN_MM_FP32_DEST=ffn|all: accumulate the FFN matmuls in bf16 dest instead of fp32
+        ffn_fp32_dest = os.environ.get("WAN_MM_FP32_DEST", "") not in ("ffn", "all")
         self.ff_compute_kernel_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=False,
-            fp32_dest_acc_en=True,
+            fp32_dest_acc_en=ffn_fp32_dest,
             packer_l1_acc=True,
         )
+        if not ffn_fp32_dest:
+            # bf16 dest holds 8 tiles instead of 4, so the FFN blockings were re-swept with 4x2 subblocks
+            # (MM_SWEEP_FP32_DEST=0, WH 4x8, 480p). They are invalid with fp32 dest, hence registered only here.
+            register_matmul_configs(
+                {
+                    "8x8": {
+                        (4096, 5120, 3456): (8, 4, 14, (4, 2)),  # ff1 1916.8 us (fp32 dest: 2053.3)
+                    }
+                }
+            )
+            register_fused_mmrs_configs(
+                {
+                    ttnn.CoreCoord(8, 9): {
+                        # ff2 fused MM+RS 2307.7 us (fp32 dest: 2757.3)
+                        (4096, 3456, 5120): FusedMMRSConfig(ttnn.CoreCoord(8, 7), 8, 3, 10, 4, 2, None, 1),
+                    }
+                }
+            )
 
         device_grid = self.mesh_device.compute_with_storage_grid_size()
         self.core_grid = ttnn.CoreGrid(x=device_grid.x, y=device_grid.y)

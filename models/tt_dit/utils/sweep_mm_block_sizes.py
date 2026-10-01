@@ -571,7 +571,8 @@ USE_CASE_CONFIGS = {
 # match peak compute throughput — and among those, 2x2 is strictly preferred
 # over 4x1 / 1x4 (better tile reuse in the math LLK). So when fp32 dest is on
 # the subblock sweep is skipped entirely and 2x2 is picked (when divisible).
-FP32_DEST_ACC_EN = True
+FP32_DEST_ACC_EN = os.environ.get("MM_SWEEP_FP32_DEST", "1") != "0"  # MM_SWEEP_FP32_DEST=0: bf16 dest
+DEST_VOLUME = 4 if FP32_DEST_ACC_EN else 8  # max subblock h * w (dest tiles)
 
 # Block-size candidate methodology:
 # - M/N block:  even sizes in [MN_BLOCK_MIN, MN_BLOCK_MAX]  union  divisors of
@@ -728,7 +729,7 @@ def estimate_l1_kb(m_blk, k_blk, n_blk, use_case="plain", op_kind="mm"):
     return kb
 
 
-def pick_subblock(m_block, n_block, max_dest_volume=4):
+def pick_subblock(m_block, n_block, max_dest_volume=DEST_VOLUME):
     """Pick best valid (sb_h, sb_w) where sb_h|m_block, sb_w|n_block, sb_h*sb_w <= max_dest_volume.
 
     For fp32 dest, (2, 2) is strictly preferred among same-product candidates
@@ -759,7 +760,7 @@ def get_divisors(k_tiles):
     return get_k_block_candidates(k_tiles)
 
 
-def generate_subblock_combos(m_block, n_block, max_dest_volume=4):
+def generate_subblock_combos(m_block, n_block, max_dest_volume=DEST_VOLUME):
     """Return list of valid (sb_h, sb_w) pairs for given block sizes."""
     combos = []
     for h in range(1, min(m_block, max_dest_volume) + 1):
@@ -953,7 +954,7 @@ def _build_op_runner(cfg, mesh_device, M, K, N, dtype, is_agmm, uc_cfg, core_gri
         mesh_device.arch(),
         math_fidelity=ttnn.MathFidelity.HiFi2,
         math_approx_mode=uc_cfg.get("math_approx_mode", False),
-        fp32_dest_acc_en=True,
+        fp32_dest_acc_en=FP32_DEST_ACC_EN,
         packer_l1_acc=True,
     )
 

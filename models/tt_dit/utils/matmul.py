@@ -83,6 +83,9 @@ grid_88_configs = {
     # sweep_mm_block_sizes.py on wh_4x8_ring, 2026-09-30 (rank 1 of each sweep).
     (4096, 5120, 3840): (8, 8, 10, (2, 2)),  # to_qkv, 2228.0 us (default 8x8x8: 2317.6)
     (4096, 5120, 1280): (8, 8, 5, (4, 1)),  # to_out (addcmul) 1184.2 us / cross to_q, to_out (plain) 986.4 us
+    # CFG-batched rows (8192/device), 2026-10-01
+    (8192, 5120, 3840): (8, 10, 10, (2, 2)),  # to_qkv, 4398.0 us
+    (8192, 5120, 1280): (12, 8, 5, (4, 1)),  # to_out (addcmul) 2305.0 us / cross to_q, to_out (plain) 1873.7 us
     (4096, 5120, 3456): (8, 10, 8, (2, 2)),  # ff1 + GELU, 2053.3 us (default: 2096.4)
     (32, 2432, 7296): (2, 4, 8),
     (1024, 2432, 3648): (4, 4, 16),

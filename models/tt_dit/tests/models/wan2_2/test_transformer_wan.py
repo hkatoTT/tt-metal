@@ -161,6 +161,7 @@ COMMON_MESH_PARAMS = [
     [
         pytest.param(1, 31, 40, 80, 512, id="5b-720p"),
         pytest.param(1, 21, 60, 104, 512, id="14b-480p"),
+        pytest.param(2, 21, 60, 104, 512, id="14b-480p-b2"),  # CFG batching (cond + uncond in one forward)
         pytest.param(1, 21, 90, 160, 512, id="14b-720p"),
     ],
 )
@@ -216,6 +217,8 @@ def test_wan_transformer_block(
         temb_input = torch.randn((B, 6, DIM), dtype=torch.float32)
         rope_cos = torch.randn(B, spatial_seq_len, 1, HEAD_DIM // 2)
         rope_sin = torch.randn(B, spatial_seq_len, 1, HEAD_DIM // 2)
+        if B == 2:  # CFG batching: both passes share latent positions and timestep, only the text differs
+            rope_cos[1], rope_sin[1], temb_input[1] = rope_cos[0], rope_sin[0], temb_input[0]
         torch_rope_cos, torch_rope_sin = stack_cos_sin(rope_cos, rope_sin)
 
         logger.info(f"Running torch model with spatial shape {spatial_input.shape}, prompt shape {prompt_input.shape}")
@@ -276,18 +279,36 @@ def test_wan_transformer_block(
     spatial_padded = pad_vision_seq_parallel(spatial_input.unsqueeze(0), num_devices=sp_factor)
     rope_cos_padded = pad_vision_seq_parallel(rope_cos_stack, num_devices=sp_factor)
     rope_sin_padded = pad_vision_seq_parallel(rope_sin_stack, num_devices=sp_factor)
+    cfg_batch = B == 2  # mirror inner_step_cfg: rows of both passes stacked per device, one rope, prompt pair
+    if cfg_batch:
+        Np = spatial_padded.shape[2]
+        n_local = Np // sp_factor
+        # global [1, 1, 2 * Np, D] whose SP shard i is [batch-0 rows of shard i; batch-1 rows of shard i]
+        spatial_padded = (
+            spatial_padded[0].reshape(2, sp_factor, n_local, DIM).permute(1, 0, 2, 3).reshape(1, 1, 2 * Np, DIM)
+        )
+        rope_cos_padded = rope_cos_padded[:1]
+        rope_sin_padded = rope_sin_padded[:1]
 
     # Create TT tensors
     tt_spatial = bf16_tensor_2dshard(spatial_padded, device=mesh_device, shard_mapping={sp_axis: 2, tp_axis: 3})
-    tt_prompt = bf16_tensor(prompt_input.unsqueeze(0), device=mesh_device)
-    tt_temb = from_torch(temb_input.unsqueeze(0), device=mesh_device, dtype=ttnn.float32, mesh_axes=[..., tp_axis])
+    if cfg_batch:
+        tt_prompt = tuple(bf16_tensor(prompt_input[i : i + 1].unsqueeze(0), device=mesh_device) for i in range(2))
+        tt_temb = from_torch(
+            temb_input[:1].unsqueeze(0), device=mesh_device, dtype=ttnn.float32, mesh_axes=[..., tp_axis]
+        )
+        tt_model.attn1._cfg_batch = 2
+        tt_model.attn2._cfg_batch = 2
+    else:
+        tt_prompt = bf16_tensor(prompt_input.unsqueeze(0), device=mesh_device)
+        tt_temb = from_torch(temb_input.unsqueeze(0), device=mesh_device, dtype=ttnn.float32, mesh_axes=[..., tp_axis])
     tt_rope_cos = from_torch(rope_cos_padded, device=mesh_device, dtype=ttnn.float32, mesh_axes=[..., sp_axis, None])
     tt_rope_sin = from_torch(rope_sin_padded, device=mesh_device, dtype=ttnn.float32, mesh_axes=[..., sp_axis, None])
     tt_trans_mat = bf16_tensor(get_rot_transformation_mat(), device=mesh_device)
 
     # Run TT model
     logger.info(
-        f"Running TT model with spatial shape {tt_spatial.shape}, prompt shape {tt_prompt.shape}, rope_cos shape {tt_rope_cos.shape}, rope_sin shape {tt_rope_sin.shape}"
+        f"Running TT model with spatial shape {tt_spatial.shape}, prompt shape {getattr(tt_prompt, 'shape', 'pair')}, rope_cos shape {tt_rope_cos.shape}, rope_sin shape {tt_rope_sin.shape}"
     )
     # WAN_BLOCK_TEST_ITERS=N runs the block N times back to back, so a device profile of the last
     # iteration shows warm (host-ahead-of-device) timing.
@@ -311,7 +332,9 @@ def test_wan_transformer_block(
             mesh_device, dims=spatial_concat_dims, mesh_shape=tuple(mesh_device.shape)
         ),
     )
-    tt_spatial_out = tt_spatial_out[:, :, :spatial_seq_len, :]
+    if cfg_batch:  # back to [2, Np, D] in batch order
+        tt_spatial_out = tt_spatial_out.reshape(sp_factor, 2, n_local, DIM).permute(1, 0, 2, 3).reshape(2, Np, DIM)
+    tt_spatial_out = tt_spatial_out[..., :spatial_seq_len, :]
 
     assert_quality(torch_spatial_out, tt_spatial_out, pcc=MIN_PCC, relative_rmse=MAX_RMSE)
 

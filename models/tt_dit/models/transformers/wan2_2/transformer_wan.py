@@ -167,6 +167,7 @@ class WanTransformerBlock(Module):
                 {
                     "8x8": {
                         (4096, 5120, 3456): (8, 4, 14, (4, 2)),  # ff1 1916.8 us (fp32 dest: 2053.3)
+                        (8192, 5120, 3456): (8, 5, 14, (4, 2)),  # ff1, CFG-batched rows: 3622.6 us
                     }
                 }
             )
@@ -175,6 +176,8 @@ class WanTransformerBlock(Module):
                     ttnn.CoreCoord(8, 9): {
                         # ff2 fused MM+RS 2307.7 us (fp32 dest: 2757.3)
                         (4096, 3456, 5120): FusedMMRSConfig(ttnn.CoreCoord(8, 7), 8, 3, 10, 4, 2, None, 1),
+                        # ff2, CFG-batched rows: 4129.9 us
+                        (8192, 3456, 5120): FusedMMRSConfig(ttnn.CoreCoord(8, 7), 8, 3, 10, 4, 2, None, 1),
                     }
                 }
             )
@@ -732,6 +735,73 @@ class WanTransformer3DModel(Module):
 
         return spatial_1BNI
 
+    def inner_step_cfg(
+        self,
+        spatial_1BNI,
+        prompt_1BLP,
+        negative_prompt_1BLP,
+        rope_cos_1HND,
+        rope_sin_1HND,
+        trans_mat,
+        N,
+        timestep,
+        gather_output=True,
+    ):
+        """inner_step for the cond and uncond passes of classifier-free guidance at once.
+
+        Both passes share the latent and the timestep and differ only in the text, so the per-device spatial
+        rows of the two passes are stacked into one [1, 1, 2n, D] tensor: every row-wise op (norms, projections,
+        FFN) runs once on 2n rows, with one FSDP weight gather instead of two. WanAttention splits the passes
+        again where needed (blocks see `_cfg_batch == 2`). Returns (cond, uncond), each laid out like inner_step's.
+        """
+        temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
+        spatial_1BND = self.patch_embedding(spatial_1BNI)
+        spatial_1BND = ttnn.concat([spatial_1BND, spatial_1BND], dim=2)
+
+        for block in self.blocks:
+            block.attn1._cfg_batch = 2
+            block.attn2._cfg_batch = 2
+        try:
+            for block in self.blocks:
+                spatial_1BND = block(
+                    spatial_1BND=spatial_1BND,
+                    prompt_1BLP=(prompt_1BLP, negative_prompt_1BLP),
+                    temb_1BTD=timestep_proj_1BTD,
+                    N=N,
+                    rope_cos=rope_cos_1HND,
+                    rope_sin=rope_sin_1HND,
+                    trans_mat=trans_mat,
+                )
+        finally:
+            for block in self.blocks:
+                block.attn1._cfg_batch = 1
+                block.attn2._cfg_batch = 1
+
+        scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
+        shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)
+        spatial_norm_1BND = self.norm_out(
+            spatial_1BND, dynamic_weight=(1 + scale_11BD), dynamic_bias=shift_11BD, dtype=ttnn.float32
+        )
+        if self.parallel_config.tensor_parallel.factor > 1:
+            spatial_norm_1BND = self.ccl_manager.all_gather_persistent_buffer(
+                spatial_norm_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
+            )
+        spatial_1BNI = self.proj_out(
+            spatial_norm_1BND, compute_kernel_config=self.hifi4_compute_kernel_config, dtype=self.output_dtype
+        )
+
+        n = spatial_1BNI.shape[2] // 2
+        c = spatial_1BNI.shape[3]
+        outs = []
+        for lo in (0, n):
+            half = ttnn.slice(spatial_1BNI, [0, 0, lo, 0], [1, 1, lo + n, c])
+            if gather_output:
+                half = self.ccl_manager.all_gather_persistent_buffer(
+                    half, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
+                )
+            outs.append(half)
+        return outs[0], outs[1]
+
     # Prep run is False because we warmup the entire pipeline first. Remove if this is not desired.
     @traced_function(device=lambda self: self.mesh_device, clone_prep_inputs=False, prep_run=False)
     def combined_step(
@@ -749,6 +819,24 @@ class WanTransformer3DModel(Module):
         *,
         gather_output: bool = True,
     ) -> ttnn.Tensor:
+        # CFG batching (WAN_CFG_BATCH, on by default; WAN_CFG_BATCH=0 runs cond / uncond as two forwards).
+        # Not bit-identical to the two-forward path: the 8192-row matmuls use other blockings (another
+        # accumulation order), and over 40 steps this shifts the composition a little at equal quality.
+        # Use WAN_CFG_BATCH=0 when comparing against videos generated without it.
+        if do_classifier_free_guidance and os.environ.get("WAN_CFG_BATCH", "1") == "1":
+            cond, uncond = self.inner_step_cfg(
+                spatial_1BNI,
+                prompt_1BLP,
+                negative_prompt_1BLP,
+                rope_cos_1HND,
+                rope_sin_1HND,
+                trans_mat,
+                N,
+                timestep,
+                gather_output=gather_output,
+            )
+            return ttnn.lerp(uncond, cond, guidance_scale)
+
         cond = self.inner_step(
             spatial_1BNI,
             prompt_1BLP,

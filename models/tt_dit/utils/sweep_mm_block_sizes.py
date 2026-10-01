@@ -167,6 +167,12 @@ SHAPES = [
     (4096, 3456, 5120, 8, 9, False, "ff2"),
     (4096, 3456, 5120, 8, 7, False, "mmrs"),
     (4096, 3456, 5120, 8, 6, False, "mmrs"),
+    # CFG-batched Wan2.2 480p on WH 4x8: cond + uncond rows stacked per device -> 8192 rows/device.
+    (8192, 5120, 3456, 8, 8, True, "ff1_gelu"),
+    (8192, 3456, 5120, 8, 7, False, "mmrs"),
+    (8192, 5120, 3840, 8, 8, True, "qkv"),
+    (8192, 5120, 1280, 8, 8, True, "to_out"),
+    (8192, 5120, 1280, 8, 8, True, "plain"),
     # MiniMax-H3 AGMM shapes, BH Galaxy TP=4 / SP=8, 12x9 grid (the model reserves one core column
     # for CCL). M is the per-device packed sequence length at 768P; 4736 is the 5s case (with the perf
     # gate's 39-token prompt -- these were 4768/9216/13632 from an audio-undercounting harness until

@@ -132,6 +132,15 @@ class WanAttention(Module):
         )
 
         self.sdpa_worker_grid = (full_grid.x - 1, full_grid.y)  # Reserve last column for CCL
+        # The CFG head fold (see forward) runs one 2H-head ring SDPA. On WH 4x8 480p its 2 x 10 x 16 = 320 Q chunks
+        # split evenly over 8x8 workers (5 per core) with the ring all-gather workers on the last row, while 7x9
+        # leaves some cores one chunk more: ring SDPA 24.08 -> 22.39 ms per block, 40 steps 81.82 -> 77.96 s.
+        # Only for the fold: two 10-head calls on 8x8 are slower than on 7x9. WAN_CFG_HEADFOLD_GRID="x,y" overrides.
+        fold_grid = os.environ.get("WAN_CFG_HEADFOLD_GRID")
+        self.fold_sdpa_worker_grid = (
+            tuple(int(v) for v in fold_grid.split(",")) if fold_grid else (full_grid.x, full_grid.y - 1)
+        )
+        self.fold_ccl_row_major = self.fold_sdpa_worker_grid[1] < full_grid.y
         chunk_lookup = {**self.sdpa_chunk_size_map, **(sdpa_chunk_size_overrides or {})}
         ring_sdpa_chunk_size = chunk_lookup.get(
             (
@@ -145,11 +154,16 @@ class WanAttention(Module):
         if os.environ.get("WAN_SDPA_CHUNK"):
             ring_sdpa_chunk_size = tuple(int(v) for v in os.environ["WAN_SDPA_CHUNK"].split(","))
 
-        self.ring_sdpa_program_config = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=self.sdpa_worker_grid,
+        ring_sdpa_config_args = dict(
             q_chunk_size=ring_sdpa_chunk_size[0],
             k_chunk_size=ring_sdpa_chunk_size[1],
             exp_approx_mode=False,  # NOTE: False is more correct
+        )
+        self.ring_sdpa_program_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.sdpa_worker_grid, **ring_sdpa_config_args
+        )
+        self.ring_sdpa_program_config_fold = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.fold_sdpa_worker_grid, **ring_sdpa_config_args
         )
 
         self.use_exp_ring_sdpa = (
@@ -391,6 +405,11 @@ class WanAttention(Module):
         # 2n rows; attention runs on [2, H, n, E].
         cfg_batch = getattr(self, "_cfg_batch", 1)
         prompt_pair = prompt_1BLP if isinstance(prompt_1BLP, tuple) else None
+        # Self-attention folds the two passes into the head dim instead ([1, 2H, n, E], B=1): attention is per head,
+        # so this is exact, keeps one ring SDPA call with its B=1 K/V chains, and the layout change is a free reshape
+        # of the head-split norm output (no permute / slice / concat). On by default; WAN_CFG_HEADFOLD=0 attends the
+        # two passes as [2, H, n, E], one ring SDPA call each.
+        head_fold = cfg_batch == 2 and self.is_self and os.environ.get("WAN_CFG_HEADFOLD", "1") == "1"
 
         def rows_to_dim1(t):
             # [1, 1, 2n, F] -> [1, 2, n, F], the batched layout the fused distributed RMSNorm accepts (view)
@@ -405,6 +424,8 @@ class WanAttention(Module):
             if cfg_batch != 2:
                 return t
             h, n2, e = t.shape[1], t.shape[2], t.shape[3]
+            if head_fold:
+                return ttnn.reshape(t, (1, 2 * h, n2 // 2, e))
             return ttnn.permute(ttnn.reshape(t, (h, 2, n2 // 2, e)), (1, 0, 2, 3))
 
         if rope_cos is not None:
@@ -428,7 +449,8 @@ class WanAttention(Module):
                 compute_kernel_config=self.mm_compute_kernel_config,
                 parallel_config=None if use_nonfused_agmm else self.parallel_config,
             )
-            q_1BNF, k_1BNF, v_1BNF = rows_to_dim1(q_1BNF), rows_to_dim1(k_1BNF), rows_to_dim0(v_1BNF)
+            q_1BNF, k_1BNF = rows_to_dim1(q_1BNF), rows_to_dim1(k_1BNF)
+            v_1BNF = v_1BNF if head_fold else rows_to_dim0(v_1BNF)
         else:
             # Cross-attention: Q from spatial, fused KV from prompt
             assert prompt_1BLP is not None
@@ -487,6 +509,8 @@ class WanAttention(Module):
                 )
             )
             v_BHNE = create_heads(v_1BNF)
+            if head_fold:  # [1, H, 2n, E] -> [1, 2H, n, E], same head order as q / k
+                v_BHNE = ttnn.reshape(v_BHNE, (1, 2 * v_BHNE.shape[1], v_BHNE.shape[2] // 2, v_BHNE.shape[3]))
             if cross_kv_key is not None:
                 self._cross_kv_cache[cross_kv_key] = (k_BHNE, v_BHNE)
         else:
@@ -497,6 +521,12 @@ class WanAttention(Module):
             if self.parallel_config.sequence_parallel.factor > 1:
                 # Q and K already cast by norm kernel; cast V and dummy joint inputs to match
                 dummy_joint = self.dummy_joint_input
+                if head_fold:
+                    if getattr(self, "_dummy_joint_input_fold", None) is None:
+                        self._dummy_joint_input_fold = bf16_tensor(
+                            torch.zeros((1, 2 * self.n_local_heads, 0, self.head_dim)), device=self.mesh_device
+                        )
+                    dummy_joint = self._dummy_joint_input_fold
                 if sdpa_input_dtype is not None:
                     if v_BHNE.dtype != sdpa_input_dtype:
                         v_BHNE = ttnn.typecast(v_BHNE, sdpa_input_dtype)
@@ -504,6 +534,8 @@ class WanAttention(Module):
                         dummy_joint = ttnn.typecast(dummy_joint, sdpa_input_dtype)
 
                 # HACK: pass null joint inputs to take advantage of ring attention, even though this is self-attention.
+                fold_ccl_row_major = head_fold and self.fold_ccl_row_major
+
                 def ring_sdpa(q, k, v):
                     if self.use_exp_ring_sdpa:
                         out, _, _ = ttnn.transformer.exp_ring_joint_scaled_dot_product_attention(
@@ -551,7 +583,9 @@ class WanAttention(Module):
                             ),
                             joint_strategy="rear",
                             logical_n=N,
-                            program_config=self.ring_sdpa_program_config,
+                            program_config=(
+                                self.ring_sdpa_program_config_fold if head_fold else self.ring_sdpa_program_config
+                            ),
                             compute_kernel_config=self.sdpa_compute_kernel_config,
                             dim=2,
                             multi_device_global_semaphore=self.ccl_manager.get_ag_ping_pong_semaphore(
@@ -562,12 +596,16 @@ class WanAttention(Module):
                             mesh_device=self.mesh_device,
                             topology=self.ccl_manager.topology,
                             subdevice_id=self.ccl_manager.ccl_sub_device_id,
-                            ccl_core_grid_offset=(self.sdpa_worker_grid[0], 0),
-                            use_column_major_ccl=True,
+                            ccl_core_grid_offset=(
+                                (0, self.fold_sdpa_worker_grid[1])
+                                if fold_ccl_row_major
+                                else ((self.fold_sdpa_worker_grid if head_fold else self.sdpa_worker_grid)[0], 0)
+                            ),
+                            use_column_major_ccl=not fold_ccl_row_major,
                         )
                     return out
 
-                if cfg_batch == 2:
+                if cfg_batch == 2 and not head_fold:
                     # Ring SDPA with batch 2 takes ~4x a batch-1 call, not 2x: its K/V store-and-forward chains
                     # are only built for B == 1. So attend the cond and uncond passes one at a time.
                     halves = []
@@ -601,6 +639,10 @@ class WanAttention(Module):
                 compute_kernel_config=self.sdpa_compute_kernel_config,
             )
 
+        if head_fold:  # [1, 2H, n, E] -> [1, H, 2n, E]: rows come out cond-then-uncond like the input
+            spatial_BHNE = ttnn.reshape(
+                spatial_BHNE, (1, spatial_BHNE.shape[1] // 2, spatial_BHNE.shape[2] * 2, spatial_BHNE.shape[3])
+            )
         spatial_1BND = ttnn.transformer.concatenate_heads(spatial_BHNE)
         spatial_1BND = ttnn.unsqueeze(spatial_1BND, 0)
         if cfg_batch == 2:  # [1, 2, n, D] -> [1, 1, 2n, D], back to the stacked rows

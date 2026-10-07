@@ -90,6 +90,9 @@ ALWI void sdpa_matmul_block_no_mop(
     uint32_t ct_dim,
     uint32_t rt_dim,
     uint32_t kt_dim) {
+#ifdef HK_SKIP_MM
+    return;
+#endif
     if constexpr (sdpa_matmul_fidelity_set) {
         matmul_block_no_mop_fidelity<sdpa_matmul_fidelity>(
             in0_cb, in1_cb, in0_index, in1_index, idst, transpose, ct_dim, rt_dim, kt_dim);
@@ -623,7 +626,11 @@ void sub_exp_block_bcast_cols(
         constexpr VectorMode vector_mode_exp = VectorMode::None;
         for (uint32_t i = 0; i < tiles_per_row; i++) {
             for (uint32_t j = 0; j < tiles_per_column; j++) {
+#ifndef HK_SKIP_EXP
                 exp_packthread_tile<true, false, InputClamping::None, iterations>(dst_index++, vector_mode_exp);
+#else
+                dst_index++;
+#endif
             }
         }
         PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));

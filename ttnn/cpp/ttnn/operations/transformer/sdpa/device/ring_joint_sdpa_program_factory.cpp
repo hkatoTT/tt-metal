@@ -1914,6 +1914,14 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     defines["DHT_GRANULARITY"] = std::to_string(dht_granularity);
     defines["REDUCE_GRANULARITY"] = std::to_string(reduce_granularity);
     defines["EXP_APPROX_MODE"] = std::to_string(exp_approx_mode);
+    if (const char* hk_skip = std::getenv("TT_RING_SDPA_HK_SKIP")) {  // TIMING-ONLY (hkato)
+        if (std::string(hk_skip).find("mm") != std::string::npos) {
+            defines["HK_SKIP_MM"] = "1";
+        }
+        if (std::string(hk_skip).find("exp") != std::string::npos) {
+            defines["HK_SKIP_EXP"] = "1";
+        }
+    }
     if (args.program_config.has_value() && args.program_config->matmul_math_fidelity.has_value()) {
         TT_FATAL(use_streaming_compute, "matmul_math_fidelity needs the streaming compute path (fp32_dest_acc_en=false)");
         defines["SDPA_MATMUL_FIDELITY"] =
@@ -2780,6 +2788,7 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         reader_compile_time_args.size(), writer_compile_time_args.size(), compute_compile_time_args.size()};
 
     // Build static MHA/shared-K V head chains. GQA uses KV-head-grouped chains instead.
+    uint32_t mcast_chains = 0;  // (hkato) declared here so the Q-interleave mcast groups can set it
     // EXPERIMENT (hkato): Q interleave, see q_chunk_remapping.hpp. Every core owns the same number P of chunks,
     // core c computes chunks c, c+C, ... so in pass p the cores [g*Nq, (g+1)*Nq) all work on head p*(C/Nq)+g.
     const char* q_interleave_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE");
@@ -2823,6 +2832,35 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
                 "Q interleave: chain build failed at core {}",
                 c0);
         }
+        const char* qil_mcast_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE_MCAST");
+        if (qil_mcast_env != nullptr && std::string(qil_mcast_env) == "1" && chain_len % grid_size.x == 0) {
+            const uint32_t rows_per_group = chain_len / grid_size.x;
+            for (uint32_t c0 = 0; c0 < num_cores; c0 += chain_len) {
+                const uint32_t y0 = c0 / grid_size.x;
+                // The reader runs on NoC1 (both the default reader config and TT_RING_SDPA_READER_NOC1), whose
+                // multicast rectangle goes from the high corner to the low corner.
+                const CoreCoord rect_start =
+                    device->worker_core_from_logical_core(CoreCoord{grid_size.x - 1, y0 + rows_per_group - 1});
+                const CoreCoord rect_end = device->worker_core_from_logical_core(CoreCoord{0, y0});
+                const uint32_t injector_idx = c0;
+                const CoreCoord injector_phys = core_work[injector_idx].physical_core;
+                for (uint32_t ci = c0; ci < c0 + chain_len; ++ci) {
+                    auto& cfg = head_chain_configs[ci];
+                    cfg.participates = true;
+                    cfg.mcast_start = rect_start;
+                    cfg.mcast_end = rect_end;
+                    cfg.injector_physical = injector_phys;
+                    cfg.prev_physical = CoreCoord{0, 0};
+                    cfg.next_physical = CoreCoord{0, 0};
+                    cfg.is_injector = (ci == injector_idx);
+                    cfg.is_sink = !cfg.is_injector;
+                    cfg.mcast_num_dests = cfg.is_injector ? chain_len - 1 : 0;
+                    cfg.next_core_q_chunks = cfg.is_injector ? q_interleave_per_core : 0;
+                }
+                mcast_chains++;
+            }
+            log_info(tt::LogOp, "Ring joint Q interleave mcast: {} groups of {} cores", mcast_chains, chain_len);
+        }
     }
     if (use_head_chain && build_kv_chains && !q_interleave) {
         for (uint32_t head_id = 0; head_id < static_cast<uint32_t>(head_segments.size()); ++head_id) {
@@ -2841,7 +2879,6 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     }
 
     // Check query-head chain multicast eligibility and configure mcast for eligible chains.
-    uint32_t mcast_chains = 0;
     if (use_head_chain && build_kv_chains && !q_interleave) {
         struct McastCandidate {
             std::vector<uint32_t> core_indices;

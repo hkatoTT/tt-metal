@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "dit_fused_distributed_rmsnorm_device_operation.hpp"
 
 #include <tt-metalium/constants.hpp>
@@ -71,7 +72,8 @@ void DitFusedDistributedRmsnormDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(input.buffer() != nullptr, "Input must be allocated");
     TT_FATAL(input.layout() == Layout::TILE, "Input layout must be TILE, got {}", input.layout());
     TT_FATAL(
-        input.dtype() == DataType::BFLOAT16 || input.dtype() == DataType::FLOAT32,
+        input.dtype() == DataType::BFLOAT16 || input.dtype() == DataType::FLOAT32 ||
+            (input.dtype() == DataType::BFLOAT8_B && std::getenv("TT_DIT_RMSNORM_ALLOW_BF8") != nullptr),
         "Input dtype must be BFLOAT16 or FLOAT32, got {}",
         input.dtype());
 

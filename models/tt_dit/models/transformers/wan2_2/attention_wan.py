@@ -463,6 +463,7 @@ class WanAttention(Module):
                 spatial_1BND,
                 compute_kernel_config=self.mm_compute_kernel_config,
                 parallel_config=None if use_nonfused_agmm else self.parallel_config,
+                dtype=ttnn.bfloat8_b if os.environ.get("WAN_QKV_OUT_BF8") == "1" else None,  # EXPERIMENT
             )
             q_1BNF, k_1BNF = rows_to_dim1(q_1BNF), rows_to_dim1(k_1BNF)
             v_1BNF = v_1BNF if head_fold else rows_to_dim0(v_1BNF)

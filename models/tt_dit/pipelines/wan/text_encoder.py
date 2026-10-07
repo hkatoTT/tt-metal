@@ -84,7 +84,8 @@ class TextEncoder:
     def prepare(self) -> None:
         cache.load_model(
             self._tt_encoder,
-            model_name=os.path.basename(self._checkpoint_name),
+            model_name=os.path.basename(self._checkpoint_name)
+            + ("-embshard" if os.environ.get("WAN_ENC_EMB_SHARD") == "1" else ""),
             subfolder="text_encoder",
             parallel_config=self._encoder_parallel_config,
             mesh_shape=tuple(self._device.shape),

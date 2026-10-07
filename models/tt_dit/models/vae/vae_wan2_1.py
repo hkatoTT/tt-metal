@@ -102,7 +102,9 @@ class WanAttentionBlock(Module):
         self.mesh_device = mesh_device
         self.parallel_config = parallel_config
         self.ccl_manager = ccl_manager
-        self.sdpa_t_fracture_w_only = sdpa_t_fracture_w_only
+        self.sdpa_t_fracture_w_only = (
+            sdpa_t_fracture_w_only or os.environ.get("WAN_VAE_SDPA_W_ONLY") == "1"
+        )  # EXPERIMENT (hkato)
 
         self.norm = RMSNorm(
             embedding_dim=dim,
@@ -2090,6 +2092,17 @@ class WanVAEDecoderAdapter:
 
     @torch.no_grad()
     def decode(self, latents: torch.Tensor, *, output_type: str) -> torch.Tensor:
+        import time as _hk_time  # EXPERIMENT (hkato): WAN_VAE_TIMING=1 section timing
+
+        _hk_t = os.environ.get("WAN_VAE_TIMING") == "1"
+        _hk_m = []
+
+        def _hk_mark(name):
+            if _hk_t:
+                ttnn.synchronize_device(self.device)
+                _hk_m.append((name, _hk_time.perf_counter()))
+
+        _hk_mark("start")
         latents = latents.to(self._torch_vae.dtype)
         latents = latents * self._latents_std + self._latents_mean
 
@@ -2105,10 +2118,13 @@ class WanVAEDecoderAdapter:
             dtype=self._decoder.dtype,
         )
 
+        _hk_mark("input")
         self.reload_weights()
+        _hk_mark("reload")
         tt_video_BCTHW, new_logical_h, new_logical_w = self._decoder(
             tt_latents_BTHWC, logical_h, t_chunk_size=self._t_chunk_size, logical_w=logical_w
         )
+        _hk_mark("decoder")
 
         concat_dims = [None, None]
         concat_dims[self._parallel_config.height_parallel.mesh_axis] = 3
@@ -2131,6 +2147,14 @@ class WanVAEDecoderAdapter:
             permute=d2h_permute,
         )
 
+        _hk_mark("d2h")
+        if _hk_t:
+            print(
+                "WAN_VAE_TIMING "
+                + " ".join("%s=%.1f" % (b[0], (b[1] - a[1]) * 1e3) for a, b in zip(_hk_m, _hk_m[1:]))
+                + " ms",
+                flush=True,
+            )
         if d2h_permute is not None:
             # Output is (B, T, H, W, C) — trim height and width.
             return video_torch[:, :, :new_logical_h, :new_logical_w, :]

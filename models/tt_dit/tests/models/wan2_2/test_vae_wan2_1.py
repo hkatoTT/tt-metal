@@ -1746,8 +1746,9 @@ def test_wan_decoder(
     [
         (1, 16, 7, 60, 104, 480, 832, 7, True),
         (1, 16, 21, 90, 160, 720, 1280, 21, False),
+        (1, 16, 3, 60, 104, 480, 832, 3, True),  # EXPERIMENT (hkato): WAN_VAE_T_CHUNK=3, one chunk
     ],
-    ids=["480p_t7_cached", "720p_t21_fullT"],
+    ids=["480p_t7_cached", "720p_t21_fullT", "480p_t3_cached"],
 )
 @pytest.mark.parametrize(
     "mesh_device, h_axis, w_axis, num_links",

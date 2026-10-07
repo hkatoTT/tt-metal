@@ -1286,3 +1286,61 @@ def test_collect_baseline(mesh_device, mesh_shape):
             f.flush()
 
     print(f"\nBaseline: {n_ok}/{n} shapes measured. Saved to {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# WH Galaxy 4x8, 480p, cached t_chunk_size=3 (WAN_VAE_T_CHUNK=3)  (EXPERIMENT, hkato)
+# Per-device (H,W): stage0(15,13) stage1(30,26) stage2(60,52) stage3(120,104); +2 halo.
+# Stage T: T_res 5 / 8 / 14 / 14, T_spatial 6 / 12 / 12.
+# ---------------------------------------------------------------------------
+_SWEEP_LAYERS_WH_H4W8_480P_T3 = [
+    # (name, C_in, C_out, kernel, stride, padding, T, H, W, h, w) -- most-to-least compute
+    ("up3_res", 96, 96, (3, 3, 3), (1, 1, 1), (0, 0, 0), 14, 122, 106, 4, 8),
+    ("conv_out", 96, 3, (3, 3, 3), (1, 1, 1), (0, 0, 0), 14, 122, 106, 4, 8),
+    ("up2_spatial", 192, 96, (1, 3, 3), (1, 1, 1), (0, 0, 0), 12, 122, 106, 4, 8),
+    ("up2_res", 192, 192, (3, 3, 3), (1, 1, 1), (0, 0, 0), 14, 62, 54, 4, 8),
+    ("up1_spatial", 384, 192, (1, 3, 3), (1, 1, 1), (0, 0, 0), 12, 62, 54, 4, 8),
+    ("up1_res", 384, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 8, 32, 28, 4, 8),
+    ("up1_res0", 192, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 8, 32, 28, 4, 8),
+    ("up0_spatial", 384, 192, (1, 3, 3), (1, 1, 1), (0, 0, 0), 6, 32, 28, 4, 8),
+    ("lat_mid_res", 384, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 5, 17, 15, 4, 8),
+    ("conv_in", 32, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 5, 17, 15, 4, 8),
+    ("up1_tconv", 384, 768, (3, 1, 1), (1, 1, 1), (0, 0, 0), 8, 30, 26, 4, 8),
+    ("up0_tconv", 384, 768, (3, 1, 1), (1, 1, 1), (0, 0, 0), 5, 15, 13, 4, 8),
+]
+
+
+@pytest.mark.parametrize(
+    "mesh_device, mesh_shape, device_params",
+    [[(1, 1), (1, 1), {"trace_region_size": TRACE_REGION_SIZE}]],
+    ids=["wh_4x8_480p_t3_1x1"],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize(
+    "layer_name, C_in, C_out, kernel, stride, padding, T, H, W, h_factor, w_factor",
+    _SWEEP_LAYERS_WH_H4W8_480P_T3,
+    ids=[l[0] for l in _SWEEP_LAYERS_WH_H4W8_480P_T3],
+)
+def test_bruteforce_sweep_wh_h4w8_480p_t3(
+    mesh_device, mesh_shape, layer_name, C_in, C_out, kernel, stride, padding, T, H, W, h_factor, w_factor
+):
+    parent_mesh = mesh_device
+    device = parent_mesh.create_submesh(ttnn.MeshShape(*mesh_shape))
+    output = f"sweep_results_wh_h4w8_480p_t3/{layer_name}_{C_in}x{C_out}.json"
+    run_sweep(
+        device,
+        C_in,
+        C_out,
+        kernel,
+        T,
+        H,
+        W,
+        output,
+        stride=stride,
+        padding=padding,
+        h_factor=h_factor,
+        w_factor=w_factor,
+        grid_size=device.compute_with_storage_grid_size(),
+        max_combos=int(os.environ.get("CONV3D_SWEEP_MAX_COMBOS", "150")),
+        hw_product=32,
+    )

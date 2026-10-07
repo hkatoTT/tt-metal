@@ -718,15 +718,24 @@ def fast_device_to_host(
 
     # Grab mesh coordinates from the device tensor before DMA.
     mesh_coords = list(tt_tensor.tensor_topology().mesh_coords())
+    import os as _hk_os  # EXPERIMENT (hkato): WAN_VAE_TIMING=1 section timing
+    import time as _hk_time
+
+    _hk = _hk_os.environ.get("WAN_VAE_TIMING") == "1"
+    _t0 = _hk_time.perf_counter()
 
     if pre_transfer_fn is not None:
         tt_tensor = pre_transfer_fn(tt_tensor)
+    if _hk:
+        ttnn.synchronize_device(mesh_device)
+    _t1 = _hk_time.perf_counter()
 
     # Single .cpu() on the mesh tensor batches all DMA reads into one C++
     # dispatch — host buffers are allocated in parallel and the reader thread
     # pool processes all completion-queue reads concurrently.
     host_tensor = tt_tensor.cpu(blocking=False)
     ttnn.synchronize_device(mesh_device)
+    _t2 = _hk_time.perf_counter()
 
     # Extract per-shard host tensors (single-host: just wraps each shard).
     host_shard_tensors = ttnn.get_device_tensors(host_tensor)
@@ -736,7 +745,16 @@ def fast_device_to_host(
     trim = tuple(slice(0, d) for d in logical_shape)
     shards = [_to_torch_zero_copy(s)[trim] for s in host_shard_tensors]
 
-    return _reassemble_2d(mesh_coords, shards, logical_shape, mesh_shape, concat_dims, permute, dtype)
+    _t3 = _hk_time.perf_counter()
+    out = _reassemble_2d(mesh_coords, shards, logical_shape, mesh_shape, concat_dims, permute, dtype)
+    if _hk:
+        _t4 = _hk_time.perf_counter()
+        print(
+            "WAN_D2H_TIMING pre=%.1f dma=%.1f shards=%.1f reassemble=%.1f ms"
+            % ((_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3, (_t3 - _t2) * 1e3, (_t4 - _t3) * 1e3),
+            flush=True,
+        )
+    return out
 
 
 def upsample(

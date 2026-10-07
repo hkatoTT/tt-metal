@@ -875,6 +875,8 @@ class WanPipeline(PipelineAPIMixin):
             cache.clear()
             self.dit_ccl_manager._ping_pong_buffer_indices.clear()
             _log_dram(self.mesh_device, "before_vae_freed")
+        if os.environ.get("WAN_DUMP_LATENTS"):  # EXPERIMENT (hkato): determinism checks
+            torch.save(latents.detach().cpu(), os.environ["WAN_DUMP_LATENTS"])
         video_torch = self._vae.decode(latents, output_type=output_type)
 
         if output_type == "uint8":

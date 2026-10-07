@@ -1563,7 +1563,14 @@ class WanDecoder(Module):
             # t_chunk_size. Feeding a T>1 first chunk would instead hit the "Rep" branch
             # and skip doubling the non-boundary frames, dropping output frames.
             chunk_bounds = [(0, 1)] + [(s, min(s + t_chunk_size, T)) for s in range(1, T, t_chunk_size)]
+            import time as _hk_time  # EXPERIMENT (hkato): WAN_VAE_TIMING=1 per-chunk timing
+
+            _hk_t = os.environ.get("WAN_VAE_TIMING") == "1"
+            _hk_ct = []
             for chunk_idx, (t_start, t_end) in enumerate(chunk_bounds):
+                if _hk_t:
+                    ttnn.synchronize_device(self.mesh_device)
+                    _hk_c0 = _hk_time.perf_counter()
                 self._conv_idx = [0]
                 out_BTHWC, new_logical_h, new_logical_w = self.decoder(
                     x_BTHWC[:, t_start:t_end, :, :, :],
@@ -1572,11 +1579,22 @@ class WanDecoder(Module):
                     feat_idx=self._conv_idx,
                     logical_w=logical_w,
                 )
+                if _hk_t:
+                    ttnn.synchronize_device(self.mesh_device)
+                    _hk_c1 = _hk_time.perf_counter()
                 out_BCTHW = ttnn.permute(out_BTHWC, (0, 4, 1, 2, 3))
                 if output_BCTHW is None:
                     output_BCTHW = out_BCTHW
                 else:
                     output_BCTHW = ttnn.concat([output_BCTHW, out_BCTHW], dim=2)
+                if _hk_t:
+                    ttnn.synchronize_device(self.mesh_device)
+                    _hk_ct.append(
+                        "%d:%.1f+%.1f"
+                        % (t_end - t_start, (_hk_c1 - _hk_c0) * 1e3, (_hk_time.perf_counter() - _hk_c1) * 1e3)
+                    )
+            if _hk_t:
+                print("WAN_VAE_CHUNKS " + " ".join(_hk_ct), flush=True)
             self.clear_cache()
 
         output_tile_BCTHW = ttnn.to_layout(output_BCTHW, ttnn.TILE_LAYOUT)
@@ -2121,9 +2139,21 @@ class WanVAEDecoderAdapter:
         _hk_mark("input")
         self.reload_weights()
         _hk_mark("reload")
+        _hk_prof = None
+        if os.environ.get("WAN_VAE_PROFILE") == "1" and getattr(self, "_hk_calls", 0) >= 1:  # EXPERIMENT (hkato)
+            import cProfile
+
+            _hk_prof = cProfile.Profile()
+            _hk_prof.enable()
+        self._hk_calls = getattr(self, "_hk_calls", 0) + 1
         tt_video_BCTHW, new_logical_h, new_logical_w = self._decoder(
             tt_latents_BTHWC, logical_h, t_chunk_size=self._t_chunk_size, logical_w=logical_w
         )
+        if _hk_prof is not None:
+            _hk_prof.disable()
+            import pstats
+
+            pstats.Stats(_hk_prof).sort_stats("tottime").print_stats(30)
         _hk_mark("decoder")
 
         concat_dims = [None, None]

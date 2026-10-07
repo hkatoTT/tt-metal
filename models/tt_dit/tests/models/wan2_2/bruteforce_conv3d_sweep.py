@@ -1344,3 +1344,57 @@ def test_bruteforce_sweep_wh_h4w8_480p_t3(
         max_combos=int(os.environ.get("CONV3D_SWEEP_MAX_COMBOS", "150")),
         hw_product=32,
     )
+
+
+# WH Galaxy 4x8, 480p, cached t_chunk_size=5 (WAN_VAE_T_CHUNK=5)  (EXPERIMENT, hkato)
+# Stage T: T_res 7 / 12 / 22 / 22, T_tconv 7 / 12, T_spatial 10 / 20 / 20.
+_SWEEP_LAYERS_WH_H4W8_480P_T5 = [
+    ("up3_res", 96, 96, (3, 3, 3), (1, 1, 1), (0, 0, 0), 22, 122, 106, 4, 8),
+    ("conv_out", 96, 3, (3, 3, 3), (1, 1, 1), (0, 0, 0), 22, 122, 106, 4, 8),
+    ("up2_spatial", 192, 96, (1, 3, 3), (1, 1, 1), (0, 0, 0), 20, 122, 106, 4, 8),
+    ("up2_res", 192, 192, (3, 3, 3), (1, 1, 1), (0, 0, 0), 22, 62, 54, 4, 8),
+    ("up1_spatial", 384, 192, (1, 3, 3), (1, 1, 1), (0, 0, 0), 20, 62, 54, 4, 8),
+    ("up1_res", 384, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 12, 32, 28, 4, 8),
+    ("up1_res0", 192, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 12, 32, 28, 4, 8),
+    ("up0_spatial", 384, 192, (1, 3, 3), (1, 1, 1), (0, 0, 0), 10, 32, 28, 4, 8),
+    ("lat_mid_res", 384, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 7, 17, 15, 4, 8),
+    ("conv_in", 32, 384, (3, 3, 3), (1, 1, 1), (0, 0, 0), 7, 17, 15, 4, 8),
+    ("up1_tconv", 384, 768, (3, 1, 1), (1, 1, 1), (0, 0, 0), 12, 30, 26, 4, 8),
+    ("up0_tconv", 384, 768, (3, 1, 1), (1, 1, 1), (0, 0, 0), 7, 15, 13, 4, 8),
+]
+
+
+@pytest.mark.parametrize(
+    "mesh_device, mesh_shape, device_params",
+    [[(1, 1), (1, 1), {"trace_region_size": TRACE_REGION_SIZE}]],
+    ids=["wh_4x8_480p_t5_1x1"],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize(
+    "layer_name, C_in, C_out, kernel, stride, padding, T, H, W, h_factor, w_factor",
+    _SWEEP_LAYERS_WH_H4W8_480P_T5,
+    ids=[l[0] for l in _SWEEP_LAYERS_WH_H4W8_480P_T5],
+)
+def test_bruteforce_sweep_wh_h4w8_480p_t5(
+    mesh_device, mesh_shape, layer_name, C_in, C_out, kernel, stride, padding, T, H, W, h_factor, w_factor
+):
+    parent_mesh = mesh_device
+    device = parent_mesh.create_submesh(ttnn.MeshShape(*mesh_shape))
+    output = f"sweep_results_wh_h4w8_480p_t5/{layer_name}_{C_in}x{C_out}.json"
+    run_sweep(
+        device,
+        C_in,
+        C_out,
+        kernel,
+        T,
+        H,
+        W,
+        output,
+        stride=stride,
+        padding=padding,
+        h_factor=h_factor,
+        w_factor=w_factor,
+        grid_size=device.compute_with_storage_grid_size(),
+        max_combos=int(os.environ.get("CONV3D_SWEEP_MAX_COMBOS", "150")),
+        hw_product=32,
+    )

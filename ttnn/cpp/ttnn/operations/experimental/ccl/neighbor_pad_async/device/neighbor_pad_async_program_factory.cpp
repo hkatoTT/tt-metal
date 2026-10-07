@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
+#include <string>
 #include "neighbor_pad_async_program_factory.hpp"
 
 #include "ttnn/operations/ccl/ccl_common.hpp"
@@ -250,7 +252,14 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
     uint32_t num_links = operation_attributes.num_links;
     uint32_t pad2_num_links = operation_attributes.pad2_num_links;
     uint32_t total_fabric_cores = (num_links * 2) + (is_2d ? pad2_num_links * 2 : 0);
-    if (total_fabric_cores > compute_grid_size.x) {
+    // EXPERIMENT (hkato): TT_NP_W_ROW1=1 -> W fabric cores on logical row 1, so H and W links are capped separately
+    // by the grid width instead of sharing row 0 (on WH 8-wide grids W otherwise drops to 1 link).
+    const bool hk_w_row1 = is_2d && compute_grid_size.y > 1 && std::getenv("TT_NP_W_ROW1") != nullptr &&
+                           std::string(std::getenv("TT_NP_W_ROW1")) == "1";
+    if (hk_w_row1) {
+        num_links = std::min<uint32_t>(num_links, compute_grid_size.x / 2);
+        pad2_num_links = std::min<uint32_t>(pad2_num_links, compute_grid_size.x / 2);
+    } else if (total_fabric_cores > compute_grid_size.x) {
         // Reduce pad2_num_links first (W-fabric), then num_links (H-fabric) if still too many
         uint32_t max_total = compute_grid_size.x;
         uint32_t h_cores = num_links * 2;
@@ -381,12 +390,14 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
         w_fabric_logical_cores.reserve(num_w_fabric_cores);
         w_fabric_virtual_cores.reserve(num_w_fabric_cores);
         for (uint32_t i = 0; i < num_w_fabric_cores; i++) {
-            CoreCoord wc = {num_h_fabric_cores + i, 0};
+            CoreCoord wc = hk_w_row1 ? CoreCoord{i, 1} : CoreCoord{num_h_fabric_cores + i, 0};
             w_fabric_logical_cores.push_back(wc);
             w_fabric_virtual_cores.push_back(mesh_device->worker_core_from_logical_core(wc));
         }
         w_fabric_core_range =
-            CoreRangeSet(CoreRange({num_h_fabric_cores, 0}, {num_h_fabric_cores + num_w_fabric_cores - 1, 0}));
+            hk_w_row1
+                ? CoreRangeSet(CoreRange({0, 1}, {num_w_fabric_cores - 1, 1}))
+                : CoreRangeSet(CoreRange({num_h_fabric_cores, 0}, {num_h_fabric_cores + num_w_fabric_cores - 1, 0}));
 
         // W link distribution: T-batch-aligned (each link handles complete T batches).
         // This simplifies per-row type detection in kernels (no partial-T-batch edge cases).
@@ -599,12 +610,24 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
 
         if (!local_copy_cores.empty()) {
             has_local_copy = true;
-            // CB on all local-copy cores
-            CreateCircularBuffer(program, local_copy_cores, cb_sender_config);
+            // CB on all local-copy cores. EXPERIMENT (hkato): TT_NP_LC_BATCH=<B> -> 2*B sticks, B per transaction
+            uint32_t hk_lc_batch = 1;
+            if (const char* e = std::getenv("TT_NP_LC_BATCH"); e != nullptr && std::atoi(e) > 0) {
+                hk_lc_batch = static_cast<uint32_t>(std::atoi(e));
+            }
+            if (hk_lc_batch > 1) {
+                CircularBufferConfig hk_lc_cb_config =
+                    CircularBufferConfig(2 * hk_lc_batch * l1_scratch_cb_page_size_bytes, {{sender_cb_index, df}})
+                        .set_page_size(sender_cb_index, l1_scratch_cb_page_size_bytes);
+                CreateCircularBuffer(program, local_copy_cores, hk_lc_cb_config);
+            } else {
+                CreateCircularBuffer(program, local_copy_cores, cb_sender_config);
+            }
 
             // Create consolidated local copy reader kernel (uniform compile args)
             auto local_reader_cfg = ReaderDataMovementConfig{};
             local_reader_cfg.compile_args = {sender_cb_index, page_size};
+            local_reader_cfg.defines["HK_LC_BATCH"] = std::to_string(hk_lc_batch);
             TensorAccessorArgs(*input_buffer).append_to(local_reader_cfg.compile_args);
             local_reader_kernel_id = CreateKernel(
                 program,
@@ -624,6 +647,7 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
             // Create consolidated local copy writer kernel (uniform compile args)
             auto local_writer_cfg = WriterDataMovementConfig{};
             local_writer_cfg.compile_args = {sender_cb_index, page_size};
+            local_writer_cfg.defines["HK_LC_BATCH"] = std::to_string(hk_lc_batch);
             TensorAccessorArgs(*output_buffer).append_to(local_writer_cfg.compile_args);
             local_writer_kernel_id = CreateKernel(
                 program,

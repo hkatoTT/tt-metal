@@ -75,6 +75,26 @@ void kernel_main() {
 
         uint32_t dst_stick_id =
             (t + padding_left) * num_sticks_per_halo_dim + stick_start_id + outer_dim_offset + t_front_pad_stick_offset;
+#if defined(HK_LC_BATCH) && HK_LC_BATCH > 1
+        // EXPERIMENT (hkato): HK_LC_BATCH sticks per CB transaction, one barrier per batch
+        for (uint32_t base = 0; base < num_sticks_to_read; base += HK_LC_BATCH) {
+            const uint32_t n = (num_sticks_to_read - base) < HK_LC_BATCH ? (num_sticks_to_read - base) : HK_LC_BATCH;
+            cb_output.wait_front(HK_LC_BATCH);
+            uint32_t l1_addr = cb_output.get_read_ptr();
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t dst_noc_addr = dst_accessor.get_noc_addr(dst_stick_id);
+                if (masked) {
+                    zeroWrite<stick_size>(dst_noc_addr);
+                } else {
+                    noc_async_write(l1_addr, dst_noc_addr, stick_size);
+                }
+                dst_stick_id++;
+                l1_addr += stick_size;
+            }
+            noc_async_write_barrier();
+            cb_output.pop_front(HK_LC_BATCH);
+        }
+#else
         for (uint32_t iter = 0; iter < num_sticks_to_read; ++iter) {
             cb_output.wait_front(1);
             if (masked) {
@@ -88,6 +108,7 @@ void kernel_main() {
             noc_obj.async_write_barrier();
             cb_output.pop_front(1);
         }
+#endif
     }
     noc_obj.async_write_barrier();
 }

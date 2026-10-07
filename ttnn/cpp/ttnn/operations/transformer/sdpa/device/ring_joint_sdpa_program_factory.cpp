@@ -25,6 +25,7 @@
 #include <map>
 #include <optional>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <deque>
 #include <limits>
@@ -2779,7 +2780,51 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         reader_compile_time_args.size(), writer_compile_time_args.size(), compute_compile_time_args.size()};
 
     // Build static MHA/shared-K V head chains. GQA uses KV-head-grouped chains instead.
-    if (use_head_chain && build_kv_chains) {
+    // EXPERIMENT (hkato): Q interleave, see q_chunk_remapping.hpp. Every core owns the same number P of chunks,
+    // core c computes chunks c, c+C, ... so in pass p the cores [g*Nq, (g+1)*Nq) all work on head p*(C/Nq)+g.
+    const char* q_interleave_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE");
+    const uint32_t q_interleave_per_core = base_chunks_per_core;
+    const bool q_interleave = q_interleave_env != nullptr && std::string(q_interleave_env) == "1" && use_head_chain &&
+                              build_kv_chains && ksplit_count == 1 && !enable_zigzag_balancing &&
+                              !use_rotated_q_split && !has_sliding_window && cores_doing_extra_work == 0 &&
+                              q_interleave_per_core >= 2 && num_q_chunks > 1 && num_cores % num_q_chunks == 0 &&
+                              total_q_chunks == q_interleave_per_core * num_cores;
+    if (q_interleave_env != nullptr) {
+        log_info(
+            tt::LogOp,
+            "Ring joint Q interleave {}: per_core={} cores={} num_q_chunks={} extra={}",
+            q_interleave ? "ACTIVE" : "declined",
+            q_interleave_per_core,
+            num_cores,
+            num_q_chunks,
+            cores_doing_extra_work);
+    }
+    if (q_interleave) {
+        defines["SDPA_Q_INTERLEAVE_PER_CORE"] = std::to_string(q_interleave_per_core);
+        defines["SDPA_Q_INTERLEAVE_CORES"] = std::to_string(num_cores);
+        // Chains of chain_len cores within a group: more chain heads read K/V from DRAM (each one fewer bytes).
+        const char* chain_len_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE_CHAIN");
+        uint32_t chain_len = chain_len_env != nullptr ? static_cast<uint32_t>(std::atoi(chain_len_env)) : num_q_chunks;
+        if (chain_len < 2 || num_q_chunks % chain_len != 0) {
+            chain_len = num_q_chunks;
+        }
+        log_info(tt::LogOp, "Ring joint Q interleave chain length {}", chain_len);
+        const char* order_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE_ORDER");
+        const std::string chain_order = order_env != nullptr ? std::string(order_env) : std::string("fwd");
+        log_info(tt::LogOp, "Ring joint Q interleave chain order {}", chain_order);
+        for (uint32_t c0 = 0; c0 < num_cores; c0 += chain_len) {
+            std::vector<ChainSegment> chain_segs;
+            for (uint32_t i = 0; i < chain_len; ++i) {
+                const uint32_t idx = chain_order == "rev" ? chain_len - 1 - i : i;
+                chain_segs.emplace_back(c0 + idx, q_interleave_per_core);
+            }
+            TT_FATAL(
+                build_linear_chain(chain_segs, 0xFFFFFFFFu, head_chain_configs, core_work, false),
+                "Q interleave: chain build failed at core {}",
+                c0);
+        }
+    }
+    if (use_head_chain && build_kv_chains && !q_interleave) {
         for (uint32_t head_id = 0; head_id < static_cast<uint32_t>(head_segments.size()); ++head_id) {
             const auto& segs = head_segments[head_id];
             if (segs.size() < 2) {
@@ -2797,7 +2842,7 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
 
     // Check query-head chain multicast eligibility and configure mcast for eligible chains.
     uint32_t mcast_chains = 0;
-    if (use_head_chain && build_kv_chains) {
+    if (use_head_chain && build_kv_chains && !q_interleave) {
         struct McastCandidate {
             std::vector<uint32_t> core_indices;
             uint32_t ref_q_chunks;
@@ -3052,7 +3097,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
 
     reader_kernel.compile_time_args = reader_compile_time_args;
     reader_kernel.defines = kernel_defines;
-    reader_kernel.config = ReaderConfigDescriptor{};
+    if (const char* e = std::getenv("TT_RING_SDPA_READER_NOC1"); e != nullptr && std::string(e) == "1") {
+        reader_kernel.config = DataMovementConfigDescriptor{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_1, .noc = tt::tt_metal::NOC::NOC_1};
+    } else {
+        reader_kernel.config = ReaderConfigDescriptor{};
+    }
     // Layout: metadata block first (when present), then the logical-length pair, so the kernel's base index
     // is ring_joint::kReaderMetadataCommonArgCount (or kWriterMetadataCommonArgCount) when its metadata block
     // is present, else 0. Both slots are emplaced whenever either tensor is present. Passed as Buffer* (not
@@ -3095,7 +3145,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     writer_kernel.core_ranges = core_grid_set;
     writer_kernel.compile_time_args = writer_compile_time_args;
     writer_kernel.defines = kernel_defines;
-    writer_kernel.config = WriterConfigDescriptor{};
+    if (const char* e = std::getenv("TT_RING_SDPA_READER_NOC1"); e != nullptr && std::string(e) == "1") {
+        writer_kernel.config = DataMovementConfigDescriptor{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_0, .noc = tt::tt_metal::NOC::NOC_0};
+    } else {
+        writer_kernel.config = WriterConfigDescriptor{};
+    }
     if (kv_pad_from_metadata || has_logical_length_tensor) {
         KernelDescriptor::RTArgList writer_common_args;
         if (kv_pad_from_metadata) {

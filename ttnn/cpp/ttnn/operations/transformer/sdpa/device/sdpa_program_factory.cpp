@@ -740,6 +740,16 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
     defines_map["DHT_GRANULARITY"] = std::to_string(dht_granularity);
     defines_map["REDUCE_GRANULARITY"] = std::to_string(reduce_granularity);
     defines_map["EXP_APPROX_MODE"] = std::to_string(exp_approx_mode);
+    if (program_config.has_value() && program_config->matmul_math_fidelity.has_value()) {
+        TT_FATAL(
+            use_streaming_compute, "matmul_math_fidelity needs the streaming compute path (fp32_dest_acc_en=false)");
+        defines_map["SDPA_MATMUL_FIDELITY"] =
+            std::to_string(static_cast<uint32_t>(*program_config->matmul_math_fidelity));
+    }
+    // MATH_FIDELITY is not defined on the unpack TRISC, and all three must agree on how P.V is set up.
+    if (math_fidelity == MathFidelity::LoFi) {
+        defines_map["SDPA_COMPUTE_LOFI"] = "1";
+    }
     log_debug(tt::LogOp, "use_zigzag_balancing: {}", use_zigzag_balancing);
 
     KernelDescriptor::Defines defines(defines_map.begin(), defines_map.end());

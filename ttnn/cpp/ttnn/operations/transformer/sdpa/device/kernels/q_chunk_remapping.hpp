@@ -79,6 +79,10 @@ struct GlobalQIndex {
  * Q/K/V and write outputs for each (batch, head, q_chunk) triple a core is assigned.
  */
 FORCE_INLINE GlobalQIndex decompose_global_q_index(uint32_t idx, uint32_t num_q_chunks, uint32_t NQH, bool use_zigzag) {
+#if defined(SDPA_Q_INTERLEAVE_PER_CORE) && defined(SDPA_Q_INTERLEAVE_CORES)
+    // Q interleave: a core's contiguous flat range [c*P, c*P+P) maps to chunks c, c+C, c+2C, ... (one per pass).
+    idx = (idx % SDPA_Q_INTERLEAVE_PER_CORE) * SDPA_Q_INTERLEAVE_CORES + idx / SDPA_Q_INTERLEAVE_PER_CORE;
+#endif
     const uint32_t remapped = remap_q_index(idx, num_q_chunks, use_zigzag);
     return {
         /*nb=*/remapped / (NQH * num_q_chunks),

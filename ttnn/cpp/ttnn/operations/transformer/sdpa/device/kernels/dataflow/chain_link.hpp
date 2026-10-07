@@ -86,6 +86,9 @@ struct ChainConfig {
  * For non-participating cores the semaphores are not used; the valid semaphore is only
  * initialized when is_participant=true.
  */
+// Head-level chain that serves whichever head the core is on (Q interleave: one chain per core group).
+constexpr uint32_t kAnyChainHead = 0xFFFFFFFFu;
+
 template <bool mcast_enabled, bool is_head_level>
 class ChainLink {
 public:
@@ -153,7 +156,7 @@ public:
             return false;
         }
         if constexpr (is_head_level) {
-            if (nq != chain_head) {
+            if (chain_head != kAnyChainHead && nq != chain_head) {
                 return false;
             }
         }
@@ -169,7 +172,7 @@ public:
             return false;
         }
         if constexpr (is_head_level) {
-            if (nq != chain_head) {
+            if (chain_head != kAnyChainHead && nq != chain_head) {
                 return false;
             }
         }

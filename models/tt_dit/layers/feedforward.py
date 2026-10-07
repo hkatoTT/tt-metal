@@ -181,5 +181,9 @@ class ParallelFeedForward(Module):
             scalar=scalar,
             compute_kernel_config=compute_kernel_config,
             use_persistent_buffer=use_persistent_buffer,
-            dtype=addcmul_a.get_dtype() if ff2_in_bf8 else None,
+            dtype=(
+                ttnn.bfloat8_b
+                if os.environ.get("WAN_FFN2_RS_BF8") == "1"  # EXPERIMENT: bf8 partials (needs TT_MMRS_SPLIT_FINAL_DF=1)
+                else (addcmul_a.get_dtype() if ff2_in_bf8 else None)
+            ),
         )

@@ -392,7 +392,35 @@ StridedReduceScatterProgramArtifacts build_ring_strided_reduce_scatter_async_pro
     uint32_t addcmul_temp_cb_index = tt::CB::c_in4;
     uint32_t addcmul_a_cb_index = tt::CB::c_in5;
     uint32_t addcmul_b_cb_index = tt::CB::c_in6;
-    if (fuse_rs_addcmul) {
+    // EXPERIMENT (hkato): split final format (partials in the input format, final addcmul in the output format)
+    const tt::DataFormat final_df = tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
+    const bool split_final_df = fuse_rs_addcmul && final_df != df;
+    const uint32_t final_out_cb_index = tt::CB::c_in7;
+    const uint32_t final_page_size = tt::tile_size(final_df);
+    const tt::DataFormat a_df =
+        fuse_rs_addcmul ? tt::tt_metal::datatype_to_dataformat_converter(addcmul_input_tensor1->dtype()) : df;
+    const tt::DataFormat b_df =
+        fuse_rs_addcmul ? tt::tt_metal::datatype_to_dataformat_converter(addcmul_input_tensor2->dtype()) : df;
+    const uint32_t a_page_size = split_final_df ? tt::tile_size(a_df) : l1_scratch_cb_page_size_bytes;
+    const uint32_t b_page_size = split_final_df ? tt::tile_size(b_df) : l1_scratch_cb_page_size_bytes;
+    if (split_final_df) {
+        tt::tt_metal::CircularBufferConfig cb_final_out_config =
+            tt::tt_metal::CircularBufferConfig(cb_num_pages * final_page_size, {{final_out_cb_index, final_df}})
+                .set_page_size(final_out_cb_index, final_page_size);
+        CreateCircularBuffer(program, sender_worker_core_range_set, cb_final_out_config);
+        tt::tt_metal::CircularBufferConfig cb_addcmul_temp_config =
+            tt::tt_metal::CircularBufferConfig(2 * cb_num_pages * final_page_size, {{addcmul_temp_cb_index, final_df}})
+                .set_page_size(addcmul_temp_cb_index, final_page_size);
+        CreateCircularBuffer(program, sender_worker_core_range_set, cb_addcmul_temp_config);
+        tt::tt_metal::CircularBufferConfig cb_addcmul_a_config =
+            tt::tt_metal::CircularBufferConfig(cb_num_pages * a_page_size, {{addcmul_a_cb_index, a_df}})
+                .set_page_size(addcmul_a_cb_index, a_page_size);
+        CreateCircularBuffer(program, sender_worker_core_range_set, cb_addcmul_a_config);
+        tt::tt_metal::CircularBufferConfig cb_addcmul_b_config =
+            tt::tt_metal::CircularBufferConfig(cb_num_pages * b_page_size, {{addcmul_b_cb_index, b_df}})
+                .set_page_size(addcmul_b_cb_index, b_page_size);
+        CreateCircularBuffer(program, sender_worker_core_range_set, cb_addcmul_b_config);
+    } else if (fuse_rs_addcmul) {
         // Temp CB needs double capacity for the in-place mul-then-repack pattern.
         tt::tt_metal::CircularBufferConfig cb_addcmul_temp_config =
             tt::tt_metal::CircularBufferConfig(
@@ -430,6 +458,13 @@ StridedReduceScatterProgramArtifacts build_ring_strided_reduce_scatter_async_pro
     if (fuse_rs_addcmul) {
         reader_compute_defines["FUSE_RS_ADDCMUL"] = "1";
         reduce_compute_defines["FUSE_RS_ADDCMUL"] = "1";
+        if (split_final_df) {
+            reduce_compute_defines["RS_FINAL_OUT_CB"] = std::to_string(final_out_cb_index);
+            writer_compute_defines["RS_FINAL_OUT_CB"] = std::to_string(final_out_cb_index);
+            writer_compute_defines["RS_FINAL_PAGE_SIZE"] = std::to_string(final_page_size);
+            reader_compute_defines["RS_ADDCMUL_A_PAGE_SIZE"] = std::to_string(a_page_size);
+            reader_compute_defines["RS_ADDCMUL_B_PAGE_SIZE"] = std::to_string(b_page_size);
+        }
         // Non-broadcast gate: b has full rows (per-token), element-wise multiply.
         // Broadcast gate: b has 1 row per tile, broadcast across acc's rows.
         auto b_logical_shape = addcmul_input_tensor2->logical_shape();

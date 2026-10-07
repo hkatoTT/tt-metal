@@ -53,6 +53,13 @@ constexpr uint32_t cb_intermediate_id = get_compile_time_arg_val(3);
 constexpr uint32_t cb_reader_output_id = get_compile_time_arg_val(4);
 constexpr uint32_t tile_granularity = get_compile_time_arg_val(5);
 constexpr uint32_t page_size = get_compile_time_arg_val(6);
+#ifdef RS_ADDCMUL_A_PAGE_SIZE
+#define HK_A_PAGE_SIZE RS_ADDCMUL_A_PAGE_SIZE
+#define HK_B_PAGE_SIZE RS_ADDCMUL_B_PAGE_SIZE
+#else
+#define HK_A_PAGE_SIZE page_size
+#define HK_B_PAGE_SIZE page_size
+#endif
 constexpr uint32_t input_batch_num_pages = get_compile_time_arg_val(7);
 [[maybe_unused]] constexpr uint32_t input_channel_num_pages =
     get_compile_time_arg_val(8);  // C=1 is validated on host; reserved for future C>1 support
@@ -385,13 +392,13 @@ void kernel_main() {
                                         noc_obj.async_read(
                                             addcmul_a_addrgen,
                                             CoreLocalMem<uint8_t>(addcmul_a_l1_write_addr),
-                                            page_size,
+                                            HK_A_PAGE_SIZE,
                                             {.page_id = a_tile_idx},
                                             {});
                                         noc_obj.async_read(
                                             addcmul_b_addrgen,
                                             CoreLocalMem<uint8_t>(addcmul_b_l1_write_addr),
-                                            page_size,
+                                            HK_B_PAGE_SIZE,
                                             {.page_id = b_gate_idx},
                                             {});
                                     }
@@ -405,8 +412,8 @@ void kernel_main() {
                                 }
 #ifdef FUSE_RS_ADDCMUL
                                 if (is_final_ring_step) {
-                                    addcmul_a_l1_write_addr += page_size;
-                                    addcmul_b_l1_write_addr += page_size;
+                                    addcmul_a_l1_write_addr += HK_A_PAGE_SIZE;
+                                    addcmul_b_l1_write_addr += HK_B_PAGE_SIZE;
                                 }
 #endif
 

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include "ttnn/operations/experimental/ccl/minimal_matmul_strided_reduce_scatter_async/device/minimal_matmul_strided_reduce_scatter_async_op.hpp"
@@ -263,10 +264,14 @@ MinimalMatmulStridedReduceScatterAsync::compute_output_specs(
     auto rs_output_shape = mm_output_shape;
     rs_output_shape[attributes.dim] /= attributes.ring_size;
 
+    // EXPERIMENT (hkato): TT_MMRS_SPLIT_FINAL_DF=1 -> the fused addcmul output takes the residual's dtype
+    auto rs_output_dtype = mm_output_spec.data_type();
+    if (std::getenv("TT_MMRS_SPLIT_FINAL_DF") != nullptr && tensor_args.addcmul_input_tensor1.has_value()) {
+        rs_output_dtype = tensor_args.addcmul_input_tensor1->dtype();
+    }
     tt::tt_metal::TensorSpec rs_output_spec(
         rs_output_shape,
-        tt::tt_metal::TensorLayout(
-            mm_output_spec.data_type(), mm_output_spec.page_config(), attributes.rs_output_mem_config));
+        tt::tt_metal::TensorLayout(rs_output_dtype, mm_output_spec.page_config(), attributes.rs_output_mem_config));
 
     // --- L1 handoff (step 1): block-shard the MM output across the matmul core grid so the RS reader
     // consumes it straight out of L1 instead of round-tripping through DRAM.

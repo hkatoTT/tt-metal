@@ -293,7 +293,15 @@ void kernel_main() {
                     // i=R-1: consume output_cb, write final reduced tiles to local output.
                     for (uint32_t i = 0; i < ring_size; i++) {
                         const uint32_t actual_slice_idx = wrap_slice_idx(slice_idx, direction, ring_size);
+#ifdef RS_FINAL_OUT_CB
+                        CircularBuffer cb_final_out(RS_FINAL_OUT_CB);
+                        CircularBuffer& cb_output =
+                            (i == ring_size - 1) ? cb_final_out : (i > 0 ? cb_compute_output : cb_reader_output);
+                        const uint32_t step_page_size = (i == ring_size - 1) ? RS_FINAL_PAGE_SIZE : page_size;
+#else
                         CircularBuffer& cb_output = i > 0 ? cb_compute_output : cb_reader_output;
+                        const uint32_t step_page_size = page_size;
+#endif
 
                         const auto [mm_N_full_blocks_per_slice, cols_before_actual_slice] =
                             get_slice_N_block_info(actual_slice_idx, slice_Wt, N_full_block_wt);
@@ -366,7 +374,7 @@ void kernel_main() {
                                                     slice_Wt,
                                                     input_tensor_Wt);
                                             valid_l1_addrs[num_in_bounds_tiles] =
-                                                l1_read_addr + packet_slot * page_size;
+                                                l1_read_addr + packet_slot * step_page_size;
                                             if (num_in_bounds_tiles == 0) {
                                                 slice_tile_idx_first = slice_coordinates_to_slice_tile_index(
                                                     slice_row, slice_col - cols_before_actual_slice, slice_Wt);
@@ -442,12 +450,12 @@ void kernel_main() {
                                             noc_obj.async_write(
                                                 CoreLocalMem<uint8_t>(valid_l1_addrs[0]),
                                                 output_addrgen,
-                                                page_size,
+                                                step_page_size,
                                                 {},
                                                 {.page_id = output_tile_id});
                                         }
                                     }
-                                    l1_read_addr += page_size * tiles_to_put_in_current_packet;
+                                    l1_read_addr += step_page_size * tiles_to_put_in_current_packet;
                                 }
                                 noc_obj.async_write_barrier();
                                 cb_output.pop_front(tile_granularity);

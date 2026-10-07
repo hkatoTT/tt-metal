@@ -211,6 +211,17 @@ void kernel_main() {
                                 cb_addcmul_temp.pop_front(tile_granularity);
                                 cb_addcmul_a.pop_front(tile_granularity);
 
+#ifdef RS_FINAL_OUT_CB
+                                CircularBuffer cb_final(RS_FINAL_OUT_CB);
+                                cb_final.reserve_back(tile_granularity);
+                                tile_regs_wait();
+                                pack_reconfig_data_format(RS_FINAL_OUT_CB);
+                                for (uint32_t tile_id = 0; tile_id < tiles_to_read_in_this_step; tile_id++) {
+                                    pack_tile(tile_id, RS_FINAL_OUT_CB);
+                                }
+                                tile_regs_release();
+                                cb_final.push_back(tile_granularity);
+#else
                                 cb_out.reserve_back(tile_granularity);
                                 tile_regs_wait();
                                 pack_reconfig_data_format(output_cb);
@@ -219,11 +230,18 @@ void kernel_main() {
                                 }
                                 tile_regs_release();
                                 cb_out.push_back(tile_granularity);
+#endif
                             } else {
 #endif
                                 // Normal ring accumulation step: acc = input + intermediate
                                 cb_in.wait_front(tile_granularity);
                                 cb_intermediate.wait_front(tile_granularity);
+#ifdef RS_FINAL_OUT_CB
+                                // the fused final step left other formats configured
+                                add_init(input_cb, intermediate_cb, false);
+                                reconfig_data_format(input_cb, intermediate_cb);
+                                pack_reconfig_data_format(output_cb);
+#endif
 
                                 tile_regs_acquire();
                                 for (uint32_t tile_id = 0; tile_id < tiles_to_read_in_this_step; tile_id++) {

@@ -194,6 +194,9 @@ class WanPipelineConfig:
 
         if vae_t_chunk_size is _UNSET:
             vae_t_chunk_size = preset.get("vae_t_chunk_size", 1)
+        if os.environ.get("WAN_VAE_T_CHUNK"):  # EXPERIMENT: latent frames per VAE decode chunk ("full" = all)
+            v = os.environ["WAN_VAE_T_CHUNK"]
+            vae_t_chunk_size = None if v == "full" else int(v)
 
         return cls(
             topology=topology if topology is not None else preset["topology"],
@@ -862,6 +865,16 @@ class WanPipeline(PipelineAPIMixin):
         on_event: PipelineEventCallback,
     ) -> torch.Tensor:
         on_event(SectionStart("vae"))
+        if os.environ.get("WAN_VAE_FREE_CCL") == "1":  # EXPERIMENT: free the DiT CCL buffers for the VAE
+            ttnn.synchronize_device(self.mesh_device)
+            cache = self.dit_ccl_manager._ping_pong_buffer_cache
+            for bufs in cache.values():
+                for b in bufs if isinstance(bufs, (list, tuple)) else [bufs]:
+                    if isinstance(b, ttnn.Tensor):
+                        ttnn.deallocate(b)
+            cache.clear()
+            self.dit_ccl_manager._ping_pong_buffer_indices.clear()
+            _log_dram(self.mesh_device, "before_vae_freed")
         video_torch = self._vae.decode(latents, output_type=output_type)
 
         if output_type == "uint8":

@@ -484,7 +484,35 @@ void kernel_main() {
                 // Critical to performance for sender to push data to compute before mcasting
                 // This frees sender to start next read earlier
                 cb_in0.push_back(in0_block_num_tiles);
-                if (!is_sink_core) {
+#ifdef AGMM_IN0_MCAST_NDESTS
+                if (!is_sink_core && is_injector_core) {
+                    in0_sender_sem.wait(AGMM_IN0_MCAST_NDESTS);
+                    in0_sender_sem.set(0);
+                    noc_obj.async_write_multicast(
+                        CoreLocalMem<uint32_t>(in0_start_address),
+                        MulticastEndpoint{},
+                        current_block_bytes,
+                        AGMM_IN0_MCAST_NDESTS,
+                        {},
+                        {.noc_x_start = in0_sender_noc_x,
+                         .noc_y_start = in0_sender_noc_y,
+                         .noc_x_end = in0_dest_noc_x,
+                         .noc_y_end = in0_dest_noc_y,
+                         .addr = in0_start_address},
+                        /*linked=*/true);
+                    in0_valid_sem.relay_multicast(
+                        noc_obj,
+                        in0_receiver_sem,
+                        in0_sender_noc_x,
+                        in0_sender_noc_y,
+                        in0_dest_noc_x,
+                        in0_dest_noc_y,
+                        AGMM_IN0_MCAST_NDESTS,
+                        /*linked=*/false);
+                    noc_obj.async_writes_flushed();
+                } else
+#endif
+                    if (!is_sink_core) {
                     in0_sender_sem.wait(1);
                     in0_sender_sem.set(0);
 

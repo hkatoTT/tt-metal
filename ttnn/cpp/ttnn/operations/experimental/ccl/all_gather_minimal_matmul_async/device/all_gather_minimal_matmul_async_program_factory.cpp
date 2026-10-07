@@ -661,6 +661,10 @@ all_gather_minimal_matmul_async_factory_helper(
     std::map<std::string, std::string> defines;
     std::map<std::string, std::string> in0_defines;
     std::map<std::string, std::string> in0_injector_defines;
+    std::string hk_in0_mcast_ndests_define;
+    if (std::getenv("TT_AGMM_IN0_MCAST") != nullptr && std::string(std::getenv("TT_AGMM_IN0_MCAST")) == "1") {
+        hk_in0_mcast_ndests_define = std::to_string(in1_parallel_axis_cores - 1);  // set into in0_defines below
+    }
     std::map<std::string, std::string> in0_fabric_defines;
     if (use_bias) {
         defines["FUSE_BIAS"] = "1";
@@ -859,6 +863,9 @@ all_gather_minimal_matmul_async_factory_helper(
         fused_ternary_input_a,
         fused_ternary_input_b,
         true);
+    if (!hk_in0_mcast_ndests_define.empty()) {
+        in0_defines["AGMM_IN0_MCAST_NDESTS"] = hk_in0_mcast_ndests_define;
+    }
     auto in0_sender_kernels_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_minimal_matmul_async/device/kernels/dm_in0_sender.cpp",
@@ -1234,6 +1241,8 @@ all_gather_minimal_matmul_async_factory_helper(
         tt::tt_metal::SetCommonRuntimeArgs(program, compute_kernels_id, compute_common_args);
     }
 
+    const bool hk_in0_mcast =
+        std::getenv("TT_AGMM_IN0_MCAST") != nullptr && std::string(std::getenv("TT_AGMM_IN0_MCAST")) == "1";
     for (uint32_t core_id = 0; core_id < num_cores; ++core_id) {
         tt::tt_metal::CoreCoord core = cores.at(core_id);
         tt::tt_metal::CoreCoord virtual_core = device->worker_core_from_logical_core(core);
@@ -1297,13 +1306,37 @@ all_gather_minimal_matmul_async_factory_helper(
         bool is_in1_sink = core == in1_core_order.back();
 
         auto in0_injector_virtual_core = device->worker_core_from_logical_core(in0_core_order.front());
+        // EXPERIMENT (hkato): TT_AGMM_IN0_MCAST=1 -> injector multicasts in0 to its whole line
+        tt::tt_metal::CoreCoord hk_dest = in0_next_core_physical;
+        tt::tt_metal::CoreCoord hk_src = in0_prev_core_physical;
+        bool hk_sink = is_in0_sink;
+        if (hk_in0_mcast) {
+            tt::tt_metal::CoreCoord lo = device->worker_core_from_logical_core(in0_core_order.front());
+            tt::tt_metal::CoreCoord hi = lo;
+            for (const auto& c : in0_core_order) {
+                const tt::tt_metal::CoreCoord p = device->worker_core_from_logical_core(c);
+                lo = tt::tt_metal::CoreCoord{std::min(lo.x, p.x), std::min(lo.y, p.y)};
+                hi = tt::tt_metal::CoreCoord{std::max(hi.x, p.x), std::max(hi.y, p.y)};
+            }
+            if (in0_noc == tt::tt_metal::NOC::NOC_1) {
+                std::swap(lo, hi);  // NoC1 multicast rectangles go from the high corner to the low corner
+            }
+            if (in0_core_order_index == 0) {
+                hk_src = lo;   // rect start
+                hk_dest = hi;  // rect end
+                hk_sink = in0_core_order.size() <= 1;
+            } else {
+                hk_src = in0_injector_virtual_core;  // ack target
+                hk_sink = true;
+            }
+        }
         // Per-core args only (common values set via SetCommonRuntimeArgs above)
         std::vector<uint32_t> in0_args = {
-            is_in0_sink,
-            (std::uint32_t)in0_next_core_physical.x,  // in0_dest_noc_x
-            (std::uint32_t)in0_next_core_physical.y,  // in0_dest_noc_y
-            (std::uint32_t)in0_prev_core_physical.x,  // in0_sender_noc_x
-            (std::uint32_t)in0_prev_core_physical.y,  // in0_sender_noc_y
+            hk_sink,
+            (std::uint32_t)hk_dest.x,  // in0_dest_noc_x
+            (std::uint32_t)hk_dest.y,  // in0_dest_noc_y
+            (std::uint32_t)hk_src.x,   // in0_sender_noc_x
+            (std::uint32_t)hk_src.y,   // in0_sender_noc_y
             in0_sender_semaphore_id,
             in0_receiver_semaphore_id,
             in0_valid_semaphore_id,

@@ -189,6 +189,8 @@ class WanPipelineConfig:
                 )
             if encoder_parallel_config is None:
                 encoder_parallel_config = EncoderParallelConfig.from_tuple((h_factor, tp_axis))
+                if os.environ.get("WAN_ENC_ON_SP_AXIS") == "1":  # EXPERIMENT: shard the text encoder 8 ways
+                    encoder_parallel_config = EncoderParallelConfig.from_tuple((w_factor, sp_axis))
 
         if vae_t_chunk_size is _UNSET:
             vae_t_chunk_size = preset.get("vae_t_chunk_size", 1)
@@ -553,6 +555,13 @@ class WanPipeline(PipelineAPIMixin):
             gather_output=False,
         )
 
+        if os.environ.get("WAN_FWD_TIMING") == "1":
+            ttnn.synchronize_device(self.mesh_device)
+            hk_t = time.perf_counter()
+            out = self._solver.step(step=step, latent=permuted_latent_tt, velocity_pred=permuted_velocity_pred_tt)
+            ttnn.synchronize_device(self.mesh_device)
+            print(f"WAN_FWD solver={(time.perf_counter() - hk_t) * 1e3:.2f} ms", flush=True)
+            return out
         return self._solver.step(
             step=step,
             latent=permuted_latent_tt,

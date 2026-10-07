@@ -154,10 +154,18 @@ class WanAttention(Module):
         if os.environ.get("WAN_SDPA_CHUNK"):
             ring_sdpa_chunk_size = tuple(int(v) for v in os.environ["WAN_SDPA_CHUNK"].split(","))
 
+        # Ring SDPA QK^T and P.V matmuls at LoFi by default (max / exp / rescale keep the compute config's HiFi2).
+        # WH 4x8 480p: ring SDPA 13.00 -> 12.04 ms, 40 steps 86.97 -> 82.76 s. The video keeps its quality but its
+        # content changes noticeably (QK^T precision feeds the softmax). WAN_SDPA_MATMUL_FIDELITY=none restores the
+        # compute config's fidelity; other values (e.g. HiFi2) pick that fidelity. Validated only with the streaming
+        # kernel from #58223 on; on the older kernel a LoFi compute config hung the ring SDPA on WH 4x8.
+        sdpa_mm_fidelity = os.environ.get("WAN_SDPA_MATMUL_FIDELITY", "LoFi")
+        sdpa_mm_fidelity = None if sdpa_mm_fidelity.lower() in ("", "none", "off") else sdpa_mm_fidelity
         ring_sdpa_config_args = dict(
             q_chunk_size=ring_sdpa_chunk_size[0],
             k_chunk_size=ring_sdpa_chunk_size[1],
-            exp_approx_mode=False,  # NOTE: False is more correct
+            exp_approx_mode=os.environ.get("WAN_SDPA_EXP_APPROX") == "1",  # EXPERIMENT; False is more correct
+            matmul_math_fidelity=getattr(ttnn.MathFidelity, sdpa_mm_fidelity) if sdpa_mm_fidelity else None,
         )
         self.ring_sdpa_program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=self.sdpa_worker_grid, **ring_sdpa_config_args
@@ -285,6 +293,9 @@ class WanAttention(Module):
     ) -> ttnn.Tensor:
         """Fused to_out projection + addcmul: output = residual + (matmul(x, W) + bias) * gate."""
         to_out = self.to_out
+        if dtype is None and x.get_dtype() == ttnn.bfloat8_b:
+            # a bf8 activation (e.g. ring SDPA run on bf8 q/k/v) must not make the residual stream bf8
+            dtype = addcmul_residual.get_dtype()
 
         # Reads to_out.weight.data directly, so runtime-mode LoRA (which keeps
         # the delta in self._runtime_A/B) would silently no-op. Fuse mode is
@@ -311,6 +322,10 @@ class WanAttention(Module):
             core_grid = ttnn.CoreCoord(full_grid.x, full_grid.y - 1)
             matmul_config = get_matmul_config(M, K, N, core_grid)
 
+            if os.environ.get("WAN_AGMM_IN_BF8") == "1":  # EXPERIMENT: bf8 activation input, bf16 output
+                dtype = dtype or ttnn.bfloat16
+                if x.get_dtype() == ttnn.bfloat16:
+                    x = ttnn.typecast(x, ttnn.bfloat8_b)
             ag_persistent_buffer = self.ccl_manager.get_ag_ping_pong_buffer(
                 x.shape, 3, parallel_config.tensor_parallel.mesh_axis, dtype=x.get_dtype()
             )
@@ -473,6 +488,8 @@ class WanAttention(Module):
                         ks.append(self.norm_k(k_p, num_heads_per_device=self.n_local_heads))
                         vs.append(create_heads(v_p))
                     cached_kv = (ttnn.concat(ks, dim=0), ttnn.concat(vs, dim=0))
+                    if os.environ.get("WAN_XATTN_BF8") == "1":  # EXPERIMENT
+                        cached_kv = tuple(ttnn.typecast(t, ttnn.bfloat8_b) for t in cached_kv)
                     if cross_kv_key is not None:
                         self._cross_kv_cache[cross_kv_key] = cached_kv
             else:
@@ -485,6 +502,8 @@ class WanAttention(Module):
         sdpa_input_dtype = getattr(self, "_sdpa_input_dtype", None)
         use_ring_sdpa = self.parallel_config.sequence_parallel.factor > 1
         norm_output_dtype = sdpa_input_dtype if (use_ring_sdpa and prompt_1BLP is None) else None
+        if prompt_1BLP is not None and os.environ.get("WAN_XATTN_BF8") == "1":  # EXPERIMENT: cross q in bf8
+            norm_output_dtype = ttnn.bfloat8_b
 
         # Norm spatial before splitting heads
         q_BHNE = norm_out_to_bhne(
@@ -511,6 +530,8 @@ class WanAttention(Module):
             v_BHNE = create_heads(v_1BNF)
             if head_fold:  # [1, H, 2n, E] -> [1, 2H, n, E], same head order as q / k
                 v_BHNE = ttnn.reshape(v_BHNE, (1, 2 * v_BHNE.shape[1], v_BHNE.shape[2] // 2, v_BHNE.shape[3]))
+            if prompt_1BLP is not None and os.environ.get("WAN_XATTN_BF8") == "1":  # EXPERIMENT
+                k_BHNE, v_BHNE = ttnn.typecast(k_BHNE, ttnn.bfloat8_b), ttnn.typecast(v_BHNE, ttnn.bfloat8_b)
             if cross_kv_key is not None:
                 self._cross_kv_cache[cross_kv_key] = (k_BHNE, v_BHNE)
         else:
@@ -531,7 +552,12 @@ class WanAttention(Module):
                     if v_BHNE.dtype != sdpa_input_dtype:
                         v_BHNE = ttnn.typecast(v_BHNE, sdpa_input_dtype)
                     if dummy_joint.dtype != sdpa_input_dtype:
-                        dummy_joint = ttnn.typecast(dummy_joint, sdpa_input_dtype)
+                        # cache the cast: a fresh tensor per call changes its address and misses the program cache
+                        cache_key = (id(dummy_joint), sdpa_input_dtype)
+                        if getattr(self, "_dummy_joint_cast_key", None) != cache_key:
+                            self._dummy_joint_cast = ttnn.typecast(dummy_joint, sdpa_input_dtype)
+                            self._dummy_joint_cast_key = cache_key
+                        dummy_joint = self._dummy_joint_cast
 
                 # HACK: pass null joint inputs to take advantage of ring attention, even though this is self-attention.
                 fold_ccl_row_major = head_fold and self.fold_ccl_row_major

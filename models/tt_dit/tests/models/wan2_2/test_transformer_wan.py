@@ -266,6 +266,20 @@ def test_wan_transformer_block(
     logger.info(f"Loading TT model from torch state dict...")
     start = time.time()
     tt_model.load_torch_state_dict(state_dict)
+    if os.environ.get("WAN_PROJ_LOFI"):  # EXPERIMENT
+        from models.tt_dit.pipelines.wan.quant_config import set_block_proj_fidelity
+
+        set_block_proj_fidelity(tt_model, os.environ["WAN_PROJ_LOFI"].split(","))
+    if os.environ.get("WAN_SDPA_BF8") == "1":  # EXPERIMENT: ring SDPA inputs (q / k / v) in bfloat8_b
+        tt_model.attn1._sdpa_input_dtype = ttnn.bfloat8_b
+    if os.environ.get("WAN_WEIGHTS_BF8"):  # EXPERIMENT: weight-only bfloat8_b for the listed layers
+        from models.tt_dit.pipelines.wan.quant_config import _WEIGHT_ONLY_LAYERS, _quantize_weight
+
+        for name in os.environ["WAN_WEIGHTS_BF8"].split(","):
+            linear = _WEIGHT_ONLY_LAYERS[name](tt_model)
+            _quantize_weight(linear.weight, ttnn.bfloat8_b)
+            if getattr(linear, "bias", None) is not None:
+                _quantize_weight(linear.bias, ttnn.bfloat8_b)
     end = time.time()
     logger.info(f"Time taken to load state dict: {end - start} seconds")
 

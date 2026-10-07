@@ -283,6 +283,8 @@ def test_pipeline_performance(
     parallel_config = DiTParallelConfig.from_tuples(cfg=(1, 0), sp=(w_factor, sp_axis), tp=(h_factor, tp_axis))
     vae_parallel_config = VaeHWParallelConfig.from_tuples(height=(h_factor, tp_axis), width=(w_factor, sp_axis))
     encoder_parallel_config = EncoderParallelConfig.from_tuple((h_factor, tp_axis))
+    if os.environ.get("WAN_ENC_ON_SP_AXIS") == "1":  # EXPERIMENT: shard the text encoder over the 8-device axis
+        encoder_parallel_config = EncoderParallelConfig.from_tuple((tuple(mesh_device.shape)[sp_axis], sp_axis))
 
     pipeline = pipeline_cls(
         device=mesh_device,
@@ -308,6 +310,14 @@ def test_pipeline_performance(
     if quant_config_name is not None:
         qc = getattr(QuantConfig, quant_config_name)()
         set_quant_config(pipeline, qc)
+    if os.environ.get("WAN_SDPA_BF8") == "1" and not os.environ.get("WAN_WEIGHTS_BF8"):  # EXPERIMENT
+        from models.tt_dit.pipelines.wan.quant_config import set_weights_only_cast
+
+        set_weights_only_cast(pipeline, [])
+    if os.environ.get("WAN_WEIGHTS_BF8"):  # EXPERIMENT: weight-only bfloat8_b for the listed layers
+        from models.tt_dit.pipelines.wan.quant_config import set_weights_only_cast
+
+        set_weights_only_cast(pipeline, os.environ["WAN_WEIGHTS_BF8"].split(","))
 
     # Warmup run (not timed)
     logger.info("Running warmup iteration...")

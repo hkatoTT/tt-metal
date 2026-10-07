@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from loguru import logger
@@ -316,3 +317,65 @@ def set_quant_config(pipeline, config: QuantConfig) -> None:
             apply_quant_config(pipeline.transformer_states[idx].model, config)
 
     pipeline._prepare_transformer = _prepare_with_quant
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENT (hkato): weight-only bfloat8_b cast that keeps every compute config as configured by the model
+# ---------------------------------------------------------------------------
+
+_WEIGHT_ONLY_LAYERS = {
+    "qkv": lambda b: b.attn1.to_qkv,
+    "out": lambda b: b.attn1.to_out,
+    "xq": lambda b: b.attn2.to_q,
+    "xkv": lambda b: b.attn2.to_kv,
+    "xout": lambda b: b.attn2.to_out,
+    "ff1": lambda b: b.ffn.ff1,
+    "ff2": lambda b: b.ffn.ff2,
+}
+
+
+def cast_weights_only(model, names, dtype=ttnn.bfloat8_b) -> None:
+    for block in model.blocks:
+        if os.environ.get("WAN_PROJ_LOFI"):
+            set_block_proj_fidelity(block, os.environ["WAN_PROJ_LOFI"].split(","))
+        for name in names:
+            linear = _WEIGHT_ONLY_LAYERS[name](block)
+            if linear.weight._data is not None:
+                _quantize_weight(linear.weight, dtype)
+            if getattr(linear, "bias", None) is not None and linear.bias._data is not None:
+                _quantize_weight(linear.bias, dtype)
+    if os.environ.get("WAN_SDPA_BF8") == "1":  # EXPERIMENT: ring SDPA inputs (q / k / v) in bfloat8_b
+        for block in model.blocks:
+            block.attn1._sdpa_input_dtype = ttnn.bfloat8_b
+    logger.info(f"Weight-only cast to {dtype}: {names}")
+
+
+def set_weights_only_cast(pipeline, names, dtype=ttnn.bfloat8_b) -> None:
+    for state in pipeline.transformer_states:
+        if state.model.is_loaded():
+            cast_weights_only(state.model, names, dtype)
+    if not hasattr(pipeline, "_orig_prepare_transformer"):
+        pipeline._orig_prepare_transformer = pipeline._prepare_transformer
+    original_prepare = pipeline._orig_prepare_transformer
+
+    def _prepare_with_cast(idx: int):
+        was_loaded = pipeline.transformer_states[idx].model.is_loaded()
+        original_prepare(idx)
+        if not was_loaded:
+            cast_weights_only(pipeline.transformer_states[idx].model, names, dtype)
+
+    pipeline._prepare_transformer = _prepare_with_cast
+
+
+def set_block_proj_fidelity(block, parts, fidelity=ttnn.MathFidelity.LoFi) -> None:
+    """EXPERIMENT (hkato): WAN_PROJ_LOFI=attn,ffn lowers only the math fidelity of those projection matmuls
+    (every other compute-config field is kept)."""
+    cfgs = []
+    if "attn" in parts:
+        cfgs += [block.attn1.mm_compute_kernel_config, block.attn2.mm_compute_kernel_config]
+        cfgs += [block.attn1.to_out.compute_config, block.attn2.to_out.compute_config]
+    if "ffn" in parts:
+        cfgs += [block.ff_compute_kernel_config]
+    for cfg in cfgs:
+        if cfg is not None:
+            cfg.math_fidelity = fidelity

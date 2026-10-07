@@ -227,8 +227,9 @@ class WanTransformerBlock(Module):
         gate_msa_1B1D = ttnn.typecast(gate_msa_1B1D, dtype=ttnn.bfloat16)
         c_gate_msa_1B1D = ttnn.typecast(c_gate_msa_1B1D, dtype=ttnn.bfloat16)
 
+        norm_dtype = ttnn.bfloat8_b if os.environ.get("WAN_AGMM_IN_BF8") == "1" else None  # EXPERIMENT
         spatial_normed_1BND = self.norm1(
-            spatial_1BND, dynamic_weight=(1.0 + scale_msa_1B1D), dynamic_bias=shift_msa_1B1D
+            spatial_1BND, dynamic_weight=(1.0 + scale_msa_1B1D), dynamic_bias=shift_msa_1B1D, dtype=norm_dtype
         )
 
         # Self attention on spatial with fused residual addcmul
@@ -244,19 +245,31 @@ class WanTransformerBlock(Module):
         )
 
         # Cross attention on prompt
-        spatial_normed_1BND = self.norm2(spatial_1BND)
+        spatial_normed_1BND = self.norm2(spatial_1BND, dtype=norm_dtype)
 
-        attn_output_1BND = self.attn2(
-            spatial_1BND=spatial_normed_1BND,
-            N=N,
-            prompt_1BLP=prompt_1BLP,
-            cross_attn_mask=cross_attn_mask,
-        )
-        spatial_1BND = spatial_1BND + attn_output_1BND
+        if os.environ.get("WAN_XATTN_FUSED_ADD") == "1":  # EXPERIMENT: residual add fused into cross to_out
+            if getattr(self, "_ones_gate", None) is None or tuple(self._ones_gate.shape) != tuple(gate_msa_1B1D.shape):
+                self._ones_gate = ttnn.ones_like(gate_msa_1B1D)
+            spatial_1BND = self.attn2(
+                spatial_1BND=spatial_normed_1BND,
+                N=N,
+                prompt_1BLP=prompt_1BLP,
+                cross_attn_mask=cross_attn_mask,
+                addcmul_residual=spatial_1BND,
+                addcmul_gate=self._ones_gate,
+            )
+        else:
+            attn_output_1BND = self.attn2(
+                spatial_1BND=spatial_normed_1BND,
+                N=N,
+                prompt_1BLP=prompt_1BLP,
+                cross_attn_mask=cross_attn_mask,
+            )
+            spatial_1BND = spatial_1BND + attn_output_1BND
 
         # Feed Forward
         spatial_normed_1BND = self.norm3(
-            spatial_1BND, dynamic_weight=(1.0 + c_scale_msa_1B1D), dynamic_bias=c_shift_msa_1B1D
+            spatial_1BND, dynamic_weight=(1.0 + c_scale_msa_1B1D), dynamic_bias=c_shift_msa_1B1D, dtype=norm_dtype
         )
 
         if self.ccl_manager.topology == ttnn.Topology.Linear:
@@ -754,9 +767,12 @@ class WanTransformer3DModel(Module):
         FFN) runs once on 2n rows, with one FSDP weight gather instead of two. WanAttention splits the passes
         again where needed (blocks see `_cfg_batch == 2`). Returns (cond, uncond), each laid out like inner_step's.
         """
+        hk_marks = [self._synced_time()] if os.environ.get("WAN_FWD_TIMING") == "1" else None
         temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
         spatial_1BND = self.patch_embedding(spatial_1BNI)
         spatial_1BND = ttnn.concat([spatial_1BND, spatial_1BND], dim=2)
+        if hk_marks:
+            hk_marks.append(self._synced_time())
 
         for block in self.blocks:
             block.attn1._cfg_batch = 2
@@ -776,6 +792,8 @@ class WanTransformer3DModel(Module):
             for block in self.blocks:
                 block.attn1._cfg_batch = 1
                 block.attn2._cfg_batch = 1
+        if hk_marks:
+            hk_marks.append(self._synced_time())
 
         scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
         shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)
@@ -800,6 +818,10 @@ class WanTransformer3DModel(Module):
                     half, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
                 )
             outs.append(half)
+        if hk_marks:
+            hk_marks.append(self._synced_time())
+            pre, blocks, post = ((b - a) * 1e3 for a, b in zip(hk_marks, hk_marks[1:]))
+            print(f"WAN_FWD pre={pre:.2f} blocks={blocks:.2f} post={post:.2f} ms", flush=True)
         return outs[0], outs[1]
 
     # Prep run is False because we warmup the entire pipeline first. Remove if this is not desired.
@@ -888,6 +910,22 @@ class WanCheckpoint:
     def state_dict(self) -> dict[str, torch.Tensor]:
         return dict(self._state_dict)
 
+    @staticmethod
+    def _bf8_load_names() -> list[str]:
+        if os.environ.get("WAN_WEIGHTS_BF8_LOAD") != "1" or not os.environ.get("WAN_WEIGHTS_BF8"):
+            return []
+        return os.environ["WAN_WEIGHTS_BF8"].split(",")
+
+    def _cache_suffix(self, is_fsdp: bool) -> str:
+        suffix = "-ffnresident" if self._ffn_resident(is_fsdp) else ""
+        if self._bf8_load_names():
+            suffix += "-bf8w-" + "-".join(self._bf8_load_names())
+        return suffix
+
+    def _full_resident(self, is_fsdp: bool) -> bool:
+        # EXPERIMENT: WAN_FULL_RESIDENT=<subfolder>[,<subfolder>] drops FSDP for that checkpoint entirely.
+        return is_fsdp and self._subfolder in os.environ.get("WAN_FULL_RESIDENT", "").split(",")
+
     def _ffn_resident(self, is_fsdp: bool) -> bool:
         # WAN_FFN_RESIDENT=<subfolder>[,<subfolder>] keeps that checkpoint's FFN weights resident (no FSDP on
         # ff1/ff2) while the rest of the model stays FSDP. Costs ~2.3 GiB/device for a 14B transformer.
@@ -907,7 +945,10 @@ class WanCheckpoint:
         Loading is deferred so the caller can manage the lifecycle (deallocate / reload).
         """
         c = self._config
-        return WanTransformer3DModel(
+        ffn_resident = self._ffn_resident(is_fsdp)
+        if self._full_resident(is_fsdp):
+            is_fsdp = False
+        model = WanTransformer3DModel(
             patch_size=c.patch_size,
             num_heads=c.num_attention_heads,
             dim=c.num_attention_heads * c.attention_head_dim,
@@ -923,10 +964,28 @@ class WanCheckpoint:
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
             is_fsdp=is_fsdp,
-            ffn_fsdp=not self._ffn_resident(is_fsdp),
+            ffn_fsdp=not ffn_resident,
             model_type=model_type,
             lora_enabled=lora_enabled,
         )
+        if os.environ.get("WAN_SDPA_BF8") == "1" or os.environ.get("WAN_PROJ_LOFI"):
+            from models.tt_dit.pipelines.wan.quant_config import set_block_proj_fidelity
+
+            for block in model.blocks:
+                if os.environ.get("WAN_SDPA_BF8") == "1":
+                    block.attn1._sdpa_input_dtype = ttnn.bfloat8_b
+                if os.environ.get("WAN_PROJ_LOFI"):
+                    set_block_proj_fidelity(block, os.environ["WAN_PROJ_LOFI"].split(","))
+        if self._bf8_load_names():
+            from models.tt_dit.pipelines.wan.quant_config import _WEIGHT_ONLY_LAYERS
+
+            for block in model.blocks:
+                for name in self._bf8_load_names():
+                    linear = _WEIGHT_ONLY_LAYERS[name](block)
+                    linear.weight.dtype = ttnn.bfloat8_b
+                    if getattr(linear, "bias", None) is not None:
+                        linear.bias.dtype = ttnn.bfloat8_b
+        return model
 
     def load(
         self,
@@ -937,11 +996,14 @@ class WanCheckpoint:
         is_fsdp: bool,
     ) -> None:
         """Load (or reload) weights for a previously-built transformer."""
+        cache_suffix = self._cache_suffix(is_fsdp)
+        if self._full_resident(is_fsdp):
+            is_fsdp = False
         cache.load_model(
             tt_model=model,
             get_torch_state_dict=lambda: self._state_dict,
             # resident FFN weights are cached with a different sharding, so they get their own cache entry
-            model_name=os.path.basename(self._name) + ("-ffnresident" if self._ffn_resident(is_fsdp) else ""),
+            model_name=os.path.basename(self._name) + cache_suffix,
             subfolder=self._subfolder,
             parallel_config=parallel_config,
             mesh_shape=tuple(mesh_device.shape),

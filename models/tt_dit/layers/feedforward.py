@@ -1,11 +1,13 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
-
-# SPDX-License-Identifier: Apache-2.0
+import os
 
 import ttnn
 
 from .linear import ColParallelLinear, Linear, LoRAColParallelLinear, LoRARowParallelLinear, RowParallelLinear
 from .module import Module
+
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
 
 
 class FeedForward(Module):
@@ -161,6 +163,7 @@ class ParallelFeedForward(Module):
 
         `default_block_size` and `force_transpose` are forwarded to ff1 only, as in `forward`.
         """
+        ff2_in_bf8 = os.environ.get("WAN_FFN2_IN_BF8") == "1"  # EXPERIMENT: ff1 emits bf8 for ff2 (MM+RS)
         ff1_out = self.ff1(
             x,
             compute_kernel_config=compute_kernel_config,
@@ -169,6 +172,7 @@ class ParallelFeedForward(Module):
             core_grid=core_grid,
             force_transpose=force_transpose,
             use_persistent_buffer=use_persistent_buffer,
+            dtype=ttnn.bfloat8_b if ff2_in_bf8 else None,
         )
         return self.ff2.forward_fused_addcmul(
             ff1_out,
@@ -177,4 +181,5 @@ class ParallelFeedForward(Module):
             scalar=scalar,
             compute_kernel_config=compute_kernel_config,
             use_persistent_buffer=use_persistent_buffer,
+            dtype=addcmul_a.get_dtype() if ff2_in_bf8 else None,
         )

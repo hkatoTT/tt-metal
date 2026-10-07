@@ -1,8 +1,5 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
-
-# SPDX-License-Identifier: Apache-2.0
-
 import math
+import os
 
 import torch
 
@@ -18,6 +15,11 @@ from ..utils.matmul import (
 )
 from ..utils.tensor import prepare_for_fused_swiglu
 from .module import Module, Parameter
+
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
 
 # Fidelity per weight dtype. Quantized dtypes (e.g. bfloat8_b) are deliberately absent: callers
 # look up with .get(dtype, HiFi2). This compute_config is a dead default for any op handed an
@@ -438,6 +440,10 @@ class ColParallelLinear(Module):
                 force_transpose=force_transpose,
             )
 
+            if os.environ.get("WAN_AGMM_IN_BF8") == "1":  # EXPERIMENT: bf8 activation input, bf16 output
+                dtype = dtype or ttnn.bfloat16
+                if x.get_dtype() == ttnn.bfloat16:
+                    x = ttnn.typecast(x, ttnn.bfloat8_b)
             tp_mesh_axis = parallel_config.tensor_parallel.mesh_axis
             ag_persistent_buffer = (
                 self.ccl_manager.get_ag_ping_pong_buffer(x.shape, -1, tp_mesh_axis, dtype=x.get_dtype())

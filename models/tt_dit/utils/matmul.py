@@ -576,6 +576,19 @@ grid_12_8_configs = {
     (128, 6144, 768): (4, 12, 4, (2, 2)),  # 87.4 µs, −2.2% vs 12×9 — attn to_out prompt
 }
 
+
+# EXPERIMENT (hkato): WAN_AGMM_OVR="MxKxN=mb,kb,nb,sh,sw;..." overrides 8x8 table entries (re-applied after
+# every register_matmul_configs call, so model-registered entries are overridden too).
+def _apply_agmm_env_overrides() -> None:
+    for _ovr in filter(None, os.environ.get("WAN_AGMM_OVR", "").split(";")):
+        _shape, _blk = _ovr.split("=")
+        _m, _k, _n = (int(v) for v in _shape.split("x"))
+        _b = [int(v) for v in _blk.split(",")]
+        grid_88_configs[(_m, _k, _n)] = (_b[0], _b[1], _b[2], (_b[3], _b[4]))
+
+
+_apply_agmm_env_overrides()
+
 _grid_config_lookup = {
     (8, 8): grid_88_configs,
     (8, 9): grid_89_configs,
@@ -1187,6 +1200,7 @@ def register_matmul_configs(configs: dict) -> None:
             msg = f"Unknown grid key {grid_key!r}, expected one of {list(grid_map)}"
             raise ValueError(msg)
         target.update(entries)
+    _apply_agmm_env_overrides()
 
 
 def register_fused_mmrs_configs(configs: dict) -> None:
@@ -1208,6 +1222,18 @@ def register_fused_mmrs_configs(configs: dict) -> None:
     """
     for core_grid, entries in configs.items():
         fused_mmrs_configs.setdefault(core_grid, {}).update(entries)
+    # EXPERIMENT (hkato): WAN_MMRS_OVR="MxKxN=mb,kb,nb,sh,sw;..." overrides the blocking of registered entries
+    for _ovr in filter(None, os.environ.get("WAN_MMRS_OVR", "").split(";")):
+        _shape, _blk = _ovr.split("=")
+        _key = tuple(int(v) for v in _shape.split("x"))
+        _b = [int(v) for v in _blk.split(",")]
+        for _table in fused_mmrs_configs.values():
+            if _key in _table:
+                _table[_key] = _table[_key]._replace(
+                    M_block_size=_b[0], K_block_size=_b[1], N_block_size=_b[2], subblock_h=_b[3], subblock_w=_b[4]
+                )
+                if len(_b) > 5:  # 6th value: mm_window_blocks (0 = no L1 window, DRAM handoff)
+                    _table[_key] = _table[_key]._replace(mm_window_blocks=_b[5] or None)
 
 
 # ===================================================================== Fabric-bound all-gather-matmul

@@ -120,7 +120,7 @@ class TextEncoder:
 
         # Pad batch list of prompts to ensure proper sharding on batch dimension.
         total_prompts = len(all_input_prompts)
-        num_devices = self._device.shape[1 - self._dit_parallel_config.tensor_parallel.mesh_axis]
+        num_devices = self._device.shape[1 - self._encoder_parallel_config.tensor_parallel.mesh_axis]
         all_input_prompts += [" "] * ((num_devices - (total_prompts % num_devices)) % num_devices)
 
         all_prompt_embeds = self._encode(
@@ -158,7 +158,7 @@ class TextEncoder:
 
         # Shard on batch dimension. On non TP axis
         dims = [None, None]
-        DP_axis = 1 - self._dit_parallel_config.tensor_parallel.mesh_axis
+        DP_axis = 1 - self._encoder_parallel_config.tensor_parallel.mesh_axis
         dims[DP_axis] = 0
         mesh_mapper = ttnn.ShardTensor2dMesh(self._device, mesh_shape=tuple(self._device.shape), dims=dims)
         tt_prompt = ttnn.from_torch(

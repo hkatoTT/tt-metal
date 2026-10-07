@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -384,7 +385,9 @@ all_gather_minimal_matmul_async_factory_helper(
     //
     // The PR's single-buffered output is KEPT (not reverted to 2x): it is what lets large-N
     // shapes such as chunks=3 QKV fit in L1; re-doubling it OOMs those here.
-    const uint32_t double_buffer_factor = 2;
+    // EXPERIMENT (hkato): TT_AGMM_CB_DEPTH overrides the in0/in1 CB depth (default 2)
+    const char* hk_depth_env = std::getenv("TT_AGMM_CB_DEPTH");
+    const uint32_t double_buffer_factor = hk_depth_env ? static_cast<uint32_t>(std::atoi(hk_depth_env)) : 2;
     uint32_t in0_cb_num_tiles = in0_block_num_tiles * double_buffer_factor;
     uint32_t in1_cb_num_tiles = in1_block_num_tiles * double_buffer_factor;
     // SwiGLU writes half the N tiles per block (one per gate/up pair); the intermediate
@@ -455,8 +458,13 @@ all_gather_minimal_matmul_async_factory_helper(
             tt::tt_metal::datatype_to_dataformat_converter(fused_ternary_input_a.value().dtype());
         auto ternary_a_tile_size = tt::tile_size(ternary_a_data_format);
 
-        TT_FATAL(ternary_a_tile_size == in1_tile_size, "ternary_a_tile_size must be equal to in1_tile_size");
-        TT_FATAL(ternary_a_data_format == in1_data_format, "ternary_a_data_format must be equal to in1_data_format");
+        // EXPERIMENT (hkato): TT_AGMM_TERNARY_ANY_DF=1 lets the residual (ternary A) differ from the weight format
+        // (the DM kernels size ternary A from its own CB and the compute kernel reconfigures before the add).
+        if (std::getenv("TT_AGMM_TERNARY_ANY_DF") == nullptr) {
+            TT_FATAL(ternary_a_tile_size == in1_tile_size, "ternary_a_tile_size must be equal to in1_tile_size");
+            TT_FATAL(
+                ternary_a_data_format == in1_data_format, "ternary_a_data_format must be equal to in1_data_format");
+        }
         uint32_t ternary_a_cb_num_tiles = out_block_num_tiles;  // Same as output block, not double buffered
 
         tt::tt_metal::create_cb(

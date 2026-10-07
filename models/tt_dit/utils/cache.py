@@ -130,7 +130,9 @@ def load_model(
         # Without this a handful of flipped bytes on the way to disk is reused on every later run,
         # and nothing downstream can tell a damaged weight from a real one. Off by default because
         # it re-reads the whole cache once at creation.
-        if _verify_env_enabled() and not verify_saved_model(tt_model, cache_dir):
+        verify_failed = _verify_env_enabled() and not verify_saved_model(tt_model, cache_dir)
+        drop_host_copies(tt_model)
+        if verify_failed:
             logger.error(f"cache at '{cache_dir}' did not verify; leaving it unmarked so it is rebuilt next time.")
             return
         _mark_cache_complete(cache_dir)
@@ -159,6 +161,24 @@ def verify_saved_model(tt_model: Module, cache_dir: str | Path, /, *, prefix: st
             logger.error(f"cache incomplete: no tensorbin for '{prefix}{name}' at '{path}'")
             continue
         reloaded = None
+        host_copy = getattr(parameter, "_host_copy", None)
+        if host_copy is not None:
+            # TT_DIT_FAST_CACHE_SAVE: the file was written from this host tensor; compare on the host
+            try:
+                fresh_t = ttnn.load_tensor(path, device=None)
+                resident = [ttnn.to_torch(t) for t in ttnn.get_device_tensors(host_copy)]
+                fresh = [ttnn.to_torch(t) for t in ttnn.get_device_tensors(fresh_t)]
+                bad = [
+                    i for i, (a, b) in enumerate(zip(resident, fresh)) if a.shape != b.shape or not torch.equal(a, b)
+                ]
+                if len(resident) != len(fresh) or bad:
+                    ok = False
+                    logger.error(f"cache mismatch in '{path.name}': shards {bad or 'count'} differ")
+            except RuntimeError as err:
+                ok = False
+                logger.error(f"cache unreadable: '{path.name}' failed to load or compare: {err}")
+            parameter._host_copy = None
+            continue
         try:
             # A truncated or malformed file raises here; that is a bad cache, not a bad run.
             reloaded = ttnn.load_tensor(path, device=None if parameter.on_host else parameter.device)
@@ -253,3 +273,12 @@ def _distributed_world_size() -> int:
 
 def _cache_root() -> str | None:
     return os.environ.get("TT_DIT_CACHE_DIR")
+
+
+def drop_host_copies(tt_model: Module) -> None:
+    """Release the host copies TT_DIT_FAST_CACHE_SAVE keeps for save() / verification."""
+    for _, child in tt_model.named_children():
+        drop_host_copies(child)
+    for _, parameter in tt_model.named_parameters():
+        if getattr(parameter, "_host_copy", None) is not None:
+            parameter._host_copy = None

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -438,7 +439,8 @@ class Parameter:
             msg = f"expected tensor shape {self.total_shape}, got {shape}"
             raise LoadingError(msg)
 
-        self.data = tensor.from_torch(
+        fast_save = os.environ.get("TT_DIT_FAST_CACHE_SAVE") == "1" and not self.on_host and self.device is not None
+        host = tensor.from_torch(
             torch_tensor,
             device=self.device,
             layout=self.layout,
@@ -446,10 +448,21 @@ class Parameter:
             memory_config=self.memory_config,
             pad_value=self.pad_value,
             mesh_axes=self.mesh_axes,
-            on_host=self.on_host,
+            on_host=self.on_host or fast_save,
         )
+        if fast_save:
+            # keep the host copy for save(); it is exactly what goes to the devices
+            self._host_copy = host
+            self.data = ttnn.to_device(host, self.device, memory_config=self.memory_config)
+        else:
+            self.data = host
 
     def save(self, path: str | Path, /) -> None:
+        host_copy = getattr(self, "_host_copy", None)
+        if host_copy is not None:
+            # the host copy is kept until cache.verify_saved_model / cache.drop_host_copies releases it
+            ttnn.dump_tensor(path, host_copy, mode=ttnn.DumpTensorMode.LOCAL)
+            return
         ttnn.dump_tensor(path, self.data, mode=ttnn.DumpTensorMode.LOCAL)
 
     def load(self, path: str | Path, /) -> None:

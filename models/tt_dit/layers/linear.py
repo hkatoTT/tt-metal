@@ -458,7 +458,7 @@ class ColParallelLinear(Module):
                 weight_tensor=weight,
                 bias_tensor=self.bias.data if self.bias is not None else None,
                 config=matmul_config,
-                fused_activation=self.fused_activation_fn,
+                fused_activation=None if os.environ.get("WAN_TIMING_NO_GELU") == "1" else self.fused_activation_fn,
                 compute_kernel_config=compute_kernel_config or self.compute_config,
                 persistent_output_buffer=ag_persistent_buffer,
                 multi_device_global_semaphore=ag_global_semaphores,
@@ -746,7 +746,9 @@ class RowParallelLinear(Module):
         # array is the RS->MM return path that lets the matmul recycle window slots. A config
         # with mm_window_blocks=None opts out and falls back to self.mm_memory_config (the op
         # rejects an L1 MM output without a window).
-        mmrs_params = get_fused_mmrs_config(M, K, N, core_grid, self.ccl_manager.num_links)
+        # EXPERIMENT (hkato): WAN_MMRS_LINKS overrides the fused MM+RS link count (more RS workers per link)
+        mmrs_links = int(os.environ.get("WAN_MMRS_LINKS", "0")) or self.ccl_manager.num_links
+        mmrs_params = get_fused_mmrs_config(M, K, N, core_grid, mmrs_links)
         use_l1_handoff = mmrs_params["mm_window_blocks"] is not None
         _, output = ttnn.experimental.minimal_matmul_strided_reduce_scatter_async(
             input_tensor=[x, x_second] if x_second is not None else x,

@@ -1234,6 +1234,15 @@ def register_fused_mmrs_configs(configs: dict) -> None:
                 )
                 if len(_b) > 5:  # 6th value: mm_window_blocks (0 = no L1 window, DRAM handoff)
                     _table[_key] = _table[_key]._replace(mm_window_blocks=_b[5] or None)
+                if len(_b) > 6:  # 7th value: matmul grid rows (grid.y), 8th: RS workers per link (0 = derived)
+                    _g = _table[_key].compute_with_storage_grid_size
+                    _table[_key] = _table[_key]._replace(compute_with_storage_grid_size=ttnn.CoreCoord(_g.x, _b[6]))
+                if len(_b) > 7:
+                    _table[_key] = _table[_key]._replace(num_workers_per_link=_b[7] or None)
+                if len(_b) > 8:  # 9th: num_buffers_per_channel (0 = default), 10th: chunk_width_in_mm_blocks
+                    _table[_key] = _table[_key]._replace(num_buffers_per_channel=_b[8] or None)
+                if len(_b) > 9:
+                    _table[_key] = _table[_key]._replace(chunk_width_in_mm_blocks=_b[9])
 
 
 # ===================================================================== Fabric-bound all-gather-matmul

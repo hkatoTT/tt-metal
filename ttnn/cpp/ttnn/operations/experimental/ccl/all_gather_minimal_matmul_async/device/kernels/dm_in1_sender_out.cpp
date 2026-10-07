@@ -518,7 +518,40 @@ void kernel_main() {
                 // This frees sender to start next read earlier
                 cb_in1.push_back(in1_block_num_tiles);
 
-                if (!is_sink_core) {
+#ifdef AGMM_IN1_MCAST_NDESTS
+                if (!is_sink_core && is_injector_core) {
+                    in1_sender_sem.wait(AGMM_IN1_MCAST_NDESTS);
+                    in1_sender_sem.set(0);
+                    // one multicast per K row of the block (only the non-padded N tiles), all linked to
+                    // the closing semaphore multicast
+                    for (uint32_t i = 0; i < K_block_tiles; i++) {
+                        noc_obj.async_write_multicast(
+                            CoreLocalMem<uint32_t>(in1_start_address),
+                            MulticastEndpoint{},
+                            current_N_tiles_bytes,
+                            AGMM_IN1_MCAST_NDESTS,
+                            {},
+                            {.noc_x_start = in1_sender_noc_x,
+                             .noc_y_start = in1_sender_noc_y,
+                             .noc_x_end = in1_dest_noc_x,
+                             .noc_y_end = in1_dest_noc_y,
+                             .addr = in1_start_address},
+                            /*linked=*/true);
+                        in1_start_address += full_N_tiles_bytes;
+                    }
+                    in1_valid_sem.relay_multicast(
+                        noc_obj,
+                        in1_receiver_sem,
+                        in1_sender_noc_x,
+                        in1_sender_noc_y,
+                        in1_dest_noc_x,
+                        in1_dest_noc_y,
+                        AGMM_IN1_MCAST_NDESTS,
+                        /*linked=*/false);
+                    noc_obj.async_writes_flushed();
+                } else
+#endif
+                    if (!is_sink_core) {
                     in1_sender_sem.wait(1);
                     in1_sender_sem.set(0);
 

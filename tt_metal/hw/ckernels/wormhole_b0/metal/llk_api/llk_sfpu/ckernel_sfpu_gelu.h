@@ -350,6 +350,40 @@ inline void calculate_gelu_tanh() {
     constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
     constexpr float GELU_TANH_K = 0.044715f;
 
+    if constexpr (!is_fp32_dest_acc_en && ITERATIONS % 2 == 0) {
+        // bf16 dest: two rows in lockstep through the tanh polynomial, so each fills the other's SFPMAD
+        // stall slots (WH). Same operations in the same order as the one-row loop below.
+        sfpi::vFloat c1 = TANH_POLY_C1;
+#pragma GCC unroll 4
+        for (int d = 0; d < ITERATIONS / 2; d++) {
+            sfpi::vFloat x0 = sfpi::dst_reg[0];
+            sfpi::vFloat x1 = sfpi::dst_reg[1];
+            sfpi::vFloat u0 = x0 * x0;
+            sfpi::vFloat u1 = x1 * x1;
+            // sqrt(2/pi) folded into the cubic: u = x * (S*K*x^2 + S)
+            u0 = (SQRT_2_OVER_PI * GELU_TANH_K) * u0 + SQRT_2_OVER_PI;
+            u1 = (SQRT_2_OVER_PI * GELU_TANH_K) * u1 + SQRT_2_OVER_PI;
+            u0 = x0 * u0;
+            u1 = x1 * u1;
+            sfpi::vFloat t0, t1;
+            _sfpu_tanh_polynomial_x2_(t0, t1, u0, u1, c1);
+
+            // reload due to register pressure
+            x0 = sfpi::dst_reg[0];
+            x1 = sfpi::dst_reg[1];
+            sfpi::vFloat h0 = 0.5f * x0;
+            sfpi::vFloat h1 = 0.5f * x1;
+            h0 = h0 * t0 + h0;
+            h1 = h1 * t1 + h1;
+            h0 = sfpi::convert<sfpi::vFloat16b>(h0, sfpi::RoundMode::Nearest);
+            h1 = sfpi::convert<sfpi::vFloat16b>(h1, sfpi::RoundMode::Nearest);
+            sfpi::dst_reg[0] = h0;
+            sfpi::dst_reg[1] = h1;
+            sfpi::dst_reg += 2;
+        }
+        return;
+    }
+
 #pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat x = sfpi::dst_reg[0];

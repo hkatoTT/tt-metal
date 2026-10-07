@@ -1092,6 +1092,14 @@ all_gather_minimal_matmul_async_factory_helper(
             "fused_act_dst_id",
             mm_output_tensors[0].dtype());
     }
+    // TT_AGMM_ACT_ON_PACK=1: a fused GELU_TANH runs on the pack thread (gelu_tanh_tile_pack), so the math thread's
+    // per-tile bias add / copy of the epilogue overlaps the SFPU work.
+    if (const char* e = std::getenv("TT_AGMM_ACT_ON_PACK");
+        e != nullptr && std::string(e) == "1" && use_bias && !fuse_swiglu && !use_fused_ternary &&
+        fused_activation.has_value() &&
+        fused_activation.value().op_type == ttnn::operations::unary::UnaryOpType::GELU_TANH) {
+        compute_defines["AGMM_ACT_ON_PACK"] = "1";
+    }
     compute_defines.merge(compute_activation_defines);
     auto compute_kernels_id = CreateKernel(
         program,

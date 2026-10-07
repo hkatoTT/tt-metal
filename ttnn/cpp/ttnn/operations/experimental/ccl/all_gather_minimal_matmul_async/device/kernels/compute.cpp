@@ -14,6 +14,7 @@
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/dataflow/circular_buffer.h"
+#include "api/compute/eltwise_unary/gelu.h"
 
 #ifdef FUSE_SWIGLU
 // Fused SwiGLU output stage. The matmul produced an interleaved gate/up block in `in_cb`:
@@ -120,11 +121,22 @@ void add_bias_block(
             tile_regs_acquire();
             add_tiles_bcast<BroadcastType::ROW>(
                 in_cb.get_cb_id(), bias_cb.get_cb_id(), tile_id, n, fused_act_dst_id /*dst*/);
-#ifdef SFPU_OP_INIT_ACTIVATION
+#if defined(SFPU_OP_INIT_ACTIVATION) && !defined(AGMM_ACT_ON_PACK)
             SFPU_OP_FUNC_ACTIVATION
 #endif
             tile_regs_commit();
+#if defined(SFPU_OP_INIT_ACTIVATION) && defined(AGMM_ACT_ON_PACK)
+            // GELU on the pack thread (same pattern as bmm's apply_activation_from_pack)
+            PACK(TTI_SEMWAIT(
+                p_stall::STALL_TDMA | p_stall::STALL_CFG,
+                semaphore::t6_sem(semaphore::MATH_PACK),
+                p_stall::STALL_ON_ZERO));
+            PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
+            gelu_tanh_tile_pack(fused_act_dst_id);
+            PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
+#else
             tile_regs_wait();
+#endif
             pack_tile(fused_act_dst_id, out_cb.get_cb_id());
             tile_regs_release();
             tile_id++;
@@ -436,7 +448,9 @@ void kernel_main() {
     CircularBuffer ternary_a_cb(ternary_a_cb_id);
     CircularBuffer ternary_b_cb(ternary_b_cb_id);
 
-#ifdef SFPU_OP_INIT_ACTIVATION
+#if defined(SFPU_OP_INIT_ACTIVATION) && defined(AGMM_ACT_ON_PACK)
+    gelu_tanh_tile_init_pack();
+#elif defined(SFPU_OP_INIT_ACTIVATION)
     SFPU_OP_INIT_ACTIVATION
 #endif
 

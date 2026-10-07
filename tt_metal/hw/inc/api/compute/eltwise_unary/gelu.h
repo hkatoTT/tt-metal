@@ -56,11 +56,11 @@ ALWI void gelu_tile_pack(uint32_t idst) {
  * Init for gelu_tanh_tile. See gelu_tanh_tile() for semantics.
  */
 ALWI void gelu_tanh_tile_init() {
-    MATH(llk_math_eltwise_unary_sfpu_init<SfpuType::gelu_tanh>(sfpu::gelu_tanh_init));
+    MATH(llk_math_eltwise_unary_sfpu_init<SfpuType::gelu_tanh>(sfpu::gelu_tanh_init<DST_ACCUM_MODE>));
 }
 
 ALWI void gelu_tanh_tile_init_pack() {
-    PACK(llk_math_eltwise_unary_sfpu_init<SfpuType::gelu_tanh>(sfpu::gelu_tanh_init));
+    PACK(llk_math_eltwise_unary_sfpu_init<SfpuType::gelu_tanh>(sfpu::gelu_tanh_init<DST_ACCUM_MODE>));
 }
 
 // clang-format off

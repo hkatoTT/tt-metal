@@ -358,7 +358,13 @@ inline void calculate_gelu_tanh() {
         sfpi::vFloat p = GELU_TANH_K * x2 + 1.0f;
         sfpi::vFloat q = x * p;
         sfpi::vFloat u = SQRT_2_OVER_PI * q;
-        sfpi::vFloat t = _sfpu_tanh_fp32_accurate_(u);
+        sfpi::vFloat t;
+        if constexpr (is_fp32_dest_acc_en) {
+            t = _sfpu_tanh_fp32_accurate_(u);
+        } else {
+            // bf16 dest: the result is rounded to bf16 below, so the bf16 polynomial tanh is enough.
+            t = _sfpu_tanh_polynomial_(u);
+        }
 
         // reload due to register pressure
         x = sfpi::dst_reg[0];
@@ -375,10 +381,11 @@ inline void calculate_gelu_tanh() {
     }
 }
 
+template <bool is_fp32_dest_acc_en = true>
 inline void gelu_tanh_init() {
     math::reset_counters(p_setrwc::SET_ABD_F);
-    // initialise constants for _sfpu_tanh_fp32_accurate_
-    tanh_init<false, true>();
+    // constants for _sfpu_tanh_fp32_accurate_ (fp32 dest) or _sfpu_tanh_polynomial_ (bf16 dest)
+    tanh_init<false, is_fp32_dest_acc_en>();
 }
 
 // =============================================================================

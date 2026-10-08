@@ -507,6 +507,13 @@ class WanPipeline(PipelineAPIMixin):
             is_fsdp=self.is_fsdp,
         )
 
+    def _hk_preupload(self, key, value: torch.Tensor) -> ttnn.Tensor:
+        """EXPERIMENT (hkato): float32 device tensor cached by key (timestep / guidance value)."""
+        cache = self.__dict__.setdefault("_hk_upload_cache", {})
+        if key not in cache:
+            cache[key] = float32_tensor(value, device=self.mesh_device)
+        return cache[key]
+
     def _step(
         self,
         *,
@@ -533,17 +540,29 @@ class WanPipeline(PipelineAPIMixin):
         permuted_model_input = self.get_model_input(permuted_latent_tt, cond_latents)
 
         assert timestep.ndim == 1, "Wan2.2-T2V/I2V requires a 1D timestep tensor"
-        timestep = float32_tensor(
-            timestep.unsqueeze(1).unsqueeze(1).unsqueeze(1), device=(None if traced else self.mesh_device)
-        )
+        hk_pre = os.environ.get("WAN_PREUPLOAD") == "1" and not traced and not self._expand_timesteps
+        if hk_pre:  # EXPERIMENT (hkato): device tensors made once per value (see _hk_preupload)
+            timestep = self._hk_preupload(
+                ("t", float(t), latents_batch_size), timestep.unsqueeze(1).unsqueeze(1).unsqueeze(1)
+            )
+        else:
+            timestep = float32_tensor(
+                timestep.unsqueeze(1).unsqueeze(1).unsqueeze(1), device=(None if traced else self.mesh_device)
+            )
 
         # guidance_scale is passed as a 1-element device tensor (broadcast via ttnn.lerp's
         # tensor-weight overload) so it can be updated in place between traced executions,
         # mirroring how `timestep` above is threaded through the captured trace.
-        guidance_scale_tt = float32_tensor(
-            torch.tensor(ts.guidance_scale, dtype=torch.float32).reshape(1, 1, 1, 1),
-            device=(None if traced else self.mesh_device),
-        )
+        if hk_pre:
+            guidance_scale_tt = self._hk_preupload(
+                ("g", float(ts.guidance_scale)),
+                torch.tensor(ts.guidance_scale, dtype=torch.float32).reshape(1, 1, 1, 1),
+            )
+        else:
+            guidance_scale_tt = float32_tensor(
+                torch.tensor(ts.guidance_scale, dtype=torch.float32).reshape(1, 1, 1, 1),
+                device=(None if traced else self.mesh_device),
+            )
 
         permuted_velocity_pred_tt = ts.model.combined_step(
             do_classifier_free_guidance=cfg_enabled,
@@ -742,6 +761,12 @@ class WanPipeline(PipelineAPIMixin):
         latent_frames, latent_height, latent_width = latents.shape[2], latents.shape[3], latents.shape[4]
         prepared_prompts = [False, False]
 
+        if os.environ.get("WAN_PREUPLOAD") == "1" and not traced and not self._expand_timesteps:
+            for hk_t in timesteps:  # EXPERIMENT (hkato): upload all timesteps before the loop
+                self._hk_preupload(
+                    ("t", float(hk_t), latents.shape[0]),
+                    torch.full((latents.shape[0],), hk_t, dtype=torch.float32).unsqueeze(1).unsqueeze(1).unsqueeze(1),
+                )
         with tqdm.tqdm(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 warmup_t2 = i == 1 and len(timesteps) == 2  # Ensure transformer_2 is also warmed up

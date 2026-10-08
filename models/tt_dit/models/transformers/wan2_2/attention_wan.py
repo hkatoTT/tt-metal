@@ -124,11 +124,13 @@ class WanAttention(Module):
         self.dummy_joint_input = bf16_tensor(torch.zeros((1, self.n_local_heads, 0, self.head_dim)), device=mesh_device)
 
         full_grid = self.mesh_device.compute_with_storage_grid_size()
+        # EXPERIMENT (hkato): WAN_XSDPA_CHUNK="q,k" / WAN_XSDPA_EXP_APPROX=1 for the plain (cross-attention) SDPA
+        hk_xq, hk_xk = (int(v) for v in os.environ.get("WAN_XSDPA_CHUNK", "256,256").split(","))
         self.sdpa_program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=full_grid,
-            q_chunk_size=256,
-            k_chunk_size=256,
-            exp_approx_mode=False,  # NOTE: False is more correct
+            q_chunk_size=hk_xq,
+            k_chunk_size=hk_xk,
+            exp_approx_mode=os.environ.get("WAN_XSDPA_EXP_APPROX") == "1",  # NOTE: False is more correct
         )
 
         self.sdpa_worker_grid = (full_grid.x - 1, full_grid.y)  # Reserve last column for CCL

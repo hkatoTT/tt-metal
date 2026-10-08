@@ -216,12 +216,29 @@ class WanTransformerBlock(Module):
         spatial_1BND: fractured N on SP, fractured D on TP
         """
 
-        assert temb_1BTD.shape[2] == 6, "wan2.2 14b expects 6 chunks in timestep embedding"
+        if isinstance(temb_1BTD, (tuple, list)):
+            # EXPERIMENT (hkato): WAN_TEMB_PRESLICE=1 -- the timestep embedding arrives pre-chunked (sliced once per
+            # step for all blocks); the constant table is chunked once per block. Same fp32 adds, no per-block
+            # untilize/slice/tilize chains.
+            hk_tab = getattr(self, "_hk_table_chunks", None)
+            if hk_tab is None or hk_tab[0] is not self.scale_shift_table.data:
+                hk_tab = (self.scale_shift_table.data, ttnn.chunk(self.scale_shift_table.data, 6, dim=2))
+                self._hk_table_chunks = hk_tab
+            shift_msa_1B1D, scale_msa_1B1D, gate_msa_1B1D, c_shift_msa_1B1D, c_scale_msa_1B1D, c_gate_msa_1B1D = (
+                tab + tmb for tab, tmb in zip(hk_tab[1], temb_1BTD)
+            )
+        else:
+            assert temb_1BTD.shape[2] == 6, "wan2.2 14b expects 6 chunks in timestep embedding"
 
-        shifted_temb_1BTD = self.scale_shift_table.data + temb_1BTD
-        shift_msa_1B1D, scale_msa_1B1D, gate_msa_1B1D, c_shift_msa_1B1D, c_scale_msa_1B1D, c_gate_msa_1B1D = ttnn.chunk(
-            shifted_temb_1BTD, 6, dim=2
-        )
+            shifted_temb_1BTD = self.scale_shift_table.data + temb_1BTD
+            (
+                shift_msa_1B1D,
+                scale_msa_1B1D,
+                gate_msa_1B1D,
+                c_shift_msa_1B1D,
+                c_scale_msa_1B1D,
+                c_gate_msa_1B1D,
+            ) = ttnn.chunk(shifted_temb_1BTD, 6, dim=2)
 
         # NOTE: workaround - addcmul (fused and unfused) is less accurate with fp32 gate input
         gate_msa_1B1D = ttnn.typecast(gate_msa_1B1D, dtype=ttnn.bfloat16)
@@ -769,6 +786,8 @@ class WanTransformer3DModel(Module):
         """
         hk_marks = [self._synced_time()] if os.environ.get("WAN_FWD_TIMING") == "1" else None
         temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
+        if os.environ.get("WAN_TEMB_PRESLICE") == "1":  # EXPERIMENT (hkato): chunk once per step for all blocks
+            timestep_proj_1BTD = tuple(ttnn.chunk(timestep_proj_1BTD, 6, dim=2))
         spatial_1BND = self.patch_embedding(spatial_1BNI)
         spatial_1BND = ttnn.concat([spatial_1BND, spatial_1BND], dim=2)
         if hk_marks:
@@ -778,7 +797,11 @@ class WanTransformer3DModel(Module):
             block.attn1._cfg_batch = 2
             block.attn2._cfg_batch = 2
         try:
-            for block in self.blocks:
+            hk_flush = int(os.environ.get("WAN_PROF_FLUSH_EVERY", "0"))  # EXPERIMENT (hkato): avoid profiler overflow
+            if hk_flush > 0:
+                ttnn.synchronize_device(self.mesh_device)
+                ttnn.ReadDeviceProfiler(self.mesh_device)
+            for hk_i, block in enumerate(self.blocks):
                 spatial_1BND = block(
                     spatial_1BND=spatial_1BND,
                     prompt_1BLP=(prompt_1BLP, negative_prompt_1BLP),
@@ -788,12 +811,17 @@ class WanTransformer3DModel(Module):
                     rope_sin=rope_sin_1HND,
                     trans_mat=trans_mat,
                 )
+                if hk_flush > 0 and (hk_i + 1) % hk_flush == 0:
+                    ttnn.synchronize_device(self.mesh_device)
+                    ttnn.ReadDeviceProfiler(self.mesh_device)
         finally:
             for block in self.blocks:
                 block.attn1._cfg_batch = 1
                 block.attn2._cfg_batch = 1
         if hk_marks:
+            hk_enq = (time.perf_counter() - hk_marks[-1]) * 1e3  # EXPERIMENT (hkato): host enqueue time, no sync
             hk_marks.append(self._synced_time())
+            print(f"WAN_FWD host_enqueue_blocks={hk_enq:.2f} ms", flush=True)
 
         scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
         shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)

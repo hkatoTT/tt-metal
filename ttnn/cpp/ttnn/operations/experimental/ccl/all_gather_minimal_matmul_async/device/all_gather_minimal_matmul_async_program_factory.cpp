@@ -705,6 +705,10 @@ all_gather_minimal_matmul_async_factory_helper(
         }
         defines["CHUNK_TILE_WIDTHS"] = widths_csv;
         defines["CHUNK_TILE_OFFSETS"] = offsets_csv;
+        if (const char* e = std::getenv("TT_AGMM_V_HEADS");
+            e != nullptr && std::atoi(e) > 0 && chunk_tile_widths.size() == 3) {
+            defines["HK_AGMM_V_HEADS"] = std::to_string(std::atoi(e));  // EXPERIMENT (hkato)
+        }
     }
 
     in0_defines = defines;

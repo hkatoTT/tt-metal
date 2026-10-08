@@ -487,6 +487,7 @@ class WanAttention(Module):
                 spatial_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
             )
 
+        hk_v_BHNE = None  # EXPERIMENT (hkato): V already head-split by the QKV AGMM
         if self.is_self:
             # Fused QKV matmul with split output for self-attention
             q_1BNF, k_1BNF, v_1BNF = self.to_qkv(
@@ -496,6 +497,14 @@ class WanAttention(Module):
                 dtype=ttnn.bfloat8_b if os.environ.get("WAN_QKV_OUT_BF8") == "1" else None,  # EXPERIMENT
             )
             q_1BNF, k_1BNF = rows_to_dim1(q_1BNF), rows_to_dim1(k_1BNF)
+            hk_v_heads = os.environ.get("TT_AGMM_V_HEADS")  # EXPERIMENT (hkato)
+            if hk_v_heads is not None and int(hk_v_heads) > 0:
+                # the QKV AGMM wrote V in head-split order [1, H, 2n, E]; as folded heads that is [1, 2H, n, E]
+                assert head_fold and int(hk_v_heads) * 32 == v_1BNF.shape[3] // self.n_local_heads
+                hk_v_BHNE = ttnn.experimental.view(
+                    v_1BNF,
+                    (1, 2 * self.n_local_heads, v_1BNF.shape[2] // 2, v_1BNF.shape[3] // self.n_local_heads),
+                )
             v_1BNF = v_1BNF if head_fold else rows_to_dim0(v_1BNF)
         else:
             # Cross-attention: Q from spatial, fused KV from prompt
@@ -567,8 +576,11 @@ class WanAttention(Module):
                     dtype=norm_output_dtype,
                 )
             )
-            v_BHNE = create_heads(v_1BNF)
-            if head_fold:  # [1, H, 2n, E] -> [1, 2H, n, E], same head order as q / k
+            if hk_v_BHNE is not None:
+                v_BHNE = hk_v_BHNE
+            else:
+                v_BHNE = create_heads(v_1BNF)
+            if head_fold and hk_v_BHNE is None:  # [1, H, 2n, E] -> [1, 2H, n, E], same head order as q / k
                 v_BHNE = ttnn.reshape(v_BHNE, (1, 2 * v_BHNE.shape[1], v_BHNE.shape[2] // 2, v_BHNE.shape[3]))
             if prompt_1BLP is not None and os.environ.get("WAN_XATTN_BF8") == "1":  # EXPERIMENT
                 k_BHNE, v_BHNE = ttnn.typecast(k_BHNE, ttnn.bfloat8_b), ttnn.typecast(v_BHNE, ttnn.bfloat8_b)

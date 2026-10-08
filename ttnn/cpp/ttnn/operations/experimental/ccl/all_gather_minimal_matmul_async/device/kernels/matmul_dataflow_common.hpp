@@ -815,7 +815,16 @@ void write_block_sync_split(
             }
 
             // Row stride is this chunk's own width (a shared width would scatter later chunks).
+#ifdef HK_AGMM_V_HEADS
+            // EXPERIMENT (hkato): V chunk of a fused QKV in head-split order [H, M, E]
+            uint32_t tile_id_in_chunk =
+                (N_chunks == 3 && chunk_idx == 2)
+                    ? ((tile_idx_in_chunk / HK_AGMM_V_HEADS) * chunk_shape.logical_d0 + i) * HK_AGMM_V_HEADS +
+                          tile_idx_in_chunk % HK_AGMM_V_HEADS
+                    : i * chunk_tile_widths[chunk_idx] + tile_idx_in_chunk;
+#else
             uint32_t tile_id_in_chunk = i * chunk_tile_widths[chunk_idx] + tile_idx_in_chunk;
+#endif
 
             // Compile-time dispatch preserving concrete types
             write_tile_to_chunk(
@@ -878,7 +887,16 @@ void write_block_sync_granular_split(
                     break;
                 }
 
+#ifdef HK_AGMM_V_HEADS
+                // EXPERIMENT (hkato): V chunk of a fused QKV in head-split order [H, M, E]
+                uint32_t tile_id =
+                    (N_chunks == 3 && chunk_idx == 2)
+                        ? ((tile_idx_in_chunk / HK_AGMM_V_HEADS) * chunk_shape.logical_d0 + m_tile) * HK_AGMM_V_HEADS +
+                              tile_idx_in_chunk % HK_AGMM_V_HEADS
+                        : m_tile * chunk_tile_widths[chunk_idx] + tile_idx_in_chunk;
+#else
                 uint32_t tile_id = m_tile * chunk_tile_widths[chunk_idx] + tile_idx_in_chunk;
+#endif
                 // Compile-time dispatch preserving concrete types
                 write_tile_to_chunk(
                     noc,

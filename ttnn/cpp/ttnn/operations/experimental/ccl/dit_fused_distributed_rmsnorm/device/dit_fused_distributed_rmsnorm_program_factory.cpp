@@ -1379,6 +1379,12 @@ for (uint32_t f = 0; f < num_forwarders; f++) {
                     if (const char* e = std::getenv("TT_DLN_FPU_PRE"); e != nullptr && e[0] == '1' && is_layernorm) {
                         d["HK_LN_FPU_PRE"] = "1";  // EXPERIMENT (hkato)
                     }
+                    if (const char* e = std::getenv("TT_DLN_POST_FUSE"); e != nullptr && e[0] == '1' && is_layernorm) {
+                        d["HK_LN_POST_FUSE"] = "1";  // EXPERIMENT (hkato)
+                        if (const char* e2 = std::getenv("TT_DLN_POST_FID"); e2 != nullptr && e2[0] == '2') {
+                            d["HK_POST_FID"] = "MathFidelity::HiFi2";  // POST multiplies at HiFi2
+                        }
+                    }
                     return d;
                 }(),
         });

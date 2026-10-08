@@ -264,7 +264,11 @@ constexpr uint32_t INVALID_CB = 32;
 #ifdef ARCH_BLACKHOLE
 constexpr uint32_t MIN_BLOCKED_PACK_TILES = 4;
 #else
+#ifdef HK_BLOCKED_PACK_MIN
+constexpr uint32_t MIN_BLOCKED_PACK_TILES = HK_BLOCKED_PACK_MIN;  // EXPERIMENT (hkato)
+#else
 constexpr uint32_t MIN_BLOCKED_PACK_TILES = 8;
+#endif
 #endif
 ALWI bool should_use_blocked_pack_width(uint32_t pack_width) { return pack_width >= MIN_BLOCKED_PACK_TILES; }
 

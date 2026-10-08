@@ -45,6 +45,8 @@
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/transpose.h"
 #include "api/compute/welford.h"
+#include "api/compute/reduce.h"
+#include "api/compute/eltwise_unary/relu.h"
 #include "api/dataflow/circular_buffer.h"
 #include "ttnn/operations/normalization/kernel_util/compute/memory.h"
 
@@ -186,6 +188,98 @@ void kernel_main() {
         }
 
         // -------- PHASE 1: PRE — local per-token Welford (mean, var) over the shard --------
+#ifdef HK_LN_FPU_PRE
+        if constexpr (streaming_low_l1 == 0 && is_tp_1 == 0) {
+            // EXPERIMENT (hkato): FPU PRE -- (mean, var) of this shard in column 0.
+            constexpr uint32_t hk_scalar_sum_cb = get_compile_time_arg_val(4);  // 1.0 reduce scaler
+            constexpr uint32_t hk_s = 0;                                        // row sums
+            constexpr uint32_t hk_q = 1;                                        // row sums of squares -> var
+            constexpr uint32_t hk_t = 2;                                        // scratch
+            constexpr uint32_t hk_inv_n_bits = __builtin_bit_cast(uint32_t, 1.0f / static_cast<float>(reduce_width));
+            constexpr uint32_t hk_bs = DST_ACCUM_MODE ? 4u : 8u;
+            cb_combine.reserve_back(2);  // idle until this row's combine: [sum, sum of squares] scratch
+            // Pass S: sum_c x -> col 0, accumulated in DEST over the row.
+            reconfig_data_format(hk_scalar_sum_cb, input_cb);
+            reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(input_cb, hk_scalar_sum_cb, combine_cb);
+            tile_regs_acquire();
+            for (uint32_t c = 0; c < num_tile_cols; c++) {
+                reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(input_cb, hk_scalar_sum_cb, c, 0, hk_s);
+            }
+            reduce_uninit();
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_reconfig_data_format(combine_cb);
+            PACK((llk_pack_reconfig_l1_acc(0)));
+            pack_tile<true>(hk_s, combine_cb, 0);
+            tile_regs_release();
+            // Pass Q: x*x per tile, L1-accumulated into combine tile 1 (fp32).
+            reconfig_data_format(input_cb, input_cb);
+            mul_tiles_init(input_cb, input_cb);
+            for (uint32_t c0 = 0; c0 < num_tile_cols; c0 += hk_bs) {
+                const uint32_t n = (num_tile_cols - c0) < hk_bs ? (num_tile_cols - c0) : hk_bs;
+                tile_regs_acquire();
+                for (uint32_t i = 0; i < n; i++) {
+                    mul_tiles(input_cb, input_cb, c0 + i, c0 + i, i);
+                }
+                tile_regs_commit();
+                tile_regs_wait();
+                for (uint32_t i = 0; i < n; i++) {
+                    PACK((llk_pack_reconfig_l1_acc((c0 == 0 && i == 0) ? 0 : 1)));
+                    pack_tile<true>(i, combine_cb, 1);
+                }
+                tile_regs_release();
+            }
+            PACK((llk_pack_reconfig_l1_acc(0)));
+            cb_combine.push_back(2);
+            // Pass R: mean = S / N, var = max(Q / N - mean^2, 0), both in column 0.
+            cb_combine.wait_front(2);
+            reconfig_data_format(hk_scalar_sum_cb, combine_cb);
+            reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(combine_cb, hk_scalar_sum_cb, stats_local_cb);
+            tile_regs_acquire();
+            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(combine_cb, hk_scalar_sum_cb, 1, 0, hk_q);
+            reduce_uninit();
+            reconfig_data_format_srca(combine_cb);
+            copy_init(combine_cb);
+            copy_tile(combine_cb, 0, hk_s);
+            copy_tile(combine_cb, 0, hk_t);
+            binop_with_scalar_tile_init();
+            mul_unary_tile(hk_s, hk_inv_n_bits);  // mean
+            mul_unary_tile(hk_t, hk_inv_n_bits);  // mean (copy)
+            mul_unary_tile(hk_q, hk_inv_n_bits);  // E[x^2]
+            square_tile_init();
+            square_tile(hk_t);  // mean^2
+            sub_binary_tile_init();
+            sub_binary_tile(hk_q, hk_t, hk_q);  // var
+            relu_tile_init();
+            relu_tile(hk_q);  // var >= 0
+            tile_regs_commit();
+            cb_combine.pop_front(2);
+            // column 0 -> row 0 (the stats gather / combine expect Welford's row-0 layout)
+            cb_combine.reserve_back(2);
+            tile_regs_wait();
+            pack_reconfig_data_format(combine_cb);
+            pack_tile(hk_s, combine_cb);
+            pack_tile(hk_q, combine_cb);
+            tile_regs_release();
+            cb_combine.push_back(2);
+            cb_combine.wait_front(2);
+            reconfig_data_format_srca(combine_cb);
+            transpose_init(combine_cb);
+            tile_regs_acquire();
+            transpose_tile(combine_cb, 0, hk_s);
+            transpose_tile(combine_cb, 1, hk_q);
+            tile_regs_commit();
+            cb_combine.pop_front(2);
+            cb_stats_local.reserve_back(2);
+            tile_regs_wait();
+            pack_reconfig_data_format(stats_local_cb);
+            pack_tile(hk_s, stats_local_cb);
+            pack_tile(hk_q, stats_local_cb);
+            tile_regs_release();
+            cb_stats_local.push_back(2);
+            reconfig_data_format(input_cb, input_cb);
+        } else
+#endif
         {
             tile_regs_acquire();
             // welford_init() programs the SFPU replay buffer + address mods (needed every row).

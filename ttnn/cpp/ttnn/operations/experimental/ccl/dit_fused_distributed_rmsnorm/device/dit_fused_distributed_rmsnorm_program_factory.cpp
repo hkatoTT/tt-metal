@@ -1373,6 +1373,14 @@ for (uint32_t f = 0; f < num_forwarders; f++) {
             .fp32_dest_acc_en = fp32_dest_acc_en,
             .math_approx_mode = math_approx_mode,
             .compile_args = compute_compile_args,
+            .defines =
+                [&] {
+                    std::map<std::string, std::string> d;
+                    if (const char* e = std::getenv("TT_DLN_FPU_PRE"); e != nullptr && e[0] == '1' && is_layernorm) {
+                        d["HK_LN_FPU_PRE"] = "1";  // EXPERIMENT (hkato)
+                    }
+                    return d;
+                }(),
         });
 
     // ------------------------------------------------------------------------

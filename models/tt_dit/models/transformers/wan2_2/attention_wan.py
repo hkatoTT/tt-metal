@@ -425,6 +425,16 @@ class WanAttention(Module):
         # of the head-split norm output (no permute / slice / concat). On by default; WAN_CFG_HEADFOLD=0 attends the
         # two passes as [2, H, n, E], one ring SDPA call each.
         head_fold = cfg_batch == 2 and self.is_self and os.environ.get("WAN_CFG_HEADFOLD", "1") == "1"
+        # EXPERIMENT (hkato): WAN_XATTN_FOLD=1 folds cross-attention the same way ([1, 2H, n, E]); the cached K/V are
+        # interleaved per head (h0 cond, h0 uncond, h1 cond, ...) to match the free reshape of the query.
+        x_fold = (
+            cfg_batch == 2
+            and not self.is_self
+            and isinstance(prompt_1BLP, tuple)
+            and cross_attn_mask is None
+            and os.environ.get("WAN_XATTN_FOLD") == "1"
+        )
+        head_fold = head_fold or x_fold
 
         def rows_to_dim1(t):
             # [1, 1, 2n, F] -> [1, 2, n, F], the batched layout the fused distributed RMSNorm accepts (view)
@@ -480,7 +490,7 @@ class WanAttention(Module):
             if prompt_pair is not None:
                 # K/V per prompt, stacked on the batch dim; cached under the pair of prompt tensors
                 if self._cross_kv_cache_enabled:
-                    cross_kv_key = ("pair", id(prompt_pair[0]), id(prompt_pair[1]))
+                    cross_kv_key = ("pairfold" if x_fold else "pair", id(prompt_pair[0]), id(prompt_pair[1]))
                 cached_kv = self._cross_kv_cache.get(cross_kv_key) if cross_kv_key is not None else None
                 if cached_kv is None:
                     ks, vs = [], []
@@ -488,7 +498,15 @@ class WanAttention(Module):
                         k_p, v_p = self.to_kv(prompt, compute_kernel_config=self.mm_compute_kernel_config)
                         ks.append(self.norm_k(k_p, num_heads_per_device=self.n_local_heads))
                         vs.append(create_heads(v_p))
-                    cached_kv = (ttnn.concat(ks, dim=0), ttnn.concat(vs, dim=0))
+                    if x_fold:
+                        # [1, H, L, E] x2 -> [1, H, 2L, E] -> [1, 2H, L, E]: head 2h+b holds prompt b of head h
+                        def _fold(ts):
+                            t = ttnn.concat(ts, dim=2)
+                            return ttnn.reshape(t, (1, 2 * t.shape[1], t.shape[2] // 2, t.shape[3]))
+
+                        cached_kv = (_fold(ks), _fold(vs))
+                    else:
+                        cached_kv = (ttnn.concat(ks, dim=0), ttnn.concat(vs, dim=0))
                     if os.environ.get("WAN_XATTN_BF8") == "1":  # EXPERIMENT
                         cached_kv = tuple(ttnn.typecast(t, ttnn.bfloat8_b) for t in cached_kv)
                     if cross_kv_key is not None:

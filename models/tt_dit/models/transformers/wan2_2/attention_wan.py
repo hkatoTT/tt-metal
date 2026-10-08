@@ -688,6 +688,15 @@ class WanAttention(Module):
             spatial_BHNE = ttnn.reshape(
                 spatial_BHNE, (1, spatial_BHNE.shape[1] // 2, spatial_BHNE.shape[2] * 2, spatial_BHNE.shape[3])
             )
+        if (
+            prompt_1BLP is None
+            and os.environ.get("WAN_SDPA_OUT_CAST_FIRST") == "1"
+            and os.environ.get("WAN_AGMM_IN_BF8") == "1"
+            and spatial_BHNE.dtype == ttnn.bfloat16
+        ):
+            # EXPERIMENT (hkato): cast the self-attention output to bf8 before concat_heads (half the data to move);
+            # the to_out AGMM would cast it right after concat_heads anyway
+            spatial_BHNE = ttnn.typecast(spatial_BHNE, ttnn.bfloat8_b)
         spatial_1BND = ttnn.transformer.concatenate_heads(spatial_BHNE)
         spatial_1BND = ttnn.unsqueeze(spatial_1BND, 0)
         if cfg_batch == 2:  # [1, 2, n, D] -> [1, 1, 2n, D], back to the stacked rows

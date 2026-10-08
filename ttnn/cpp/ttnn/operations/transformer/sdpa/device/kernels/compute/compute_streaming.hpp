@@ -628,6 +628,20 @@ void sub_exp_block_bcast_cols(
         uint32_t dst_index = 0;
         constexpr int iterations = 32;
         constexpr VectorMode vector_mode_exp = VectorMode::None;
+#if defined(HK_EXP_BATCH) && !defined(HK_SKIP_EXP)
+        {
+            const uint32_t hk_ntiles = tiles_per_row * tiles_per_column;
+            PACK((_llk_math_eltwise_unary_sfpu_params_(
+                [hk_ntiles]() {
+                    for (uint32_t t = 0; t < hk_ntiles; t++) {
+                        ckernel::sfpu::calculate_exponential<true, DST_ACCUM_MODE, false, iterations, false>();
+                    }
+                },
+                0,
+                vector_mode_exp)));
+            (void)dst_index;
+        }
+#else
         for (uint32_t i = 0; i < tiles_per_row; i++) {
             for (uint32_t j = 0; j < tiles_per_column; j++) {
 #ifndef HK_SKIP_EXP
@@ -637,6 +651,7 @@ void sub_exp_block_bcast_cols(
 #endif
             }
         }
+#endif
         PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
     }
 

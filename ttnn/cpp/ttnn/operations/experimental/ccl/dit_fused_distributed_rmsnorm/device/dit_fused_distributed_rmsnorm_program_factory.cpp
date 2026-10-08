@@ -585,7 +585,13 @@ for (uint32_t f = 0; f < num_forwarders; f++) {
     // intermediate/rotated CBs are fp32 when fp32_dest_acc_en (full precision
     // across post sub-phases), bf16 otherwise. Needed both for the streaming
     // decision (below) and the CB allocation (further down).
-    const tt::DataFormat intermediate_format = fp32_dest_acc_en ? fp32_format : bf16_format;
+    // EXPERIMENT (hkato): TT_DRMS_INTER_BF16=1 -> bf16 intermediate/rotated CBs even with fp32 dest (RMS only)
+    const char* hk_inter_e = std::getenv("TT_DRMS_INTER_BF16");
+    const char* hk_ln_inter_e = std::getenv("TT_DLN_INTER_BF16");  // EXPERIMENT (hkato): same for LayerNorm
+    const bool hk_inter_bf16 = args.norm_type != DitFusedNormType::LAYERNORM
+                                   ? (hk_inter_e != nullptr && std::string(hk_inter_e) == "1")
+                                   : (hk_ln_inter_e != nullptr && std::string(hk_ln_inter_e) == "1");
+    const tt::DataFormat intermediate_format = (fp32_dest_acc_en && !hk_inter_bf16) ? fp32_format : bf16_format;
     const uint32_t intermediate_tile_size = tt::tile_size(intermediate_format);
 
     // Welford reciprocal LUT (LayerNorm only): a caller-provided fp32 [.., reduce_width]

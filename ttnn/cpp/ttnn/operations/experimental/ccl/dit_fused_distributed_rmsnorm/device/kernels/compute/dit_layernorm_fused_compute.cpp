@@ -224,8 +224,10 @@ void kernel_main() {
                 tile_regs_commit();
                 tile_regs_wait();
                 for (uint32_t i = 0; i < n; i++) {
-                    PACK((llk_pack_reconfig_l1_acc((c0 == 0 && i == 0) ? 0 : 1)));
                     pack_tile<true>(i, combine_cb, 1);
+                    if (c0 == 0 && i == 0) {
+                        PACK((llk_pack_reconfig_l1_acc(1)));  // first x^2 tile overwrote; accumulate the rest
+                    }
                 }
                 tile_regs_release();
             }

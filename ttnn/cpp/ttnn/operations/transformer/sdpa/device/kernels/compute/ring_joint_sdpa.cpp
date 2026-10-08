@@ -227,6 +227,9 @@ void kernel_main() {
     // long-term state), merged into the long-term state (the restore CBs) afterwards, so no bf16 running sum spans
     // more than one shard's K chunks. A single running sum over a long prefix loses the late chunks' contribution.
     constexpr bool seg_accum_enabled = get_named_compile_time_arg_val("seg_accum") == 1;
+#ifdef HK_FINAL_CB
+    static_assert(!seg_accum_enabled && !ksplit_enabled, "HK_FINAL_CB: only the plain streaming ring path");
+#endif
     static_assert(!(ksplit_enabled && seg_accum_enabled));
     static_assert(
         !(ksplit_enabled || seg_accum_enabled) ||
@@ -606,7 +609,11 @@ void kernel_main() {
                 cb_max_out,
                 cb_prev_out,
                 cb_out,
+#ifdef HK_FINAL_CB
+                HK_FINAL_CB,  // EXPERIMENT (hkato): final normalized output in its own bf8 CB
+#else
                 cb_out,  // cb_normalized_out — output goes directly to cb_out
+#endif
                 cb_sum_out,
                 cb_sum_in,
                 cb_signal,

@@ -779,6 +779,12 @@ void kernel_main() {
     const auto stats_tile_logical = StaticTensorTileShape<B, NH, (q_local_padded_Nt + Lt) * 2, 1>();
 
     const auto out_generator = PaddedAddrGenerator(out_writer, output_tile_logical);
+#ifdef HK_FINAL_CB
+    // EXPERIMENT (hkato): final bf8 output -> joint_out (same mapping as out)
+    static_assert(output_has_no_padding, "HK_FINAL_CB needs the static output shape");
+    constexpr uint32_t hk_final_tile_bytes = get_tile_size(HK_FINAL_CB);
+    const auto hk_final_generator = PaddedAddrGenerator(joint_out_writer, StaticOutputTileShape());
+#endif
     const auto joint_out_generator = PaddedAddrGenerator(joint_out_writer, joint_tile_logical);
 
     generate_bcast_unary_scalar(CircularBuffer(cb_scale_in), scale_val);
@@ -1239,8 +1245,21 @@ void kernel_main() {
                         }
                         return out_generator;
                     }();
+#ifdef HK_FINAL_CB
+                    (void)gen;
+                    write_block_row_grouped_trid<output_has_no_padding>(
+                        noc,
+                        hk_final_generator,
+                        qi.out_slice,
+                        end_seq_tile,
+                        HK_FINAL_CB,
+                        hk_final_tile_bytes,
+                        out_subblock_h,
+                        /*flush_trid=*/0);
+#else
                     write_block_row_grouped_trid<output_has_no_padding>(
                         noc, gen, qi.out_slice, end_seq_tile, cb_out, tile_bytes, out_subblock_h, /*flush_trid=*/0);
+#endif
                 } else if (!single_q_chunk) {
                     deferred.pending = true;
                     deferred.trid = trid_for_q(q_index);

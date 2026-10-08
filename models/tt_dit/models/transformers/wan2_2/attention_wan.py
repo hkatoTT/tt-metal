@@ -648,7 +648,7 @@ class WanAttention(Module):
                             num_buffers_per_channel=32,
                         )
                     else:
-                        out, _, _ = ttnn.transformer.ring_joint_scaled_dot_product_attention(
+                        out, hk_jout, _ = ttnn.transformer.ring_joint_scaled_dot_product_attention(
                             q,
                             k,
                             v,
@@ -683,6 +683,8 @@ class WanAttention(Module):
                             ),
                             use_column_major_ccl=not fold_ccl_row_major,
                         )
+                        if os.environ.get("TT_RING_SDPA_FINAL_BF8") == "1":  # EXPERIMENT (hkato): final bf8 output
+                            return hk_jout
                     return out
 
                 if cfg_batch == 2 and not head_fold:

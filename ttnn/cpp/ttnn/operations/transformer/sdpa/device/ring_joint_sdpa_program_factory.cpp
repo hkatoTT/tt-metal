@@ -2044,6 +2044,17 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t cb_exp_max_diff = allocate_tile_cb(statistics_tiles, stats_tile_size, stats_df);
 
     const uint32_t cb_out = allocate_tile_cb(out0_t, out_tile_size, out_df);
+    // EXPERIMENT (hkato): TT_RING_SDPA_FINAL_BF8=1 -> final normalized output in its own bf8 CB, written to joint_out
+    uint32_t hk_final_cb = 0;
+    const bool hk_final_bf8 =
+        [] {
+            const char* e = std::getenv("TT_RING_SDPA_FINAL_BF8");
+            return e != nullptr && e[0] == '1';
+        }() &&
+        L == 0 && use_streaming_compute && !has_sliding_window && joint_output_tensor.dtype() == DataType::BFLOAT8_B;
+    if (hk_final_bf8) {
+        hk_final_cb = allocate_tile_cb(out0_t, tt::tile_size(tt::DataFormat::Bfp8_b), tt::DataFormat::Bfp8_b);
+    }
 
     // These CBs carry accumulator state between passes: DRAM save/restore across ring iterations, or the K-split
     // reducer's partial results from the other bands. Unsplit sliding attention folds every K/V range into one pass per
@@ -3107,6 +3118,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
 
     // Convert std::map<string,string> defines to KernelDescriptor::Defines vector form.
     KernelDescriptor::Defines kernel_defines(defines.begin(), defines.end());
+    if (hk_final_bf8) {
+        kernel_defines.emplace_back("HK_FINAL_CB", std::to_string(hk_final_cb));  // EXPERIMENT (hkato)
+    }
 
     // Build kernel descriptors locally so we can append per-core runtime args
     // before pushing them into desc.kernels at the end. KernelDescriptor creation

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "ttnn/operations/transformer/sdpa/device/ring_joint_sdpa_device_operation.hpp"
 #include "ttnn/tensor/tensor_ops.hpp"
 #include "ttnn/device_operation.hpp"
@@ -30,6 +31,13 @@
 #include "ttnn/tensor/types.hpp"
 
 using namespace tt::tt_metal;
+
+// EXPERIMENT (hkato)
+static bool hk_env_on(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && e[0] == '1';
+}
+static bool hk_out_bf8() { return hk_env_on("TT_RING_SDPA_OUT_BF8"); }
 
 namespace ttnn::prim {
 
@@ -1129,6 +1137,13 @@ RingJointSDPAResultSpec RingJointSDPADeviceOperation::compute_output_specs(
         joint_output_shape[3] = v_head_dim;
         joint_padded_seq = tensor_args.joint_q.value().padded_shape()[2];
     }
+    // EXPERIMENT (hkato): TT_RING_SDPA_FINAL_BF8=1 -> joint_out carries the final bf8 output (no joint Q)
+    const bool hk_final_bf8 = hk_env_on("TT_RING_SDPA_FINAL_BF8") &&
+                              (!has_joint_tensors || tensor_args.joint_q.value().logical_shape()[2] == 0);
+    if (hk_final_bf8) {
+        joint_output_shape = input.logical_shape();
+        joint_output_shape[3] = v_head_dim;
+    }
 
     auto stats_shape = input.logical_shape();
     stats_shape[3] = 1;
@@ -1142,9 +1157,17 @@ RingJointSDPAResultSpec RingJointSDPADeviceOperation::compute_output_specs(
 
     return {
         tt::tt_metal::TensorSpec(
-            out_shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), args.output_memory_config)),
+            out_shape,
+            TensorLayout(
+                hk_out_bf8() ? DataType::BFLOAT8_B : DataType::BFLOAT16,  // EXPERIMENT (hkato)
+                PageConfig(Layout::TILE),
+                args.output_memory_config)),
         tt::tt_metal::TensorSpec(
-            joint_output_shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), args.output_memory_config)),
+            joint_output_shape,
+            TensorLayout(
+                hk_final_bf8 ? DataType::BFLOAT8_B : DataType::BFLOAT16,
+                PageConfig(Layout::TILE),
+                args.output_memory_config)),
         tt::tt_metal::TensorSpec(
             stats_shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), args.output_memory_config))};
 }

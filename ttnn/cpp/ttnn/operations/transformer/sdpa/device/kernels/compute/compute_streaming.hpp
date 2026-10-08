@@ -652,9 +652,32 @@ void sub_exp_block_bcast_cols(
         } else {
             pack_contiguous_rows(inout_cb, max_row_base, tiles_per_row, cols_in_row, global_col_base, tiles_per_column);
         }
-        configure_single_tile_pack(reduce_cb);
+#ifdef HK_SUM_STRIDE0
+        // EXPERIMENT (hkato): the P pack above left a tiles_per_column-wide blocked-pack MOP (the sum CB has the
+        // same bf16 format). With the pack OUTPUT_ADDR_OFFSET GPR at 0 every tile of that MOP lands on the same L1
+        // tile, so one pack call L1-accumulates a row's P tiles into its sum tile. The first subblock of a row in
+        // a K chunk must overwrite, so it keeps the single-tile path below.
+        if (global_col_base > 0 && should_use_blocked_pack_width(tiles_per_column)) {
+            PACK((TT_SETDMAREG(
+                p_setdmareg::PAYLOAD_IMMEDIATE,
+                0,
+                p_setdmareg::MODE_IMMEDIATE,
+                LO_16(p_gpr_pack::OUTPUT_ADDR_OFFSET))));
+            PACK((llk_pack_reconfig_l1_acc(1)));
+            for (uint32_t i = 0; i < tiles_per_row; i++) {
+                pack_tile<true>(i * tiles_per_column, reduce_cb, max_row_base + i);
+            }
+            PACK((TT_SETDMAREG(
+                p_setdmareg::PAYLOAD_IMMEDIATE,
+                _llk_pack_output_addr_offset_words_(pack_dst_format[reduce_cb], FACE_R_DIM, 4),
+                p_setdmareg::MODE_IMMEDIATE,
+                LO_16(p_gpr_pack::OUTPUT_ADDR_OFFSET))));
+        } else
+#endif
         {
-            uint32_t dst_index = 0;
+            configure_single_tile_pack(reduce_cb);
+            {
+                uint32_t dst_index = 0;
 #pragma GCC unroll 1
             for (uint32_t i = 0; i < tiles_per_row; i++) {
                 if (global_col_base > 0) {
@@ -669,6 +692,7 @@ void sub_exp_block_bcast_cols(
                         PACK((llk_pack_reconfig_l1_acc(1)));
                     }
                 }
+            }
             }
         }
     }

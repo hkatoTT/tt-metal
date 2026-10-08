@@ -1914,6 +1914,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     defines["DHT_GRANULARITY"] = std::to_string(dht_granularity);
     defines["REDUCE_GRANULARITY"] = std::to_string(reduce_granularity);
     defines["EXP_APPROX_MODE"] = std::to_string(exp_approx_mode);
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_SUM_STRIDE0"); hk_e != nullptr && hk_e[0] == '1') {
+        defines["HK_SUM_STRIDE0"] = "1";  // EXPERIMENT (hkato)
+    }
     if (const char* hk_e = std::getenv("TT_SDPA_BLOCKED_PACK_MIN"); hk_e != nullptr) {
         defines["HK_BLOCKED_PACK_MIN"] = hk_e;  // EXPERIMENT (hkato)
     }

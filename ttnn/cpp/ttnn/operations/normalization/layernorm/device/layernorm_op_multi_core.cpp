@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -1068,6 +1069,10 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
     }
     if (rms_norm) {
         compute.compiler_options.defines.emplace("RMSNORM", "1");
+    }
+    if (const char* hk_e = std::getenv("TT_SILU_FAST"); hk_e != nullptr && std::atoi(hk_e) > 0) {
+        compute.compiler_options.defines.emplace(
+            "HK_SILU_FAST", std::to_string(std::atoi(hk_e)));  // EXPERIMENT (hkato)
     }
     if (input_is_row_major) {
         compute.compiler_options.defines.emplace("TILIZE_IN", "1");

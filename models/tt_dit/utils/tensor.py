@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -468,6 +469,20 @@ def _get_inter_host_axis(mesh_device: ttnn.MeshDevice, view, mesh_shape: tuple[i
     return 0
 
 
+_HK_D2H_BUFS: dict = {}  # EXPERIMENT (hkato): WAN_D2H_FAST output buffers
+_HK_D2H_IDX: dict = {}
+_HK_D2H_POOL = None
+
+
+def _hk_d2h_pool():
+    global _HK_D2H_POOL
+    if _HK_D2H_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _HK_D2H_POOL = ThreadPoolExecutor(max_workers=16)
+    return _HK_D2H_POOL
+
+
 def _reassemble_2d(
     mesh_coords: list,
     shards: list[torch.Tensor],
@@ -526,6 +541,27 @@ def _reassemble_2d(
             perm_list = list(permute)
             d0_out = perm_list.index(d0)
             d1_out = perm_list.index(d1)
+
+            if os.environ.get("WAN_D2H_FAST") == "1":
+                # EXPERIMENT (hkato): reuse two pre-faulted output buffers (alternating) and scatter the
+                # permuted shards straight into them from a thread pool (no per-shard contiguous temp).
+                key = (tuple(out_shape), out_dtype)
+                bufs = _HK_D2H_BUFS.setdefault(key, [])
+                if len(bufs) < 2:
+                    bufs.append(torch.empty(out_shape, dtype=out_dtype).fill_(0))
+                out = bufs[_HK_D2H_IDX.get(key, 0) % len(bufs)]
+                _HK_D2H_IDX[key] = _HK_D2H_IDX.get(key, 0) + 1
+
+                def _one(item):
+                    coord, shard = item
+                    r, c = int(coord[0]), int(coord[1])
+                    slices = [slice(None)] * ndim
+                    slices[d0_out] = slice(r * s0, (r + 1) * s0)
+                    slices[d1_out] = slice(c * s1, (c + 1) * s1)
+                    out[tuple(slices)].copy_(shard.permute(*permute))
+
+                list(_hk_d2h_pool().map(_one, zip(mesh_coords, shards)))
+                return out
 
             out = torch.empty(out_shape, dtype=out_dtype)
             for coord, shard in zip(mesh_coords, shards):

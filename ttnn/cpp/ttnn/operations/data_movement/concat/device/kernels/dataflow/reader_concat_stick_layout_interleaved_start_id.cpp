@@ -43,6 +43,35 @@ void kernel_main() {
 
     uint32_t curr_tensor = start_tensor;
     uint32_t curr_tensor_id = start_tensor_id;
+#if defined(HK_CONCAT_BATCH) && !defined(WIDTH_CONCAT)
+    // EXPERIMENT (hkato): HK_CONCAT_BATCH pages per DFB transaction, one barrier per batch
+    for (uint32_t i = 0; i < num_pages; i += HK_CONCAT_BATCH) {
+        const uint32_t n = (num_pages - i) < HK_CONCAT_BATCH ? (num_pages - i) : HK_CONCAT_BATCH;
+        dfb_in.reserve_back(HK_CONCAT_BATCH);
+        const uint32_t base = dfb_in.get_write_ptr();
+        for (uint32_t j = 0; j < n; ++j) {
+            auto page_size = get_compile_time_vararg(curr_tensor);
+            noc.async_read(
+                abstract_tensor_accessor_wrappers[curr_tensor],
+                CoreLocalMem<uint8_t>(base + j * HK_CONCAT_ENTRY),
+                page_size,
+                {.page_id = page_id_per_tensor[curr_tensor]},
+                {});
+            page_id_per_tensor[curr_tensor]++;
+            curr_tensor_id++;
+            if (curr_tensor_id == num_pages_per_block[curr_tensor]) {
+                curr_tensor_id = 0;
+                curr_tensor++;
+                if (curr_tensor == num_tensors) {
+                    curr_tensor = 0;
+                }
+            }
+        }
+        noc.async_read_barrier();
+        dfb_in.push_back(HK_CONCAT_BATCH);
+    }
+    return;
+#endif
     // FIX RM CONCAT WIDTH
     for (uint32_t i = 0; i < num_pages; ++i) {
         dfb_in.reserve_back(ublock_size_pages);

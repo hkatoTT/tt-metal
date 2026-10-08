@@ -31,6 +31,27 @@ void kernel_main() {
     // producer may stage each stick in an allocator-aligned entry that is wider than the stick.
     DataflowBuffer dfb_out0(dfb::out0);
 
+#if defined(HK_CONCAT_BATCH) && !defined(BACKWARDS)
+    // EXPERIMENT (hkato): HK_CONCAT_BATCH sticks per DFB transaction, one barrier per batch (concat only)
+    {
+        const uint32_t hk_end = start_id + num_sticks;
+        for (uint32_t i = start_id; i < hk_end; i += HK_CONCAT_BATCH) {
+            const uint32_t n = (hk_end - i) < HK_CONCAT_BATCH ? (hk_end - i) : HK_CONCAT_BATCH;
+            dfb_out0.wait_front(HK_CONCAT_BATCH);
+            for (uint32_t j = 0; j < n; ++j) {
+                noc.async_write(
+                    dfb_out0,
+                    s0,
+                    stick_size,
+                    {.offset_bytes = j * HK_CONCAT_ENTRY},
+                    {.page_id = i + j, .offset_bytes = 0});
+            }
+            noc.async_write_barrier();
+            dfb_out0.pop_front(HK_CONCAT_BATCH);
+        }
+        return;
+    }
+#endif
 #ifdef BACKWARDS
     uint32_t end_id = start_id - num_sticks;
     for (uint32_t i = start_id; i != end_id; --i) {

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "ttnn/operations/data_movement/concat/device/concat_program_factory.hpp"
 
 #include <algorithm>
@@ -149,6 +150,17 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
     if (num_input_pages * single_page_size > l1_budget) {
         num_input_pages = 1;
     }
+    // EXPERIMENT (hkato): TT_CONCAT_RM_BATCH=<B> -> row-major non-width concat moves B pages per DFB transaction
+    uint32_t hk_concat_batch = 1;
+    if (rm_layout && dim != output.padded_shape().rank() - 1) {
+        if (const char* e = std::getenv("TT_CONCAT_RM_BATCH"); e != nullptr && std::atoi(e) > 1) {
+            const uint32_t b = static_cast<uint32_t>(std::atoi(e));
+            if (2 * b * single_page_size <= l1_budget) {
+                hk_concat_batch = b;
+                num_input_pages = 2 * b;
+            }
+        }
+    }
 
     // The staging buffer the reader fills a page at a time and the writer drains: one locked FIFO
     // producer and one locked FIFO consumer, so a plain 1:1 DFB.
@@ -223,6 +235,13 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
     if (rm_layout && dim == num_dims - 1) {
         reader_defines.emplace("WIDTH_CONCAT", "1");
     }
+    KernelSpec::CompilerOptions::Defines writer_defines;
+    if (hk_concat_batch > 1) {
+        reader_defines.emplace("HK_CONCAT_BATCH", std::to_string(hk_concat_batch));
+        reader_defines.emplace("HK_CONCAT_ENTRY", std::to_string(single_page_size));
+        writer_defines.emplace("HK_CONCAT_BATCH", std::to_string(hk_concat_batch));
+        writer_defines.emplace("HK_CONCAT_ENTRY", std::to_string(single_page_size));
+    }
 
     // One TensorBinding per input, plus a TensorBindingSequence over them. The reader picks which
     // input a page comes from with a value it advances at run time, so it needs the bindings
@@ -294,6 +313,7 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
         .source = rm_layout ? "ttnn/cpp/ttnn/kernel/dataflow/writer_unary_stick_layout_interleaved_start_id_metal2.cpp"
                             : "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/"
                               "writer_unary_interleaved_start_id_metal2.cpp",
+        .compiler_options = {.defines = std::move(writer_defines)},
         .dfb_bindings =
             {
                 DFBBinding{

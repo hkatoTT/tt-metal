@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
+#include <string>
 #include "untilize_with_unpadding_multi_core_interleaved_program_factory.hpp"
 
 #include "ttnn/operations/math.hpp"
@@ -120,11 +122,17 @@ UntilizeWithUnpaddingMultiCoreInterleavedProgramFactory::create_program_artifact
     // logical row spans multiple shards), the buffer's aligned page size for HEIGHT-sharded output
     // (one row per page, padded up to the buffer alignment), the full unpadded row for interleaved —
     // is supplied by the tensor binding, which hands the kernel the tensor's aligned page size.
+    // EXPERIMENT (hkato): TT_UNTILIZE_BATCH_BARRIER=1 -> one write barrier per tile-row block
+    KernelSpec::CompilerOptions::Defines hk_writer_defines;
+    if (const char* e = std::getenv("TT_UNTILIZE_BATCH_BARRIER"); e != nullptr && std::string(e) == "1") {
+        hk_writer_defines.emplace("HK_BATCH_BARRIER", "1");
+    }
     KernelSpec writer{
         .unique_id = MCI_WRITER,
         .source =
             "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/"
             "writer_unary_stick_layout_split_rows_multicore.cpp",
+        .compiler_options = {.defines = std::move(hk_writer_defines)},
         .dfb_bindings = {DFBBinding{
             .dfb_spec_name = MCI_OUT,
             .accessor_name = "out",

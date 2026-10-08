@@ -56,9 +56,14 @@ void kernel_main() {
             tt::data_movement::common::noc_async_write_sharded(
                 noc, l1_read_addr, s, base_stick_id + k, /*offset=*/0, /*size=*/unpadded_X_size);
 
+#ifndef HK_BATCH_BARRIER
             noc.async_write_barrier();
+#endif
             l1_read_addr += padded_X_size;
         }
+#ifdef HK_BATCH_BARRIER
+        noc.async_write_barrier();  // EXPERIMENT (hkato): one barrier per tile-row block instead of per stick
+#endif
         dfb_out0.pop_front(num_tiles_per_row * has_rows);
     };
 

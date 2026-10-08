@@ -150,6 +150,14 @@ WH_4X8_DEVICE_PARAMS = (
     if os.environ.get("WAN_TRACED") == "1"
     else ring_params_req_exact_devices
 )
+# EXPERIMENT (hkato): WAN_KCFG_EXTRA_KB=<KB> grows the Tensix kernel-config ring (69 KB by default on WH) by
+# shrinking worker_l1_size, so the next program's binaries can be written while a large one (ring SDPA ~60 KB) runs
+if os.environ.get("WAN_KCFG_EXTRA_KB"):
+    _WH_DEFAULT_WORKER_L1_SIZE = 1499136 - 105696  # MEM_L1_SIZE - (MEM_MAP_END + 69 KB, aligned)
+    WH_4X8_DEVICE_PARAMS = {
+        **WH_4X8_DEVICE_PARAMS,
+        "worker_l1_size": _WH_DEFAULT_WORKER_L1_SIZE - int(os.environ["WAN_KCFG_EXTRA_KB"]) * 1024,
+    }
 
 
 @pytest.mark.parametrize(

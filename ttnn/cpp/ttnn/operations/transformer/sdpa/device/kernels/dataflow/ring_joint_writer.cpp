@@ -478,6 +478,29 @@ inline uint32_t get_end_seq_tile(const QChunkInfo& qi, uint32_t ring_id, uint32_
     }
 }
 
+#ifdef HK_OUT_CONCAT_HEADS
+// EXPERIMENT (hkato): output tile (b, h, r, c) of a [D0, D1, D2, D3] (tiles) tensor stored in concatenated-heads order.
+// MODE 1: [D0, D2, D1*D3]. MODE 2 (head-folded pairs h = 2g + p): [D0, 2*D2, (D1/2)*D3], rows p*D2 + r.
+template <uint32_t D0, uint32_t D1, uint32_t D2, uint32_t D3, uint32_t MODE>
+class HkConcatHeadsTileShape {
+public:
+    constexpr HkConcatHeadsTileShape() = default;
+    constexpr HkConcatHeadsTileShape(uint32_t, uint32_t, uint32_t, uint32_t) {}
+
+    uint32_t id_of(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t i3) const {
+        if constexpr (MODE == 2) {
+            static_assert(D1 % 2 == 0, "folded heads come in pairs");
+            return i0 * D1 * D2 * D3 + ((i1 & 1u) * D2 + i2) * ((D1 / 2) * D3) + (i1 >> 1) * D3 + i3;
+        } else {
+            return i0 * D1 * D2 * D3 + i2 * (D1 * D3) + i1 * D3 + i3;
+        }
+    }
+
+    static constexpr uint32_t d2() { return D2; }
+    static constexpr uint32_t stride2() { return MODE == 2 ? (D1 / 2) * D3 : D1 * D3; }
+};
+#endif
+
 void kernel_main() {
     constexpr uint32_t B = get_compile_time_arg_val(0);
     constexpr uint32_t NH = get_compile_time_arg_val(1);
@@ -741,7 +764,12 @@ void kernel_main() {
     const auto stats_writer = TensorAccessor(stats_args, stats_addr);
 
     constexpr bool output_has_no_padding = !has_joint_q && (q_local_padded_Nt % Sq_chunk_t == 0);
+#ifdef HK_OUT_CONCAT_HEADS
+    static_assert(output_has_no_padding, "HK_OUT_CONCAT_HEADS needs the static (unpadded) output shape");
+    using StaticOutputTileShape = HkConcatHeadsTileShape<B, NH, q_local_padded_Nt, vDHt, HK_OUT_CONCAT_HEADS>;
+#else
     using StaticOutputTileShape = StaticTensorTileShape<B, NH, q_local_padded_Nt, vDHt>;
+#endif
     using OutputTileShape = std::conditional_t<output_has_no_padding, StaticOutputTileShape, TensorTileShape>;
 
     const auto output_tile_logical = OutputTileShape(B, NH, q_local_padded_Nt, vDHt);

@@ -100,9 +100,16 @@ void kernel_main() {
 
     const auto out_writer = TensorAccessor(out_args, out_addr);
 
+#ifdef HK_OUT_PAIRFOLD
+    // EXPERIMENT (hkato): concat heads + un-fold the CFG head pairs (head 2g + p -> rows p*Sq + s, cols g*Dh)
+    static_assert(out_concat_heads && NQH % 2 == 0, "HK_OUT_PAIRFOLD needs output_concat_heads and paired heads");
+    const auto out_tile_shape = TensorTileShape(B, 1, 2 * valid_Sqt, (NQH / 2) * vDHt);
+    constexpr uint32_t out_row_stride = (NQH / 2) * vDHt;
+#else
     const auto out_tile_shape =
         out_concat_heads ? TensorTileShape(B, 1, valid_Sqt, NQH * vDHt) : TensorTileShape(B, NQH, valid_Sqt, vDHt);
     constexpr uint32_t out_row_stride = out_concat_heads ? NQH * vDHt : vDHt;
+#endif
 
     constexpr uint32_t barrier_threshold = get_barrier_read_threshold<tile_bytes, num_cores>();
 
@@ -233,7 +240,12 @@ void kernel_main() {
             const uint32_t out_row_tile_count = out_row_end_tile - out_row_start_tile;
             uint32_t out_tile_id;
             if constexpr (out_concat_heads) {
+#ifdef HK_OUT_PAIRFOLD
+                out_tile_id = out_tile_shape.id_of(
+                    nb, 0, (nq & 1u) * valid_Sqt + write_offset + out_row_start_tile, (nq >> 1) * vDHt);
+#else
                 out_tile_id = out_tile_shape.id_of(nb, 0, write_offset + out_row_start_tile, nq * vDHt);
+#endif
             } else {
                 out_tile_id = out_tile_shape.id_of(nb, nq, write_offset + out_row_start_tile, 0);
             }

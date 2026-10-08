@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "ttnn/operations/transformer/sdpa/device/sdpa_device_operation.hpp"
 #include "ttnn/operations/transformer/sdpa/device/sdpa_interleaved_cb_ids.hpp"
 #include "ttnn/operations/transformer/sdpa/device/sdpa_subblock_utils.hpp"
@@ -1421,6 +1422,10 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
     writer_desc.core_ranges = core_grid;
     writer_desc.compile_time_args = writer_compile_time_args;
     writer_desc.defines = defines;
+    if (const char* e = std::getenv("TT_SDPA_OUT_PAIRFOLD");
+        e != nullptr && std::string(e) == "1" && operation_attributes.output_concat_heads) {
+        writer_desc.defines.emplace_back("HK_OUT_PAIRFOLD", "1");  // EXPERIMENT (hkato)
+    }
     writer_desc.config = WriterConfigDescriptor{};
 
     KernelDescriptor compute_desc;

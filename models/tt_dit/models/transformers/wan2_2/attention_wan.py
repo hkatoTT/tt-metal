@@ -370,6 +370,26 @@ class WanAttention(Module):
             )
         return output
 
+    def _hk_concat_out(self, spatial_BHNE, prompt_1BLP, cfg_batch):
+        # concat_heads of the attention output (factored out so TT_RING_SDPA_OUT_CONCAT can skip it)
+        if (
+            prompt_1BLP is None
+            and os.environ.get("WAN_SDPA_OUT_CAST_FIRST") == "1"
+            and os.environ.get("WAN_AGMM_IN_BF8") == "1"
+            and spatial_BHNE.dtype == ttnn.bfloat16
+        ):
+            # EXPERIMENT (hkato): cast the self-attention output to bf8 before concat_heads (half the data to move);
+            # the to_out AGMM would cast it right after concat_heads anyway
+            spatial_BHNE = ttnn.typecast(spatial_BHNE, ttnn.bfloat8_b)
+        spatial_1BND = ttnn.transformer.concatenate_heads(spatial_BHNE)
+        spatial_1BND = ttnn.unsqueeze(spatial_1BND, 0)
+        if cfg_batch == 2:  # [1, 2, n, D] -> [1, 1, 2n, D], back to the stacked rows
+            spatial_1BND = ttnn.reshape(
+                spatial_1BND, (1, 1, spatial_1BND.shape[1] * spatial_1BND.shape[2], spatial_1BND.shape[3])
+            )
+
+        return spatial_1BND
+
     def forward(
         self,
         spatial_1BND: ttnn.Tensor,
@@ -517,6 +537,7 @@ class WanAttention(Module):
                 if cached_kv is None:
                     k_1BNF, v_1BNF = self.to_kv(kv_input, compute_kernel_config=self.mm_compute_kernel_config)
 
+        hk_out_concat = None  # EXPERIMENT (hkato): set when the ring SDPA writes concatenated heads
         # Set norm output dtype to the input dtype required for ring self-attn.
         sdpa_input_dtype = getattr(self, "_sdpa_input_dtype", None)
         use_ring_sdpa = self.parallel_config.sequence_parallel.factor > 1
@@ -663,6 +684,7 @@ class WanAttention(Module):
                     spatial_BHNE = ttnn.concat(halves, dim=0)
                 else:
                     spatial_BHNE = ring_sdpa(q_BHNE, k_BHNE, v_BHNE)
+                    hk_out_concat = os.environ.get("TT_RING_SDPA_OUT_CONCAT")  # EXPERIMENT (hkato)
             else:
                 spatial_BHNE = ttnn.transformer.scaled_dot_product_attention(
                     q_BHNE,
@@ -674,6 +696,7 @@ class WanAttention(Module):
                 )
         else:
             # Cross attention
+            hk_pairfold = head_fold and os.environ.get("TT_SDPA_OUT_PAIRFOLD") == "1"  # EXPERIMENT (hkato)
             spatial_BHNE = ttnn.transformer.scaled_dot_product_attention(
                 q_BHNE,
                 k_BHNE,
@@ -682,27 +705,35 @@ class WanAttention(Module):
                 attn_mask=cross_attn_mask,
                 program_config=self.sdpa_program_config,
                 compute_kernel_config=self.sdpa_compute_kernel_config,
+                **({"output_concat_heads": True} if hk_pairfold else {}),
             )
+            if hk_pairfold:
+                hk_out_concat = "x"
 
-        if head_fold:  # [1, 2H, n, E] -> [1, H, 2n, E]: rows come out cond-then-uncond like the input
+        if hk_out_concat == "x":
+            # EXPERIMENT (hkato): the SDPA writer wrote [1, 1, n, 2H*E] storage as concat heads of [1, H, 2n, E]
+            _, _, nn_, dd = spatial_BHNE.shape
+            spatial_1BND = ttnn.experimental.view(spatial_BHNE, (1, 1, 2 * nn_, dd // 2))
+        elif hk_out_concat in ("1", "2"):
+            # EXPERIMENT (hkato): the ring SDPA writer already laid the output out in concatenated-heads order
+            # (mode 2 also un-folds the CFG head pairs), so only the shape metadata changes
+            assert hk_out_concat == ("2" if head_fold else "1"), "TT_RING_SDPA_OUT_CONCAT must match head folding"
+            _, hh, nn_, ee = spatial_BHNE.shape
+            if head_fold:
+                hh, nn_ = hh // 2, nn_ * 2
+            spatial_1BND = ttnn.experimental.view(spatial_BHNE, (1, 1, nn_, hh * ee))
+            if (
+                os.environ.get("WAN_SDPA_OUT_CAST_FIRST") == "1"
+                and os.environ.get("WAN_AGMM_IN_BF8") == "1"
+                and spatial_1BND.dtype == ttnn.bfloat16
+            ):
+                spatial_1BND = ttnn.typecast(spatial_1BND, ttnn.bfloat8_b)
+        elif head_fold:  # [1, 2H, n, E] -> [1, H, 2n, E]: rows come out cond-then-uncond like the input
             spatial_BHNE = ttnn.reshape(
                 spatial_BHNE, (1, spatial_BHNE.shape[1] // 2, spatial_BHNE.shape[2] * 2, spatial_BHNE.shape[3])
             )
-        if (
-            prompt_1BLP is None
-            and os.environ.get("WAN_SDPA_OUT_CAST_FIRST") == "1"
-            and os.environ.get("WAN_AGMM_IN_BF8") == "1"
-            and spatial_BHNE.dtype == ttnn.bfloat16
-        ):
-            # EXPERIMENT (hkato): cast the self-attention output to bf8 before concat_heads (half the data to move);
-            # the to_out AGMM would cast it right after concat_heads anyway
-            spatial_BHNE = ttnn.typecast(spatial_BHNE, ttnn.bfloat8_b)
-        spatial_1BND = ttnn.transformer.concatenate_heads(spatial_BHNE)
-        spatial_1BND = ttnn.unsqueeze(spatial_1BND, 0)
-        if cfg_batch == 2:  # [1, 2, n, D] -> [1, 1, 2n, D], back to the stacked rows
-            spatial_1BND = ttnn.reshape(
-                spatial_1BND, (1, 1, spatial_1BND.shape[1] * spatial_1BND.shape[2], spatial_1BND.shape[3])
-            )
+        if hk_out_concat not in ("1", "2", "x"):
+            spatial_1BND = self._hk_concat_out(spatial_BHNE, prompt_1BLP, cfg_batch)
 
         if use_nonfused_agmm:
             # Gather spatial on TP axis before projection

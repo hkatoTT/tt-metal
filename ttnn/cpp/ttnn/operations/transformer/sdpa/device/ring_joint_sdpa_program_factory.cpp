@@ -3182,6 +3182,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     writer_kernel.core_ranges = core_grid_set;
     writer_kernel.compile_time_args = writer_compile_time_args;
     writer_kernel.defines = kernel_defines;
+    if (const char* e = std::getenv("TT_RING_SDPA_OUT_CONCAT");
+        e != nullptr && (std::string(e) == "1" || std::string(e) == "2")) {
+        writer_kernel.defines.emplace_back("HK_OUT_CONCAT_HEADS", std::string(e));  // EXPERIMENT (hkato)
+    }
     if (const char* e = std::getenv("TT_RING_SDPA_READER_NOC1"); e != nullptr && std::string(e) == "1") {
         writer_kernel.config = DataMovementConfigDescriptor{
             .processor = tt::tt_metal::DataMovementProcessor::RISCV_0, .noc = tt::tt_metal::NOC::NOC_0};

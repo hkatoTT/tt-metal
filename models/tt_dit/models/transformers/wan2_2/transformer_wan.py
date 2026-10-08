@@ -29,6 +29,8 @@ from ....parallel.manager import CCLManager
 from ....utils import cache
 from ....utils.matmul import (
     FusedMMRSConfig,
+    get_matmul_config,
+    get_matmul_core_grid,
     register_fused_mmrs_configs,
     register_matmul_configs,
     resolves_fused_mmrs_config,
@@ -765,6 +767,38 @@ class WanTransformer3DModel(Module):
 
         return spatial_1BNI
 
+    def _hk_proj_out_tp(self, spatial_norm_1BND):
+        """EXPERIMENT (hkato): proj_out with K split over the TP axis + all-reduce (reduce-scatter + all-gather over rows)
+        of the fp32 partials; the bias is added once after the reduction."""
+        tp_axis = self.parallel_config.tensor_parallel.mesh_axis
+        if getattr(self, "_hk_proj_out_w_tp", None) is None:
+            w = ttnn.to_torch(ttnn.get_device_tensors(self.proj_out.weight.data)[0])
+            dims = [None, None]
+            dims[tp_axis] = -2
+            self._hk_proj_out_w_tp = ttnn.from_torch(
+                w,
+                dtype=self.proj_out.weight.data.dtype,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh_device,
+                mesh_mapper=ttnn.ShardTensor2dMesh(
+                    self.mesh_device, mesh_shape=tuple(self.mesh_device.shape), dims=tuple(dims)
+                ),
+            )
+        w_tp = self._hk_proj_out_w_tp
+        M, K, N = spatial_norm_1BND.padded_shape[-2], spatial_norm_1BND.padded_shape[-1], w_tp.padded_shape[-1]
+        core_grid = get_matmul_core_grid(self.mesh_device)
+        part = ttnn.experimental.minimal_matmul(
+            input_tensor=spatial_norm_1BND,
+            weight_tensor=w_tp,
+            bias_tensor=None,
+            config=get_matmul_config(M, K, N, core_grid, None),
+            compute_kernel_config=self.hifi4_compute_kernel_config,
+            dtype=ttnn.float32,
+        )
+        part = self.ccl_manager.reduce_scatter(part, dim=2, mesh_axis=tp_axis)
+        part = self.ccl_manager.all_gather(part, dim=2, mesh_axis=tp_axis, use_hyperparams=False)
+        return ttnn.add(part, self.proj_out.bias.data, dtype=self.output_dtype)
+
     def inner_step_cfg(
         self,
         spatial_1BNI,
@@ -828,13 +862,16 @@ class WanTransformer3DModel(Module):
         spatial_norm_1BND = self.norm_out(
             spatial_1BND, dynamic_weight=(1 + scale_11BD), dynamic_bias=shift_11BD, dtype=ttnn.float32
         )
-        if self.parallel_config.tensor_parallel.factor > 1:
-            spatial_norm_1BND = self.ccl_manager.all_gather_persistent_buffer(
-                spatial_norm_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
+        if os.environ.get("WAN_PROJ_OUT_TP") == "1" and self.parallel_config.tensor_parallel.factor > 1:
+            spatial_1BNI = self._hk_proj_out_tp(spatial_norm_1BND)
+        else:
+            if self.parallel_config.tensor_parallel.factor > 1:
+                spatial_norm_1BND = self.ccl_manager.all_gather_persistent_buffer(
+                    spatial_norm_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
+                )
+            spatial_1BNI = self.proj_out(
+                spatial_norm_1BND, compute_kernel_config=self.hifi4_compute_kernel_config, dtype=self.output_dtype
             )
-        spatial_1BNI = self.proj_out(
-            spatial_norm_1BND, compute_kernel_config=self.hifi4_compute_kernel_config, dtype=self.output_dtype
-        )
 
         n = spatial_1BNI.shape[2] // 2
         c = spatial_1BNI.shape[3]

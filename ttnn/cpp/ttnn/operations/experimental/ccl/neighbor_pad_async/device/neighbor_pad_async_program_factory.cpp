@@ -788,6 +788,9 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
         w_writer_kernel_config.compile_args.push_back(0);  // handle_incoming_writes (data goes direct to DRAM)
         w_writer_kernel_config.compile_args.push_back(1);  // is_w_fabric_writer (W writer: true)
         w_writer_kernel_config.compile_args.push_back(w_ring_size);  // ring_size
+        if (const char* e = std::getenv("TT_NP_W_FAST"); e != nullptr && std::string(e) == "1") {
+            w_writer_kernel_config.defines["HK_W_FAST"] = "1";  // EXPERIMENT (hkato)
+        }
         w_writer_kernel_id = CreateKernel(
             program,
             "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"

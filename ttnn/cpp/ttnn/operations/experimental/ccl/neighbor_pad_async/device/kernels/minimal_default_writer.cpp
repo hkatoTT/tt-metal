@@ -266,6 +266,9 @@ void kernel_main() {
     uint32_t outer_dim_offset = outer_dim_offset_start_id;
     uint32_t l1_buf_offset = 0;  // L1 intermediate: accumulates across all outer_dims (no reuse)
 
+#ifdef HK_W_FAST
+    uint32_t hk_w_rows_sent = 0;
+#endif
     auto process_one_row = [&]() {
         if (is_first_chip) {
             if (!is_padding_zeros) {
@@ -394,11 +397,23 @@ void kernel_main() {
 
                     dst_stick_id++;
 
+#ifdef HK_W_FAST
+                    if constexpr (!is_w_fabric_writer) {
+                        noc_obj.async_write_barrier();
+                    }
+#else
                     noc_obj.async_write_barrier();
+#endif
                     cb_output.pop_front(1);
                 }
             }
 
+#ifdef HK_W_FAST
+            if constexpr (is_w_fabric_writer) {
+                hk_w_rows_sent++;  // one cumulative semaphore inc after all rows (see below)
+                return;
+            }
+#endif
             // unicast output ready semaphore
             uint64_t neighbor_sem_noc_addr_in_pkt =
                 safe_get_noc_addr(neighbor_sem_noc0_x, neighbor_sem_noc0_y, neighbor_sem, 0);
@@ -457,6 +472,28 @@ void kernel_main() {
         }
     }
 
+#ifdef HK_W_FAST
+    if constexpr (is_w_fabric_writer) {
+        if (hk_w_rows_sent > 0) {
+            uint64_t neighbor_sem_noc_addr_in_pkt =
+                safe_get_noc_addr(neighbor_sem_noc0_x, neighbor_sem_noc0_y, neighbor_sem, 0);
+            pkt_hdr_sem_inc->to_noc_unicast_atomic_inc(
+                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{neighbor_sem_noc_addr_in_pkt, hk_w_rows_sent});
+            if (direction) {
+                fabric_connection.get_backward_connection().wait_for_empty_write_slot();
+                ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr_sem_inc, unicast_route_info);
+                fabric_connection.get_backward_connection().send_payload_flush_blocking_from_address(
+                    (uint32_t)pkt_hdr_sem_inc, sizeof(PACKET_HEADER_TYPE));
+            } else {
+                fabric_connection.get_forward_connection().wait_for_empty_write_slot();
+                ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr_sem_inc, unicast_route_info);
+                fabric_connection.get_forward_connection().send_payload_flush_blocking_from_address(
+                    (uint32_t)pkt_hdr_sem_inc, sizeof(PACKET_HEADER_TYPE));
+            }
+            noc_obj.async_writes_flushed();
+        }
+    }
+#endif
     // Ensure all DRAM writes from main loop are complete.
     noc_obj.async_write_barrier();
 

@@ -226,10 +226,25 @@ class WanTransformerBlock(Module):
             if hk_tab is None or hk_tab[0] is not self.scale_shift_table.data:
                 hk_tab = (self.scale_shift_table.data, ttnn.chunk(self.scale_shift_table.data, 6, dim=2))
                 self._hk_table_chunks = hk_tab
-            shift_msa_1B1D, scale_msa_1B1D, gate_msa_1B1D, c_shift_msa_1B1D, c_scale_msa_1B1D, c_gate_msa_1B1D = (
-                tab + tmb for tab, tmb in zip(hk_tab[1], temb_1BTD)
-            )
+            hk_fold = os.environ.get("WAN_TEMB_FOLD") == "1"
+            if hk_fold:  # EXPERIMENT (hkato): "1 +" folded into the cached table, gates added straight to bf16
+                if len(hk_tab) == 2:
+                    t = hk_tab[1]
+                    hk_tab = (hk_tab[0], t, (t[0], t[1] + 1.0, t[2], t[3], t[4] + 1.0, t[5]))
+                    self._hk_table_chunks = hk_tab
+                tf, tm = hk_tab[2], temb_1BTD
+                shift_msa_1B1D = tf[0] + tm[0]
+                scale_msa_1B1D = tf[1] + tm[1]  # already 1 + scale
+                gate_msa_1B1D = ttnn.add(tf[2], tm[2], dtype=ttnn.bfloat16)
+                c_shift_msa_1B1D = tf[3] + tm[3]
+                c_scale_msa_1B1D = tf[4] + tm[4]  # already 1 + scale
+                c_gate_msa_1B1D = ttnn.add(tf[5], tm[5], dtype=ttnn.bfloat16)
+            else:
+                shift_msa_1B1D, scale_msa_1B1D, gate_msa_1B1D, c_shift_msa_1B1D, c_scale_msa_1B1D, c_gate_msa_1B1D = (
+                    tab + tmb for tab, tmb in zip(hk_tab[1], temb_1BTD)
+                )
         else:
+            hk_fold = False
             assert temb_1BTD.shape[2] == 6, "wan2.2 14b expects 6 chunks in timestep embedding"
 
             shifted_temb_1BTD = self.scale_shift_table.data + temb_1BTD
@@ -243,12 +258,16 @@ class WanTransformerBlock(Module):
             ) = ttnn.chunk(shifted_temb_1BTD, 6, dim=2)
 
         # NOTE: workaround - addcmul (fused and unfused) is less accurate with fp32 gate input
-        gate_msa_1B1D = ttnn.typecast(gate_msa_1B1D, dtype=ttnn.bfloat16)
-        c_gate_msa_1B1D = ttnn.typecast(c_gate_msa_1B1D, dtype=ttnn.bfloat16)
+        if not hk_fold:
+            gate_msa_1B1D = ttnn.typecast(gate_msa_1B1D, dtype=ttnn.bfloat16)
+            c_gate_msa_1B1D = ttnn.typecast(c_gate_msa_1B1D, dtype=ttnn.bfloat16)
 
         norm_dtype = ttnn.bfloat8_b if os.environ.get("WAN_AGMM_IN_BF8") == "1" else None  # EXPERIMENT
         spatial_normed_1BND = self.norm1(
-            spatial_1BND, dynamic_weight=(1.0 + scale_msa_1B1D), dynamic_bias=shift_msa_1B1D, dtype=norm_dtype
+            spatial_1BND,
+            dynamic_weight=(scale_msa_1B1D if hk_fold else 1.0 + scale_msa_1B1D),
+            dynamic_bias=shift_msa_1B1D,
+            dtype=norm_dtype,
         )
 
         # Self attention on spatial with fused residual addcmul
@@ -288,7 +307,10 @@ class WanTransformerBlock(Module):
 
         # Feed Forward
         spatial_normed_1BND = self.norm3(
-            spatial_1BND, dynamic_weight=(1.0 + c_scale_msa_1B1D), dynamic_bias=c_shift_msa_1B1D, dtype=norm_dtype
+            spatial_1BND,
+            dynamic_weight=(c_scale_msa_1B1D if hk_fold else 1.0 + c_scale_msa_1B1D),
+            dynamic_bias=c_shift_msa_1B1D,
+            dtype=norm_dtype,
         )
 
         if self.ccl_manager.topology == ttnn.Topology.Linear:

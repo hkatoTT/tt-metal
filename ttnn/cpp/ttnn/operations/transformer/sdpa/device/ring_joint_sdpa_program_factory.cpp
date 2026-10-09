@@ -25,6 +25,7 @@
 #include <map>
 #include <optional>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <deque>
@@ -1379,6 +1380,16 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     const uint32_t qk_in0_block_w = DHt;
     auto [qk_out_subblock_h, qk_out_subblock_w] =
         detail::determine_largest_subblock_size(Sq_chunk_t, Sk_chunk_t, dst_size);
+    // EXPERIMENT (hkato): TT_RING_SDPA_QK_SB=h,w overrides the Q@KT output subblock (e.g. 1,8: one Q row
+    // tile reused in SrcB while 8 K tiles stream -> 9 instead of 10 tile unpacks per 8 tile matmuls).
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_QK_SB"); hk_e != nullptr) {
+        uint32_t h = 0, w = 0;
+        if (std::sscanf(hk_e, "%u,%u", &h, &w) == 2 && h * w <= dst_size && h > 0 && w > 0 && Sq_chunk_t % h == 0 &&
+            Sk_chunk_t % w == 0) {
+            qk_out_subblock_h = h;
+            qk_out_subblock_w = w;
+        }
+    }
 
     TT_FATAL(
         Sq_chunk_t % qk_out_subblock_h == 0,

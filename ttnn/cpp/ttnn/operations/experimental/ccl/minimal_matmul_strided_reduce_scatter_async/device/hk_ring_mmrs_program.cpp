@@ -221,9 +221,31 @@ hk_ring_mmrs_program(
         kernel_defines["HK_RING_BIAS"] = "1";
     }
 
-    const uint32_t in0_sender_sem = CreateSemaphore(program, all_cores, 0);
-    const uint32_t in0_receiver_sem = CreateSemaphore(program, all_cores, 0);
-    const uint32_t in0_valid_sem = CreateSemaphore(program, all_cores, 1);
+    // The cores of a row group read their own rows of each in0 block and exchange them (TT_MMRS_RING_IN0_GATHER=0:
+    // one core per row group reads the whole block and forwards it along a chain; 2.13 vs 1.97 ms with dynamic NOC)
+    const bool in0_gather = [] {
+        const char* e = std::getenv("TT_MMRS_RING_IN0_GATHER");
+        return e == nullptr || e[0] != '0';
+    }();
+    std::vector<uint32_t> ready_sems;
+    std::vector<uint32_t> parts_sems;
+    uint32_t in0_sender_sem = 0;
+    uint32_t in0_receiver_sem = 0;
+    uint32_t in0_valid_sem = 0;
+    if (in0_gather) {
+        TT_FATAL(cols_per_group <= 4, "TT_MMRS_RING_IN0_GATHER: at most 4 cores per row group (semaphores)");
+        for (uint32_t g = 0; g < cols_per_group; g++) {
+            ready_sems.push_back(CreateSemaphore(program, all_cores, 0));
+        }
+        for (uint32_t g = 0; g < cols_per_group; g++) {
+            parts_sems.push_back(CreateSemaphore(program, all_cores, 0));
+        }
+        kernel_defines["HK_IN0_GATHER"] = std::to_string(cols_per_group);
+    } else {
+        in0_sender_sem = CreateSemaphore(program, all_cores, 0);
+        in0_receiver_sem = CreateSemaphore(program, all_cores, 0);
+        in0_valid_sem = CreateSemaphore(program, all_cores, 1);
+    }
     const uint32_t in1_sender_sem = CreateSemaphore(program, all_cores, 0);
     const uint32_t in1_receiver_sem = CreateSemaphore(program, all_cores, 0);
     const uint32_t in1_valid_sem = CreateSemaphore(program, all_cores, 1);
@@ -236,6 +258,17 @@ hk_ring_mmrs_program(
     const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(mesh_device->arch());
     const auto in0_risc = DataMovementProcessor::RISCV_1;
     const auto in1_risc = DataMovementProcessor::RISCV_0;
+    // Dynamic NOC mode: in0 reads DRAM on the DRAM-read NOC and writes on its own (TT_MMRS_RING_DYN=0 keeps dedicated
+    // NOCs; DRAM reads on the write NOC were ~3x slower per tile, 2.30 vs 2.07 ms in chain mode)
+    const bool dyn_noc = [] {
+        const char* e = std::getenv("TT_MMRS_RING_DYN");
+        return e == nullptr || e[0] != '0';
+    }();
+    const auto dm_noc_mode =
+        dyn_noc ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC;
+    if (dyn_noc) {
+        kernel_defines["HK_IN0_READ_NOC"] = std::to_string(static_cast<uint32_t>(in1_noc));
+    }
     const auto in0_base_order = chain_order(cols_per_group, in0_noc);  // along a row group (offset by the group start)
     // Row y's in0 chain starts at relative column y % cols_per_group, spreading the in0 DRAM readers over all columns
     // instead of one column per group (2.35 -> 2.30 ms)
@@ -278,23 +311,36 @@ hk_ring_mmrs_program(
     for (uint32_t y = 0; y < grid.y; y++) {
         const uint32_t head = in0_order_of(y)[0];
         for (uint32_t x = 0; x < grid.x; x++) {
-            (x % cols_per_group == head ? in0_inj_ranges : in0_rest_ranges)
+            (!in0_gather && x % cols_per_group == head ? in0_inj_ranges : in0_rest_ranges)
                 .emplace_back(CoreCoord{x, y}, CoreCoord{x, y});
         }
+    }
+    if (in0_inj_ranges.empty()) {
+        // gather mode: one kernel everywhere; keep the handle valid
+        in0_inj_ranges.push_back(in0_rest_ranges.back());
+        in0_rest_ranges.pop_back();
     }
     const KernelHandle in0_inj = CreateKernel(
         program,
         in0_src,
         CoreRangeSet(in0_inj_ranges),
         DataMovementConfig{
-            .processor = in0_risc, .noc = in0_noc, .compile_args = in0_ct(true), .defines = kernel_defines});
+            .processor = in0_risc,
+            .noc = in0_noc,
+            .noc_mode = dm_noc_mode,
+            .compile_args = in0_ct(!in0_gather),
+            .defines = kernel_defines});
     const CoreRangeSet in0_rest(in0_rest_ranges);
     const KernelHandle in0_oth = CreateKernel(
         program,
         in0_src,
         in0_rest,
         DataMovementConfig{
-            .processor = in0_risc, .noc = in0_noc, .compile_args = in0_ct(false), .defines = kernel_defines});
+            .processor = in0_risc,
+            .noc = in0_noc,
+            .noc_mode = dm_noc_mode,
+            .compile_args = in0_ct(false),
+            .defines = kernel_defines});
 
     auto in1_ct = [&](bool injector) {
         std::vector<uint32_t> ct = {
@@ -333,7 +379,11 @@ hk_ring_mmrs_program(
         in1_src,
         CoreRange(CoreCoord{0, in1_order[0]}, CoreCoord{grid.x - 1, in1_order[0]}),
         DataMovementConfig{
-            .processor = in1_risc, .noc = in1_noc, .compile_args = in1_ct(true), .defines = kernel_defines});
+            .processor = in1_risc,
+            .noc = in1_noc,
+            .noc_mode = dm_noc_mode,
+            .compile_args = in1_ct(true),
+            .defines = kernel_defines});
     std::vector<CoreRange> mid_ranges;
     for (uint32_t y = 0; y < grid.y; y++) {
         if (y != in1_order[0] && y != relay_row) {
@@ -347,17 +397,26 @@ hk_ring_mmrs_program(
             in1_src,
             CoreRangeSet(mid_ranges),
             DataMovementConfig{
-                .processor = in1_risc, .noc = in1_noc, .compile_args = in1_ct(false), .defines = kernel_defines});
+                .processor = in1_risc,
+                .noc = in1_noc,
+                .noc_mode = dm_noc_mode,
+                .compile_args = in1_ct(false),
+                .defines = kernel_defines});
     }
     KernelHandle in1_relay = CreateKernel(
         program,
         in1_src,
         CoreRange(CoreCoord{0, relay_row}, CoreCoord{grid.x - 1, relay_row}),
-        DataMovementConfig{.processor = in1_risc, .noc = in1_noc, .compile_args = in1_ct(false), .defines = [&] {
-                               auto d = kernel_defines;
-                               d["HK_RELAY"] = "1";
-                               return d;
-                           }()});
+        DataMovementConfig{
+            .processor = in1_risc,
+            .noc = in1_noc,
+            .noc_mode = dm_noc_mode,
+            .compile_args = in1_ct(false),
+            .defines = [&] {
+                auto d = kernel_defines;
+                d["HK_RELAY"] = "1";
+                return d;
+            }()});
 
     const float scalar = attrs.fused_ternary_scalar.value();
     const KernelHandle compute = CreateKernel(
@@ -411,7 +470,7 @@ hk_ring_mmrs_program(
             const CoreCoord next0 = mesh_device->worker_core_from_logical_core(
                 {gx0 + in0_order[std::min<uint32_t>(i0 + 1, cols_per_group - 1)], y});
             const CoreCoord relay_phys = mesh_device->worker_core_from_logical_core({x, relay_row});
-            const std::vector<uint32_t> in0_rt = {
+            std::vector<uint32_t> in0_rt = {
                 in0.buffer()->address(),
                 out.buffer()->address(),
                 i0 == cols_per_group - 1 ? 1u : 0u,
@@ -426,7 +485,20 @@ hk_ring_mmrs_program(
                 static_cast<uint32_t>(relay_phys.x),
                 static_cast<uint32_t>(relay_phys.y),
                 y};
-            const KernelHandle k0 = x - gx0 == in0_order[0] ? in0_inj : in0_oth;
+            if (in0_gather) {
+                in0_rt.push_back(x - gx0);
+                for (uint32_t g = 0; g < cols_per_group; g++) {
+                    const CoreCoord m = mesh_device->worker_core_from_logical_core({gx0 + g, y});
+                    in0_rt.push_back(static_cast<uint32_t>(m.x));
+                    in0_rt.push_back(static_cast<uint32_t>(m.y));
+                }
+                in0_rt.insert(in0_rt.end(), ready_sems.begin(), ready_sems.end());
+                in0_rt.insert(in0_rt.end(), parts_sems.begin(), parts_sems.end());
+            }
+            const KernelHandle k0 =
+                std::find(in0_inj_ranges.begin(), in0_inj_ranges.end(), CoreRange(core, core)) != in0_inj_ranges.end()
+                    ? in0_inj
+                    : in0_oth;
             SetRuntimeArgs(program, k0, core, in0_rt);
             sv.hk_in0.emplace_back(core, k0);
 

@@ -56,17 +56,46 @@ void kernel_main() {
     const uint32_t relay_x = get_arg_val<uint32_t>(argidx++);
     const uint32_t relay_y = get_arg_val<uint32_t>(argidx++);
     const uint32_t src_index = get_arg_val<uint32_t>(argidx++);
+#ifdef HK_IN0_GATHER
+    // The HK_IN0_GATHER cores of a row group share in0: each reads its own rows of every K block from DRAM and writes
+    // them into the same CB slot of the others. Per-member flags (program semaphores, so zero at launch) carry the
+    // block number: ready[g] = slot free on member g, parts[g] = member g's rows have landed here.
+    constexpr uint32_t group_size = HK_IN0_GATHER;
+    constexpr uint32_t rows_per_member = (M_block_tiles + group_size - 1) / group_size;
+    const uint32_t my_pos = get_arg_val<uint32_t>(argidx++);
+    uint32_t member_x[group_size];
+    uint32_t member_y[group_size];
+    for (uint32_t g = 0; g < group_size; g++) {
+        member_x[g] = get_arg_val<uint32_t>(argidx++);
+        member_y[g] = get_arg_val<uint32_t>(argidx++);
+    }
+    uint32_t ready_addr[group_size];
+    uint32_t parts_addr[group_size];
+    for (uint32_t g = 0; g < group_size; g++) {
+        ready_addr[g] = get_semaphore(get_arg_val<uint32_t>(argidx++));
+    }
+    for (uint32_t g = 0; g < group_size; g++) {
+        parts_addr[g] = get_semaphore(get_arg_val<uint32_t>(argidx++));
+    }
+#endif
 
     const auto in0_reader = TensorAccessor(in0_args, in0_addr, in0_tile_size);
     const auto out_writer = TensorAccessor(out_args, out_addr, out_tile_size);
     const TensorShape2D in0_shape(M_tiles, K_tiles, M_tiles, K_tiles);
 
+#ifndef HK_IN0_GATHER
     volatile tt_l1_ptr uint32_t* sender_sem =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sender_sem_id));
     volatile tt_l1_ptr uint32_t* receiver_sem =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(receiver_sem_id));
     const uint32_t valid_sem_addr = get_semaphore(valid_sem_id);
     noc_semaphore_set(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(valid_sem_addr), 1);
+#else
+    // source word of the flag writes (the scratch CB is 256 B; the relay counters use the first 144 B)
+    const uint32_t flag_src_addr = get_write_ptr(scratch_cb) + 192;
+    volatile tt_l1_ptr uint32_t* flag_src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(flag_src_addr);
+    uint32_t blk = 0;
+#endif
     volatile tt_l1_ptr uint32_t* relay_done =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(relay_done_sem_id));
     // this source's ready counter in the relay core's scratch (the scratch CB sits at the same L1 address everywhere)
@@ -124,7 +153,79 @@ void kernel_main() {
                 }
                 cb_reserve_back(in0_cb, in0_block_num_tiles);
                 const uint32_t l1 = get_write_ptr(in0_cb);
+#ifdef HK_IN0_GATHER
+                // every member's CB holds block blk at this same address
+                blk++;
+                noc_async_writes_flushed();  // the previous flag writes have left flag_src
+                *flag_src = blk;
+                for (uint32_t g = 0; g < group_size; g++) {
+                    if (g != my_pos) {
+                        noc_semaphore_set_remote(
+                            flag_src_addr, get_noc_addr(member_x[g], member_y[g], ready_addr[my_pos]));
+                    }
+                }
+                for (uint32_t g = 0; g < group_size; g++) {
+                    if (g != my_pos) {
+                        while (*reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ready_addr[g]) < blk) {
+                            service();
+                        }
+                    }
+                }
+                {
+                    const uint32_t cur_rows = m_tile_end - m_tile;
+                    const uint32_t r0 = std::min(my_pos * rows_per_member, cur_rows);
+                    const uint32_t r1 = std::min(r0 + rows_per_member, cur_rows);
+#ifdef HK_IN0_READ_NOC
+                    constexpr uint8_t read_noc = HK_IN0_READ_NOC;
+#else
+                    const uint8_t read_noc = noc_index;
+#endif
+                    for (uint32_t r = r0; r < r1 && m_tile + r < M_tiles; r++) {
+                        for (uint32_t kk = 0; kk < K_block_tiles; kk++) {
+                            noc_async_read(
+                                in0_reader.get_noc_addr((m_tile + r) * K_tiles + kb * K_block_tiles + kk, 0, read_noc),
+                                l1 + (r * K_block_tiles + kk) * in0_tile_size,
+                                in0_tile_size,
+                                read_noc);
+                        }
+                    }
+                    noc_async_read_barrier(read_noc);
+                    const uint32_t off = r0 * K_block_tiles * in0_tile_size;
+                    const uint32_t bytes = (r1 - r0) * K_block_tiles * in0_tile_size;
+                    for (uint32_t g = 0; g < group_size; g++) {
+                        if (g != my_pos) {
+                            if (bytes > 0) {
+                                noc_async_write(l1 + off, get_noc_addr(member_x[g], member_y[g], l1 + off), bytes);
+                            }
+                            noc_semaphore_set_remote(
+                                flag_src_addr, get_noc_addr(member_x[g], member_y[g], parts_addr[my_pos]));
+                        }
+                    }
+                }
+                for (uint32_t g = 0; g < group_size; g++) {
+                    if (g != my_pos) {
+                        while (*reinterpret_cast<volatile tt_l1_ptr uint32_t*>(parts_addr[g]) < blk) {
+                            service();
+                        }
+                    }
+                }
+                cb_push_back(in0_cb, in0_block_num_tiles);
+#else
                 if constexpr (is_injector) {
+#ifdef HK_IN0_READ_NOC
+                    // dynamic NOC mode: read DRAM on the other NOC (the forwarding writes stay on noc_index)
+                    for (uint32_t r = 0; r < m_tile_end - m_tile && m_tile + r < M_tiles; r++) {
+                        for (uint32_t kk = 0; kk < K_block_tiles; kk++) {
+                            noc_async_read(
+                                in0_reader.get_noc_addr(
+                                    (m_tile + r) * K_tiles + kb * K_block_tiles + kk, 0, HK_IN0_READ_NOC),
+                                l1 + (r * K_block_tiles + kk) * in0_tile_size,
+                                in0_tile_size,
+                                HK_IN0_READ_NOC);
+                        }
+                    }
+                    noc_async_read_barrier(HK_IN0_READ_NOC);
+#else
                     read_in0_block_sync<M_block_tiles, K_block_tiles>(
                         in0_reader,
                         in0_shape,
@@ -134,6 +235,7 @@ void kernel_main() {
                         m_tile_end,
                         kb * K_block_tiles,
                         (kb + 1) * K_block_tiles);
+#endif
                 } else {
                     noc_semaphore_set(receiver_sem, 0);
                     noc_semaphore_inc(get_noc_addr(sender_x, sender_y, (uint32_t)sender_sem), 1);
@@ -150,6 +252,7 @@ void kernel_main() {
                     noc_async_write(l1, get_noc_addr(dest_x, dest_y, l1), block_bytes);
                     noc_semaphore_set_remote(valid_sem_addr, get_noc_addr(dest_x, dest_y, (uint32_t)receiver_sem));
                 }
+#endif
                 service();
             }
         }

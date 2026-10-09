@@ -831,6 +831,12 @@ all_gather_minimal_matmul_async_factory_helper(
 
     bool in0_is_output_writer = transpose_core_grid;
     bool in1_is_output_writer = !transpose_core_grid;
+    // EXPERIMENT (hkato): TT_AGMM_OUT_IN1=1 -> the in1 DM kernel writes the output (and the in0 kernel reads the
+    // ternary epilogue inputs) even on a transposed grid, taking the output writes off the serial in0 injector.
+    if (const char* hk_e = std::getenv("TT_AGMM_OUT_IN1"); hk_e != nullptr && hk_e[0] == 0x31) {
+        in0_is_output_writer = false;
+        in1_is_output_writer = true;
+    }
 
     std::vector<uint32_t> in0_sender_compile_time_args = {
         M_tiles,

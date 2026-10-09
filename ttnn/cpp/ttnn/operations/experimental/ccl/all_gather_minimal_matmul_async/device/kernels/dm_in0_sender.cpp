@@ -332,6 +332,156 @@ void kernel_main() {
     uint32_t defer_write_n_tile_end = 0;
     bool defer_write = false;
 
+#ifdef USE_MUX
+    auto hk_fab_do = [&](uint32_t n_block_iter,
+                         uint32_t k_block_iter,
+                         uint32_t m_tile,
+                         uint32_t k_block_left_tile,
+                         uint32_t k_block_right_tile,
+                         uint32_t current_M_block_tiles,
+                         uint32_t k_left_tiles,
+                         uint32_t k_right_tiles,
+                         uint32_t in0_start_address) {
+        if (n_block_iter == 0) {
+            if constexpr (is_linear) {
+                // Linear uni-ring: every (non-skipped) iter, every device sends ONE full
+                // K-block to its predecessor in the virtual ring. Dev 0
+                // (num_targets_backward_direction == 0) long-sends to Dev N-1 via
+                // mux_backward (forward direction, N-1 hops; the routing was overridden in
+                // the program factory to set distance_in_hops = N-1). Other devices
+                // short-send to my_rank-1 via mux_forward (backward direction, 1 hop). All
+                // sends signal out_ready_semaphore_forward at the receiver.
+                //
+                // Skip the last K_blocks_per_device iters: by then every block has already
+                // reached every device, so this final relay lap is redundant -- it would
+                // re-deliver each device's own data back to it and fire sem increments the
+                // receiver never waits on (which is why the receiver no longer needs to
+                // compensate sem_target; see compute_actual_k_block). Mirrors the Ring skip.
+                if constexpr (num_targets_backward_direction == 0) {
+                    // Dev 0 (chain head): long send via mux_backward + pkt_hdrs_forward
+                    if constexpr (num_targets_forward_direction > 0) {
+                        if (in0_core_order_index == backward_in0_core_order_index &&
+                            k_block_iter < (K_num_blocks - K_blocks_per_device)) {
+                            forward_half_block_to_fabric_neighbor(
+                                noc_obj,
+                                m_tile,
+                                k_block_left_tile,
+                                current_M_block_tiles,
+                                k_left_tiles,
+                                k_right_tiles,
+                                num_tiles_to_write_per_packet,
+                                in0_start_address,
+                                K_tiles,
+                                in0_reader,
+                                mux_connection_handle_backward,
+                                pkt_hdrs_forward,
+                                in0_tile_size,
+                                out_ready_sem_injector_noc_addr_forward_in_pkt,
+                                true,
+                                M_tiles,
+                                true);
+                        }
+                    }
+                } else {
+                    // Dev k > 0: short send via mux_forward + pkt_hdrs_backward
+                    if (in0_core_order_index == forward_in0_core_order_index &&
+                        k_block_iter < (K_num_blocks - K_blocks_per_device)) {
+                        forward_half_block_to_fabric_neighbor(
+                            noc_obj,
+                            m_tile,
+                            k_block_left_tile,
+                            current_M_block_tiles,
+                            k_left_tiles,
+                            k_right_tiles,
+                            num_tiles_to_write_per_packet,
+                            in0_start_address,
+                            K_tiles,
+                            in0_reader,
+                            mux_connection_handle_forward,
+                            pkt_hdrs_backward,
+                            in0_tile_size,
+                            out_ready_sem_injector_noc_addr_forward_in_pkt,
+                            true,
+                            M_tiles,
+                            true);
+                    }
+                }
+            } else {
+                // Ring: relay each K-block both directions every iter. Skip the last
+                // K_blocks_per_device iterations — those K-blocks have already reached
+                // all devices via wrap-around relay.
+                if (k_block_iter < (K_num_blocks - (K_num_blocks / num_devices))) {
+                    if constexpr (num_targets_backward_direction > 0) {
+                        if (in0_core_order_index == forward_in0_core_order_index) {
+                            forward_half_block_to_fabric_neighbor(
+                                noc_obj,
+                                m_tile,
+                                k_block_left_tile,
+                                current_M_block_tiles,
+                                k_left_tiles,
+                                k_right_tiles,
+                                num_tiles_to_write_per_packet,
+                                in0_start_address,
+                                K_tiles,
+                                in0_reader,
+                                mux_connection_handle_forward,
+                                pkt_hdrs_backward,
+                                in0_tile_size,
+                                out_ready_sem_injector_noc_addr_forward_in_pkt,
+                                true,
+                                M_tiles,
+                                true);
+                        }
+                    }
+                    if constexpr (num_targets_forward_direction > 0) {
+                        if (in0_core_order_index == backward_in0_core_order_index) {
+                            forward_half_block_to_fabric_neighbor(
+                                noc_obj,
+                                m_tile,
+                                k_block_right_tile,
+                                current_M_block_tiles,
+                                k_left_tiles,
+                                k_right_tiles,
+                                num_tiles_to_write_per_packet,
+                                in0_start_address,
+                                K_tiles,
+                                in0_reader,
+                                mux_connection_handle_backward,
+                                pkt_hdrs_forward,
+                                in0_tile_size,
+                                out_ready_sem_injector_noc_addr_backward_in_pkt,
+                                false,
+                                M_tiles,
+                                true);
+                        }
+                    }
+                }
+            }
+        }
+    };
+#ifdef HK_FAB_DEFER
+    bool hk_fab_pending = false;
+    struct {
+        uint32_t n_block_iter, k_block_iter, m_tile, k_block_left_tile, k_block_right_tile, current_M_block_tiles,
+            k_left_tiles, k_right_tiles, in0_start_address;
+    } hk_fab_args{};
+    auto hk_fab_flush = [&]() {
+        if (hk_fab_pending) {
+            hk_fab_pending = false;
+            hk_fab_do(
+                hk_fab_args.n_block_iter,
+                hk_fab_args.k_block_iter,
+                hk_fab_args.m_tile,
+                hk_fab_args.k_block_left_tile,
+                hk_fab_args.k_block_right_tile,
+                hk_fab_args.current_M_block_tiles,
+                hk_fab_args.k_left_tiles,
+                hk_fab_args.k_right_tiles,
+                hk_fab_args.in0_start_address);
+        }
+    };
+#endif
+#endif
     for (uint32_t m_block_iter = 0; m_block_iter < M_blocks_per_core; m_block_iter++) {
         uint32_t m_tile = M_start_tile + m_block_iter * M_block_tiles;
         uint32_t m_tile_end = std::min(m_tile + M_block_tiles, M_end_tile);
@@ -478,6 +628,9 @@ void kernel_main() {
                     // Get from previous device
                     in0_receiver_sem.set(INVALID);
                     in0_sender_sem.up(noc_obj, in0_sender_noc_x, in0_sender_noc_y, 1);
+#if defined(USE_MUX) && defined(HK_FAB_DEFER)
+                    hk_fab_flush();
+#endif
                     in0_receiver_sem.wait(VALID);
                 }
 
@@ -534,122 +687,32 @@ void kernel_main() {
                     in0_valid_sem.relay_unicast(noc_obj, in0_receiver_sem, in0_dest_noc_x, in0_dest_noc_y);
                 }
 #ifdef USE_MUX
-                if (n_block_iter == 0) {
-                    if constexpr (is_linear) {
-                        // Linear uni-ring: every (non-skipped) iter, every device sends ONE full
-                        // K-block to its predecessor in the virtual ring. Dev 0
-                        // (num_targets_backward_direction == 0) long-sends to Dev N-1 via
-                        // mux_backward (forward direction, N-1 hops; the routing was overridden in
-                        // the program factory to set distance_in_hops = N-1). Other devices
-                        // short-send to my_rank-1 via mux_forward (backward direction, 1 hop). All
-                        // sends signal out_ready_semaphore_forward at the receiver.
-                        //
-                        // Skip the last K_blocks_per_device iters: by then every block has already
-                        // reached every device, so this final relay lap is redundant -- it would
-                        // re-deliver each device's own data back to it and fire sem increments the
-                        // receiver never waits on (which is why the receiver no longer needs to
-                        // compensate sem_target; see compute_actual_k_block). Mirrors the Ring skip.
-                        if constexpr (num_targets_backward_direction == 0) {
-                            // Dev 0 (chain head): long send via mux_backward + pkt_hdrs_forward
-                            if constexpr (num_targets_forward_direction > 0) {
-                                if (in0_core_order_index == backward_in0_core_order_index &&
-                                    k_block_iter < (K_num_blocks - K_blocks_per_device)) {
-                                    forward_half_block_to_fabric_neighbor(
-                                        noc_obj,
-                                        m_tile,
-                                        k_block_left_tile,
-                                        current_M_block_tiles,
-                                        k_left_tiles,
-                                        k_right_tiles,
-                                        num_tiles_to_write_per_packet,
-                                        in0_start_address,
-                                        K_tiles,
-                                        in0_reader,
-                                        mux_connection_handle_backward,
-                                        pkt_hdrs_forward,
-                                        in0_tile_size,
-                                        out_ready_sem_injector_noc_addr_forward_in_pkt,
-                                        true,
-                                        M_tiles,
-                                        true);
-                                }
-                            }
-                        } else {
-                            // Dev k > 0: short send via mux_forward + pkt_hdrs_backward
-                            if (in0_core_order_index == forward_in0_core_order_index &&
-                                k_block_iter < (K_num_blocks - K_blocks_per_device)) {
-                                forward_half_block_to_fabric_neighbor(
-                                    noc_obj,
-                                    m_tile,
-                                    k_block_left_tile,
-                                    current_M_block_tiles,
-                                    k_left_tiles,
-                                    k_right_tiles,
-                                    num_tiles_to_write_per_packet,
-                                    in0_start_address,
-                                    K_tiles,
-                                    in0_reader,
-                                    mux_connection_handle_forward,
-                                    pkt_hdrs_backward,
-                                    in0_tile_size,
-                                    out_ready_sem_injector_noc_addr_forward_in_pkt,
-                                    true,
-                                    M_tiles,
-                                    true);
-                            }
-                        }
-                    } else {
-                        // Ring: relay each K-block both directions every iter. Skip the last
-                        // K_blocks_per_device iterations — those K-blocks have already reached
-                        // all devices via wrap-around relay.
-                        if (k_block_iter < (K_num_blocks - (K_num_blocks / num_devices))) {
-                            if constexpr (num_targets_backward_direction > 0) {
-                                if (in0_core_order_index == forward_in0_core_order_index) {
-                                    forward_half_block_to_fabric_neighbor(
-                                        noc_obj,
-                                        m_tile,
-                                        k_block_left_tile,
-                                        current_M_block_tiles,
-                                        k_left_tiles,
-                                        k_right_tiles,
-                                        num_tiles_to_write_per_packet,
-                                        in0_start_address,
-                                        K_tiles,
-                                        in0_reader,
-                                        mux_connection_handle_forward,
-                                        pkt_hdrs_backward,
-                                        in0_tile_size,
-                                        out_ready_sem_injector_noc_addr_forward_in_pkt,
-                                        true,
-                                        M_tiles,
-                                        true);
-                                }
-                            }
-                            if constexpr (num_targets_forward_direction > 0) {
-                                if (in0_core_order_index == backward_in0_core_order_index) {
-                                    forward_half_block_to_fabric_neighbor(
-                                        noc_obj,
-                                        m_tile,
-                                        k_block_right_tile,
-                                        current_M_block_tiles,
-                                        k_left_tiles,
-                                        k_right_tiles,
-                                        num_tiles_to_write_per_packet,
-                                        in0_start_address,
-                                        K_tiles,
-                                        in0_reader,
-                                        mux_connection_handle_backward,
-                                        pkt_hdrs_forward,
-                                        in0_tile_size,
-                                        out_ready_sem_injector_noc_addr_backward_in_pkt,
-                                        false,
-                                        M_tiles,
-                                        true);
-                                }
-                            }
-                        }
-                    }
-                }
+#ifdef HK_FAB_DEFER
+                if (!is_injector_core) {
+                    // EXPERIMENT (hkato): send this block to the fabric only after signalling ready for the next one.
+                    hk_fab_pending = true;
+                    hk_fab_args = {
+                        n_block_iter,
+                        k_block_iter,
+                        m_tile,
+                        k_block_left_tile,
+                        k_block_right_tile,
+                        current_M_block_tiles,
+                        k_left_tiles,
+                        k_right_tiles,
+                        in0_start_address};
+                } else
+#endif
+                    hk_fab_do(
+                        n_block_iter,
+                        k_block_iter,
+                        m_tile,
+                        k_block_left_tile,
+                        k_block_right_tile,
+                        current_M_block_tiles,
+                        k_left_tiles,
+                        k_right_tiles,
+                        in0_start_address);
 #endif  // USE_MUX
             }
 #ifdef FUSE_BIAS
@@ -758,6 +821,9 @@ void kernel_main() {
             }
         }
     }
+#if defined(USE_MUX) && defined(HK_FAB_DEFER)
+    hk_fab_flush();
+#endif
 
     noc_obj.async_write_barrier();
     noc_obj.async_atomic_barrier();

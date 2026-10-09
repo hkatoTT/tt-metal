@@ -666,6 +666,9 @@ all_gather_minimal_matmul_async_factory_helper(
         hk_in0_mcast_ndests_define = std::to_string(in1_parallel_axis_cores - 1);  // set into in0_defines below
     }
     std::map<std::string, std::string> in0_fabric_defines;
+    if (const char* hk_e = std::getenv("TT_AGMM_FAB_DEFER"); hk_e != nullptr && hk_e[0] == 0x31) {
+        defines["HK_FAB_DEFER"] = "1";  // EXPERIMENT (hkato): deferred fabric relay on in0 forwarder cores
+    }
     if (use_bias) {
         defines["FUSE_BIAS"] = "1";
     }

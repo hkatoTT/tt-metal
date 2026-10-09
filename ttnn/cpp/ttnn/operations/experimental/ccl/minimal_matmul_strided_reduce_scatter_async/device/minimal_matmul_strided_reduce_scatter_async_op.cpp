@@ -8,6 +8,7 @@
 #include "ttnn/operations/experimental/ccl/minimal_matmul_strided_reduce_scatter_async/device/minimal_matmul_strided_reduce_scatter_async_op.hpp"
 #include "ttnn/operations/experimental/minimal_matmul/device/minimal_matmul_device_operation.hpp"
 #include "ttnn/operations/experimental/ccl/composite_common.hpp"
+#include "ttnn/operations/experimental/ccl/minimal_matmul_strided_reduce_scatter_async/device/minimal_matmul_strided_reduce_scatter_async_program.hpp"
 
 using matmul_device_operation_t = ttnn::experimental::prim::MinimalMatmulDeviceOperation;
 
@@ -325,6 +326,17 @@ MinimalMatmulStridedReduceScatterAsync::compute_output_specs(
             tt::tt_metal::TensorLayout(mm_output_spec.data_type(), mm_output_spec.page_config(), mm_l1_sharded));
     }
 
+    if (hk_mmrs_ring_enabled()) {
+        // EXPERIMENT (hkato): TT_MMRS_RING=1 keeps the partials in the matmul cores L1 and the neighbours recv
+        // CBs; the MM output and the RS intermediate are unused placeholders
+        const tt::tt_metal::TensorSpec tiny(
+            ttnn::Shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH}),
+            tt::tt_metal::TensorLayout(
+                mm_output_spec.data_type(),
+                mm_output_spec.page_config(),
+                MemoryConfig{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM}));
+        return {tiny, tiny, rs_output_spec};
+    }
     return {mm_output_spec, rs_intermediate_spec, rs_output_spec};
 }
 

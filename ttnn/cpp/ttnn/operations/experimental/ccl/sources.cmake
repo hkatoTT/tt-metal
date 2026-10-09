@@ -48,6 +48,7 @@ set(TTNN_OP_EXPERIMENTAL_CCL_SRCS
     minimal_matmul_strided_reduce_scatter_async/minimal_matmul_strided_reduce_scatter_async.cpp
     minimal_matmul_strided_reduce_scatter_async/device/minimal_matmul_strided_reduce_scatter_async_op.cpp
     minimal_matmul_strided_reduce_scatter_async/device/minimal_matmul_strided_reduce_scatter_async_program.cpp
+    minimal_matmul_strided_reduce_scatter_async/device/hk_ring_mmrs_program.cpp
     all_gather_minimal_matmul_async/all_gather_minimal_matmul_async.cpp
     all_gather_minimal_matmul_async/device/all_gather_minimal_matmul_async_device_operation.cpp
     all_gather_minimal_matmul_async/device/all_gather_minimal_matmul_async_program_factory.cpp

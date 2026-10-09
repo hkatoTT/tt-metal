@@ -749,14 +749,58 @@ class RowParallelLinear(Module):
         # EXPERIMENT (hkato): WAN_MMRS_LINKS overrides the fused MM+RS link count (more RS workers per link)
         mmrs_links = int(os.environ.get("WAN_MMRS_LINKS", "0")) or self.ccl_manager.num_links
         mmrs_params = get_fused_mmrs_config(M, K, N, core_grid, mmrs_links)
+        mmrs_sems = self.ccl_manager.get_rs_ping_pong_semaphore(self.mesh_axis)
+        mmrs_bias = self.bias.data if self.bias is not None else None
+        if os.environ.get("TT_MMRS_RING") == "1":
+            # EXPERIMENT (hkato): matmul + ring reduce-scatter + addcmul on the matmul cores over the whole grid
+            # (TT_MMRS_RING=1 also switches the op's program). TT_MMRS_RING_BLK="M_block,K_block,subblock_h,subblock_w";
+            # N_block is fixed at each core's share of one output slice (TT_MMRS_RING_G row groups per core row).
+            _b = [int(v) for v in os.environ.get("TT_MMRS_RING_BLK", "8,9,4,2").split(",")]
+            _g = int(os.environ.get("TT_MMRS_RING_G", "2"))
+            _n_blk = N // 32 // self.mesh_device.shape[self.mesh_axis] // (core_grid.x // _g)
+            mmrs_params = {
+                "reduce_scatter_core_grid_offset": ttnn.CoreCoord(0, core_grid.y),
+                "num_links": mmrs_links,
+                "config": ttnn.MinimalMatmulConfig(
+                    M_block_size=_b[0],
+                    K_block_size=_b[1],
+                    N_block_size=_n_blk,
+                    subblock_h=_b[2],
+                    subblock_w=_b[3],
+                    compute_with_storage_grid_size=core_grid,
+                ),
+                "num_buffers_per_channel": None,
+                "chunk_width_in_mm_blocks": 1,
+                "num_workers_per_link": 1,
+                "mm_window_blocks": None,
+            }
+            # the relays' start barrier needs a semaphore no other op touches
+            _key = (id(self.mesh_device), self.mesh_axis)
+            if _key not in _HK_RING_SEMS:
+                _HK_RING_SEMS[_key] = [
+                    ttnn.create_global_semaphore(self.mesh_device, self.ccl_manager.ccl_cores, 0) for _ in range(3)
+                ]
+            mmrs_sems = _HK_RING_SEMS[_key]
+            if self.bias is not None:
+                # the ring program adds the whole bias once, for each device's own slice: replicate the rank-0 row
+                if getattr(self, "_hk_ring_bias", None) is None:
+                    _b0 = ttnn.to_torch(ttnn.get_device_tensors(self.bias.data)[0])
+                    self._hk_ring_bias = ttnn.from_torch(
+                        _b0,
+                        device=self.mesh_device,
+                        layout=ttnn.TILE_LAYOUT,
+                        dtype=self.bias.data.get_dtype(),
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                    )
+                mmrs_bias = self._hk_ring_bias
         use_l1_handoff = mmrs_params["mm_window_blocks"] is not None
         _, output = ttnn.experimental.minimal_matmul_strided_reduce_scatter_async(
             input_tensor=[x, x_second] if x_second is not None else x,
             weight_tensor=weight,
             dim=3,
-            multi_device_global_semaphore=self.ccl_manager.get_rs_ping_pong_semaphore(self.mesh_axis),
+            multi_device_global_semaphore=mmrs_sems,
             **mmrs_params,
-            bias=self.bias.data if self.bias is not None else None,
+            bias=mmrs_bias,
             memory_config_mm=ttnn.MemoryConfig(ttnn.TensorMemoryLayout.INTERLEAVED, ttnn.BufferType.L1)
             if use_l1_handoff
             else self.mm_memory_config,
@@ -778,6 +822,10 @@ class RowParallelLinear(Module):
         if needs_reshape:
             output = ttnn.squeeze(output, 0)
         return output
+
+
+# EXPERIMENT (hkato): TT_MMRS_RING start-barrier semaphores, one set per (mesh device, axis)
+_HK_RING_SEMS = {}
 
 
 def _apply_activation_fn(t: ttnn.Tensor, activation_fn: str | None) -> ttnn.Tensor:

@@ -111,6 +111,10 @@ void MinimalMatmulStridedReduceScatterAsyncProgramFactory::override_runtime_argu
     std::vector<Tensor>& output_tensor) {
     for (auto& [range, program] : cached_workload.workload.get_programs()) {
         auto& shared_variables = cached_workload.shared_variables.at(range);
+        if (shared_variables.hk_ring) {
+            hk_ring_mmrs_override_runtime_arguments(program, shared_variables, attributes, tensor_args, output_tensor);
+            continue;
+        }
 
         // The progress-counter address is baked into the reader + MM runtime args at build time
         if (tensor_args.mm_progress_counters.has_value()) {
@@ -327,6 +331,9 @@ MinimalMatmulStridedReduceScatterAsyncProgramFactory::create_at(
     const ttnn::MeshCoordinate& mesh_coordinate,
     const MinimalMatmulStridedReduceScatterAsyncInputs& tensor_args,
     std::vector<Tensor>& output_tensor) {
+    if (hk_mmrs_ring_enabled()) {
+        return hk_ring_mmrs_program(attributes, mesh_coordinate, tensor_args, output_tensor);
+    }
     uint32_t device_index = ttnn::ccl::get_linearized_index_from_physical_coord(
         tensor_args.input_tensor, mesh_coordinate, attributes.cluster_axis);
 

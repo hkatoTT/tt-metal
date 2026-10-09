@@ -1928,6 +1928,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     if (const char* hk_e = std::getenv("TT_RING_SDPA_EXP_BATCH"); hk_e != nullptr && hk_e[0] == '1') {
         defines["HK_EXP_BATCH"] = "1";  // EXPERIMENT (hkato)
     }
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_EXP_OVF"); hk_e != nullptr && hk_e[0] == '1') {
+        defines["HK_EXP_OVF"] = "1";  // EXPERIMENT (hkato, optional, default off): one-LOADMACRO-per-row exp
+    }
     if (const char* hk_e = std::getenv("TT_RING_SDPA_SUM_STRIDE0"); hk_e != nullptr && hk_e[0] == '1') {
         defines["HK_SUM_STRIDE0"] = "1";  // EXPERIMENT (hkato)
     }

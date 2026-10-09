@@ -581,6 +581,68 @@ void reduce_c_row_group(
     tile_regs_release();
 }
 
+#ifdef HK_EXP_OVF
+// EXPERIMENT (hkato, optional, default off): softmax exp with one LOADMACRO per Dst row (the stock approximate
+// exp issues LOADMACRO + SHFT2, ~2.1 cycles per row) and no input window. Schraudolph: exp(x) has the bit pattern
+// k << 15 with k = round(A*x + (B-C)). The MAD puts y = 2^127 * (1 + m * 2^-23), m = M1 - k, in the top fp32
+// binade, so every k <= M1 - 2^23 (any score far below the row max, -inf included) overflows to +inf. SHFT2
+// (round sub-unit) shifts y left by 15, which drops the sign and exponent; IADD (simple sub-unit) writes
+// LReg11 - (y << 15) = (M1 - m) << 15 = k << 15 (mod 2^32) to the staging register, with LReg11 = -1.0 =
+// M1 << 15 (mod 2^32). k >= 0 gives the stock bit pattern, k in (M1 - 2^23, 0) a negative number and +inf gives
+// -1.0; the pack ReLU zeroes both (P and the row sums are packed with it).
+constexpr uint32_t hk_ovf_m1 = (1u << 23) - (1u << 17) + (0xBF800000u >> 15);  // 8355584
+constexpr uint32_t hk_ovf_bc = 32501u;  // stock B-C (32500.818) rounded to a whole step of m
+inline void hk_load_lreg(uint32_t lreg, float v) {
+    const uint32_t b = __builtin_bit_cast(uint32_t, v);
+    TT_SFPLOADI(0, 0xA, b & 0xFFFF);
+    TT_SFPLOADI(0, 0x8, b >> 16);
+    TT_SFPCONFIG(0, lreg, 0);
+}
+inline void hk_load_template(uint32_t slot, uint32_t insn) {
+    TT_SFPLOADI(0, 0xA, insn & 0xFFFF);
+    TT_SFPLOADI(0, 0x8, insn >> 16);
+    TT_SFPCONFIG(0, slot, 0);
+}
+inline void hk_exp_ovf_enter(float va, float vc) {
+    hk_load_template(2, TT_OP_SFPSHFT2(0, 14, 14, 5));  // mux6 (round): VD = VB << LReg14 (15, stock init)
+    hk_load_template(3, TT_OP_SFPIADD(0, 11, 15, 6));   // mux7 (simple): VD = LReg11 - VB, lane flags untouched
+    TTI_SFPLOADI(0, 0xA, 0x85DF);  // simple: IADD (mux7) d3, VB = row, -> staging ; MAD (mux5) d0, VB = row
+    TTI_SFPLOADI(0, 0x8, 0x6396);  // round: SHFT2 (mux6) d2, VB = row, -> row ; store d4 from staging
+    TTI_SFPCONFIG(0, 4, 0);
+    TTI_SFPCONFIG(0, 8, 1);  // Misc: StoreMod0 0, delays in cycles
+    hk_load_lreg(11, -1.0f);
+    hk_load_lreg(12, va);
+    hk_load_lreg(13, vc);
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_7);
+}
+inline void hk_exp_ovf_exit(float a) {
+    TTI_SFP_STOCH_RND(0, 0, 0, 0, 14, 7);  // template mux6: fp32 -> int16 (stock)
+    TTI_SFPSETSGN(0, 4, 15, 0);            // template mux7: SETSGN (stock)
+    TTI_SFPLOADI(0, 0xA, 0x85EF);
+    TTI_SFPLOADI(0, 0x8, 0x731E);
+    TTI_SFPCONFIG(0, 4, 0);
+    TTI_SFPCONFIG(0xF00, 0x8, 0x1);
+    hk_load_lreg(12, a);
+    hk_load_lreg(13, 32500.818359375f);
+}
+inline void hk_exp_ovf_tiles(uint32_t ntiles) {
+    for (uint32_t t = 0; t < ntiles; t++) {
+#pragma GCC unroll 8
+        for (int d = 0; d < 8; d++) {
+            TTI_SFPLOADMACRO(0, 0, 3, 0);
+            TTI_SFPLOADMACRO(1, 0, 3, 0);
+            TTI_SFPLOADMACRO(2, 0, 3, 0);
+            TTI_SFPLOADMACRO(3, 0, 3, 0);
+        }
+    }
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+}
+#endif
+
 /**
  * In-place sub_exp on cb_qkt_im: subtracts max, applies exp with ReLU clamping,
  * writes back to same positions. Accumulates row sums into reduce_cb.
@@ -628,7 +690,19 @@ void sub_exp_block_bcast_cols(
         uint32_t dst_index = 0;
         constexpr int iterations = 32;
         constexpr VectorMode vector_mode_exp = VectorMode::None;
-#if defined(HK_EXP_BATCH) && !defined(HK_SKIP_EXP)
+#if defined(HK_EXP_OVF) && !defined(HK_SKIP_EXP)
+        {
+            const uint32_t hk_ntiles = tiles_per_row * tiles_per_column;
+            constexpr float hk_a = 256.0f * 1.4426950408889634f * __builtin_bit_cast(float, scale_fp32);
+            constexpr float hk_va = -hk_a * 0x1p104f;
+            constexpr float hk_vc = static_cast<float>((1u << 23) + hk_ovf_m1 - hk_ovf_bc) * 0x1p104f;
+            PACK((hk_exp_ovf_enter(hk_va, hk_vc)));
+            PACK((_llk_math_eltwise_unary_sfpu_params_(
+                [hk_ntiles]() { hk_exp_ovf_tiles(hk_ntiles); }, 0, vector_mode_exp)));
+            PACK((hk_exp_ovf_exit(hk_a)));
+            (void)dst_index;
+        }
+#elif defined(HK_EXP_BATCH) && !defined(HK_SKIP_EXP)
         {
             const uint32_t hk_ntiles = tiles_per_row * tiles_per_column;
             PACK((_llk_math_eltwise_unary_sfpu_params_(

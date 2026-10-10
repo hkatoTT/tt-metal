@@ -171,7 +171,7 @@ bool supports_output_bank_owned_schedule(
     // of 2 scattered pages) on Wormhole
     const bool hk_wh_bank_owned = device->arch() == tt::ARCH::WORMHOLE_B0 && [] {
         const char* e = std::getenv("TT_RING_AG_BANK_OWNED_WH");
-        return e != nullptr && e[0] == 1;
+        return e != nullptr && e[0] == '1';
     }();
     return (device->arch() == tt::ARCH::BLACKHOLE || hk_wh_bank_owned) && num_dram_banks > 0 &&
            std::all_of(

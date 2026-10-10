@@ -344,6 +344,9 @@ void kernel_main() {
                     if (num_dests > 1) {
                         noc_async_write(l1, get_noc_addr(dest2_x, dest2_y, l1), in1_block_num_tiles * in1_tile_size);
                     }
+                    // The block (write cmd buf, many packets) must leave before the valid flag (register cmd buf), or
+                    // the flag can land first and the next core computes with stale in1 (as minimal_matmul does).
+                    noc_async_writes_flushed();
                     noc_semaphore_set_remote(valid_sem_addr, get_noc_addr(dest_x, dest_y, (uint32_t)receiver_sem));
                     if (num_dests > 1) {
                         noc_semaphore_set_remote(

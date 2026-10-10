@@ -261,6 +261,7 @@ void kernel_main() {
                     }
                     noc_semaphore_set(sender_sem, 0);
                     noc_async_write(l1, get_noc_addr(dest_x, dest_y, l1), block_bytes);
+                    noc_async_writes_flushed();  // the block before the valid flag (different command buffers)
                     noc_semaphore_set_remote(valid_sem_addr, get_noc_addr(dest_x, dest_y, (uint32_t)receiver_sem));
                 }
 #endif

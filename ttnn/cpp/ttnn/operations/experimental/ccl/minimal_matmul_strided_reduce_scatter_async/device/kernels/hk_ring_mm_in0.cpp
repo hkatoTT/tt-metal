@@ -180,6 +180,10 @@ void kernel_main() {
 #else
                     const uint8_t read_noc = noc_index;
 #endif
+                    // Own transaction id: in dynamic NOC mode the read barrier compares the NOC's response count with
+                    // both RISCs' issue counters, and the other RISC reads on the same NOC.
+                    constexpr uint32_t in0_trid = 5;
+                    noc_async_read_set_trid(in0_trid, read_noc);
                     for (uint32_t r = r0; r < r1 && m_tile + r < M_tiles; r++) {
                         for (uint32_t kk = 0; kk < K_block_tiles; kk++) {
                             noc_async_read(
@@ -189,14 +193,21 @@ void kernel_main() {
                                 read_noc);
                         }
                     }
-                    noc_async_read_barrier(read_noc);
+                    noc_async_read_barrier_with_trid(in0_trid, read_noc);
+                    noc_async_read_set_trid(0, read_noc);
                     const uint32_t off = r0 * K_block_tiles * in0_tile_size;
                     const uint32_t bytes = (r1 - r0) * K_block_tiles * in0_tile_size;
                     for (uint32_t g = 0; g < group_size; g++) {
+                        if (g != my_pos && bytes > 0) {
+                            noc_async_write(l1 + off, get_noc_addr(member_x[g], member_y[g], l1 + off), bytes);
+                        }
+                    }
+                    // The rows go out through the write command buffer and the flag through the register one; without
+                    // this flush a flag could leave (and land) before the tail of a multi-packet row write, and the
+                    // member would hand stale rows to its compute (rare, timing dependent).
+                    noc_async_writes_flushed();
+                    for (uint32_t g = 0; g < group_size; g++) {
                         if (g != my_pos) {
-                            if (bytes > 0) {
-                                noc_async_write(l1 + off, get_noc_addr(member_x[g], member_y[g], l1 + off), bytes);
-                            }
                             noc_semaphore_set_remote(
                                 flag_src_addr, get_noc_addr(member_x[g], member_y[g], parts_addr[my_pos]));
                         }

@@ -12,6 +12,7 @@ from ..utils.matmul import (
     get_fused_mmrs_config,
     get_matmul_config,
     get_matmul_core_grid,
+    mm_grid,
 )
 from ..utils.tensor import prepare_for_fused_swiglu
 from .module import Module, Parameter
@@ -405,7 +406,11 @@ class ColParallelLinear(Module):
             if not use_persistent_buffer:
                 ttnn.synchronize_device(self.mesh_device)
             M, K, N = x.padded_shape[-2], weight.padded_shape[-2], weight.padded_shape[-1]
-            full_grid = self.mesh_device.compute_with_storage_grid_size()
+            full_grid = mm_grid(self.mesh_device)
+            # EXPERIMENT (hkato): WAN_AGMM_WIDE_N="n1,n2": these AGMMs see the whole device grid (8x10 with
+            # ethernet dispatch) even when WAN_MM_GRID clamps the others
+            if str(N) in os.environ.get("WAN_AGMM_WIDE_N", "").split(","):
+                full_grid = self.mesh_device.compute_with_storage_grid_size()
 
             # Fabric-bound path: known shapes route to the optimized strided all-gather-matmul op.
             # N is the weight width, so a fused-SwiGLU layer keys on its packed [gate|up] width.
@@ -727,7 +732,7 @@ class RowParallelLinear(Module):
         # For fused concat the matmul K spans both halves = the weight's K; x is only the prefix half.
         K = weight.padded_shape[-2] if x_second is not None else x.padded_shape[-1]
         M, N = x.padded_shape[-2], weight.padded_shape[-1]
-        core_grid = self.mesh_device.compute_with_storage_grid_size()
+        core_grid = mm_grid(self.mesh_device)
 
         needs_reshape = len(x.shape) <= 3
         if needs_reshape:
@@ -755,6 +760,8 @@ class RowParallelLinear(Module):
             # EXPERIMENT (hkato): matmul + ring reduce-scatter + addcmul on the matmul cores over the whole grid
             # (TT_MMRS_RING=1 also switches the op's program). TT_MMRS_RING_BLK="M_block,K_block,subblock_h,subblock_w";
             # N_block is fixed at each core's share of one output slice (TT_MMRS_RING_G row groups per core row).
+            if os.environ.get("TT_MMRS_RING_FULL") == "1":  # the whole device grid (8x10 with ethernet dispatch)
+                core_grid = self.mesh_device.compute_with_storage_grid_size()
             _b = [int(v) for v in os.environ.get("TT_MMRS_RING_BLK", "8,9,4,2").split(",")]
             _g = int(os.environ.get("TT_MMRS_RING_G", "2"))
             _n_blk = N // 32 // self.mesh_device.shape[self.mesh_axis] // (core_grid.x // _g)

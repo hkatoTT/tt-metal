@@ -130,6 +130,12 @@ static const std::vector<DispatchKernelNode> single_chip_arch_1cq = {
     {2, 0, 0, 0, DISPATCH_S, {0, x, x, x}, {1, x, x, x}, k_dispatcher_s_noc},
 };
 
+// HK_ETH_NO_DISPATCH_S: 1 CQ without dispatch_s (prefetch + dispatch only)
+static const std::vector<DispatchKernelNode> single_chip_arch_1cq_no_dispatch_s = {
+    {0, 0, 0, 0, PREFETCH_HD, {x, x, x, x}, {1, x, x, x}, k_prefetcher_noc},
+    {1, 0, 0, 0, DISPATCH_HD, {0, x, x, x}, {x, x, x, x}, k_dispatcher_noc},
+};
+
 static const std::vector<DispatchKernelNode> single_chip_arch_2cq = {
     {0, 0, 0, 0, PREFETCH_HD, {x, x, x, x}, {2, x, x, x}, k_prefetcher_noc},
     {1, 0, 0, 1, PREFETCH_HD, {x, x, x, x}, {3, x, x, x}, k_prefetcher_noc},
@@ -462,6 +468,9 @@ std::vector<DispatchKernelNode> DispatchTopology::generate_nodes(
     auto populate_single_device = [&]() {
         const bool is_quasar = this->descriptor_.cluster().arch() == tt::ARCH::QUASAR;
         if (num_hw_cqs == 1) {
+            if (!is_quasar && !this->get_dispatch_query_manager_().dispatch_s_enabled()) {
+                return single_chip_arch_1cq_no_dispatch_s;
+            }
             return is_quasar ? quasar_single_chip_1cq : single_chip_arch_1cq;
         }
         if (is_quasar) {

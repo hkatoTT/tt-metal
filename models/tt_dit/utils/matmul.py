@@ -456,9 +456,20 @@ _BH_GALAXY_MIN_DEVICES = 32
 _BH_GALAXY_MAX_CORE_GRID = (11, 10)
 
 
+def mm_grid(mesh_device):
+    """The device grid as the matmul configs see it. WAN_MM_GRID="x,y" clamps it (EXPERIMENT, hkato): with
+    ethernet dispatch the WH Galaxy grid grows to 8x10, but the matmul blockings were tuned for 8x9."""
+    grid = mesh_device.compute_with_storage_grid_size()
+    clamp = os.environ.get("WAN_MM_GRID")
+    if clamp:
+        cx, cy = (int(v) for v in clamp.split(","))
+        grid = ttnn.CoreCoord(min(grid.x, cx), min(grid.y, cy))
+    return grid
+
+
 def get_matmul_core_grid(mesh_device):
     """Return the compute core grid, clamped to 11x10 on Blackhole Galaxy (power constraint)."""
-    core_grid = mesh_device.compute_with_storage_grid_size()
+    core_grid = mm_grid(mesh_device)
     if ttnn.device.is_blackhole() and mesh_device.get_num_devices() >= _BH_GALAXY_MIN_DEVICES:
         core_grid = ttnn.CoreCoord(
             min(core_grid.x, _BH_GALAXY_MAX_CORE_GRID[0]),
@@ -585,6 +596,12 @@ def _apply_agmm_env_overrides() -> None:
         _m, _k, _n = (int(v) for v in _shape.split("x"))
         _b = [int(v) for v in _blk.split(",")]
         grid_88_configs[(_m, _k, _n)] = (_b[0], _b[1], _b[2], (_b[3], _b[4]))
+    # WAN_AGMM_OVR_89: the same for the 8x9 worker grid (the AGMMs on the 8x10 ethernet-dispatch grid)
+    for _ovr in filter(None, os.environ.get("WAN_AGMM_OVR_89", "").split(";")):
+        _shape, _blk = _ovr.split("=")
+        _m, _k, _n = (int(v) for v in _shape.split("x"))
+        _b = [int(v) for v in _blk.split(",")]
+        grid_89_configs[(_m, _k, _n)] = (_b[0], _b[1], _b[2], (_b[3], _b[4]))
 
 
 _apply_agmm_env_overrides()

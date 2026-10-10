@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from contextlib import contextmanager
 
 import torch
@@ -908,7 +909,7 @@ class CCLManager:
             barrier_semaphore=self.get_barrier_semaphore(mesh_axis) if not use_persistent_buffer else None,
             dim=dim,
             multi_device_global_semaphore=self.get_ag_ping_pong_semaphore(mesh_axis),
-            num_links=self.num_links,
+            num_links=self.links_for_axis(mesh_axis),
             topology=self.topology,
             cluster_axis=mesh_axis,
             **params,
@@ -919,6 +920,13 @@ class CCLManager:
             tensor = ttnn.reshape(tensor, shape)
 
         return tensor
+
+    def links_for_axis(self, mesh_axis) -> int:
+        # WAN_AXIS_NUM_LINKS="axis:links,...", e.g. "1:3" when ethernet dispatch takes one SP-axis link
+        for item in os.environ.get("WAN_AXIS_NUM_LINKS", "").split(","):
+            if ":" in item and int(item.split(":")[0]) == mesh_axis:
+                return int(item.split(":")[1])
+        return self.num_links
 
     def reduce_scatter_persistent_buffer(
         self, tensor: ttnn.Tensor, /, *, dim: int, mesh_axis: int | None
@@ -954,7 +962,7 @@ class CCLManager:
             barrier_semaphore=self.get_barrier_semaphore(mesh_axis) if not use_persistent_buffer else None,
             dim=dim,
             multi_device_global_semaphore=self.get_rs_ping_pong_semaphore(mesh_axis),
-            num_links=self.num_links,
+            num_links=self.links_for_axis(mesh_axis),
             memory_config=ttnn.MemoryConfig(buffer_type=ttnn.BufferType.DRAM),
             topology=self.topology,
             cluster_axis=mesh_axis,

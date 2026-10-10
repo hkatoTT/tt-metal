@@ -1221,6 +1221,34 @@ void Cluster::disable_ethernet_cores_with_retrain() {
             }
         }
     }
+    // HK_DISABLE_ETH_CHANS="chip:chan,chip:chan,...": treat these links as down (fabric skips them and they become
+    // idle ethernet cores, e.g. for ethernet dispatch). List both ends of every link.
+    if (const char* env = std::getenv("HK_DISABLE_ETH_CHANS"); env != nullptr) {
+        std::string spec(env);
+        size_t pos = 0;
+        int count = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos);
+            if (end == std::string::npos) {
+                end = spec.size();
+            }
+            std::string item = spec.substr(pos, end - pos);
+            pos = end + 1;
+            size_t colon = item.find(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            ChipId chip = std::stoi(item.substr(0, colon));
+            uint32_t chan = std::stoul(item.substr(colon + 1));
+            if (std::find(chips.begin(), chips.end(), chip) == chips.end()) {
+                continue;
+            }
+            auto eth_core = get_soc_desc(chip).get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+            this->frequent_retrain_cores_[chip].insert(tt::tt_metal::CoreCoord(eth_core.x, eth_core.y));
+            count++;
+        }
+        log_warning(LogDevice, "HK_DISABLE_ETH_CHANS: disabled {} ethernet cores", count);
+    }
 }
 
 void Cluster::rediscover_ethernet_links() {

@@ -2826,12 +2826,21 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     // EXPERIMENT (hkato): Q interleave, see q_chunk_remapping.hpp. Every core owns the same number P of chunks,
     // core c computes chunks c, c+C, ... so in pass p the cores [g*Nq, (g+1)*Nq) all work on head p*(C/Nq)+g.
     const char* q_interleave_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE");
-    const uint32_t q_interleave_per_core = base_chunks_per_core;
-    const bool q_interleave = q_interleave_env != nullptr && std::string(q_interleave_env) == "1" && use_head_chain &&
-                              build_kv_chains && ksplit_count == 1 && !enable_zigzag_balancing &&
-                              !use_rotated_q_split && !has_sliding_window && cores_doing_extra_work == 0 &&
-                              q_interleave_per_core >= 2 && num_q_chunks > 1 && num_cores % num_q_chunks == 0 &&
-                              total_q_chunks == q_interleave_per_core * num_cores;
+    // (hkato) Uneven split (e.g. TT_RING_SDPA_RELAY on the whole grid): zone 0 = the first cores_doing_extra_work
+    // cores (one chunk more; whole heads per pass in groups of num_q_chunks cores), zone 1 = the remaining whole
+    // rows as one group (each pass covers zone-1-cores chunks of one head). See q_chunk_remapping.hpp.
+    const uint32_t hk_z0_cores = cores_doing_extra_work == 0 ? num_cores : cores_doing_extra_work;
+    const uint32_t hk_z1_cores = num_cores - hk_z0_cores;
+    const uint32_t q_interleave_per_core = base_chunks_per_core + (cores_doing_extra_work == 0 ? 0u : 1u);
+    const bool hk_zones_ok =
+        hk_z1_cores == 0 ||
+        (hk_z0_cores % grid_size.x == 0 && hk_z1_cores % grid_size.x == 0 && num_q_chunks % hk_z1_cores == 0 &&
+         (hk_z1_cores * base_chunks_per_core) % num_q_chunks == 0 && base_chunks_per_core >= 2);
+    const bool q_interleave =
+        q_interleave_env != nullptr && std::string(q_interleave_env) == "1" && use_head_chain && build_kv_chains &&
+        ksplit_count == 1 && !enable_zigzag_balancing && !use_rotated_q_split && !has_sliding_window && hk_zones_ok &&
+        q_interleave_per_core >= 2 && num_q_chunks > 1 && hk_z0_cores % num_q_chunks == 0 &&
+        total_q_chunks == q_interleave_per_core * hk_z0_cores + base_chunks_per_core * hk_z1_cores;
     if (q_interleave_env != nullptr) {
         log_info(
             tt::LogOp,
@@ -2844,7 +2853,12 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     }
     if (q_interleave) {
         defines["SDPA_Q_INTERLEAVE_PER_CORE"] = std::to_string(q_interleave_per_core);
-        defines["SDPA_Q_INTERLEAVE_CORES"] = std::to_string(num_cores);
+        defines["SDPA_Q_INTERLEAVE_CORES"] = std::to_string(hk_z0_cores);
+        if (hk_z1_cores > 0) {
+            defines["SDPA_Q_IL_Z1_START"] = std::to_string(hk_z0_cores * q_interleave_per_core);
+            defines["SDPA_Q_IL_Z1_PER_CORE"] = std::to_string(base_chunks_per_core);
+            defines["SDPA_Q_IL_Z1_CORES"] = std::to_string(hk_z1_cores);
+        }
         // Chains of chain_len cores within a group: more chain heads read K/V from DRAM (each one fewer bytes).
         const char* chain_len_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE_CHAIN");
         uint32_t chain_len = chain_len_env != nullptr ? static_cast<uint32_t>(std::atoi(chain_len_env)) : num_q_chunks;
@@ -2855,11 +2869,21 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         const char* order_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE_ORDER");
         const std::string chain_order = order_env != nullptr ? std::string(order_env) : std::string("fwd");
         log_info(tt::LogOp, "Ring joint Q interleave chain order {}", chain_order);
-        for (uint32_t c0 = 0; c0 < num_cores; c0 += chain_len) {
+        // (hkato) groups {first core, cores, chunks per core}: zone 0 in chain_len pieces, zone 1 as one group
+        std::vector<std::array<uint32_t, 3>> hk_groups;
+        for (uint32_t c0 = 0; c0 < hk_z0_cores; c0 += chain_len) {
+            hk_groups.push_back({c0, chain_len, q_interleave_per_core});
+        }
+        if (hk_z1_cores > 0) {
+            hk_groups.push_back({hk_z0_cores, hk_z1_cores, base_chunks_per_core});
+        }
+        for (const auto& hk_group : hk_groups) {
+            const uint32_t c0 = hk_group[0];
+            const uint32_t glen = hk_group[1];
             std::vector<ChainSegment> chain_segs;
-            for (uint32_t i = 0; i < chain_len; ++i) {
-                const uint32_t idx = chain_order == "rev" ? chain_len - 1 - i : i;
-                chain_segs.emplace_back(c0 + idx, q_interleave_per_core);
+            for (uint32_t i = 0; i < glen; ++i) {
+                const uint32_t idx = chain_order == "rev" ? glen - 1 - i : i;
+                chain_segs.emplace_back(c0 + idx, hk_group[2]);
             }
             TT_FATAL(
                 build_linear_chain(chain_segs, 0xFFFFFFFFu, head_chain_configs, core_work, false),
@@ -2868,8 +2892,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         }
         const char* qil_mcast_env = std::getenv("TT_RING_SDPA_Q_INTERLEAVE_MCAST");
         if (qil_mcast_env != nullptr && std::string(qil_mcast_env) == "1" && chain_len % grid_size.x == 0) {
-            const uint32_t rows_per_group = chain_len / grid_size.x;
-            for (uint32_t c0 = 0; c0 < num_cores; c0 += chain_len) {
+            for (const auto& hk_group : hk_groups) {
+                const uint32_t c0 = hk_group[0];
+                const uint32_t glen = hk_group[1];
+                const uint32_t rows_per_group = glen / grid_size.x;
                 const uint32_t y0 = c0 / grid_size.x;
                 // The reader runs on NoC1 (both the default reader config and TT_RING_SDPA_READER_NOC1), whose
                 // multicast rectangle goes from the high corner to the low corner.
@@ -2878,7 +2904,7 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
                 const CoreCoord rect_end = device->worker_core_from_logical_core(CoreCoord{0, y0});
                 const uint32_t injector_idx = c0;
                 const CoreCoord injector_phys = core_work[injector_idx].physical_core;
-                for (uint32_t ci = c0; ci < c0 + chain_len; ++ci) {
+                for (uint32_t ci = c0; ci < c0 + glen; ++ci) {
                     auto& cfg = head_chain_configs[ci];
                     cfg.participates = true;
                     cfg.mcast_start = rect_start;
@@ -2888,8 +2914,8 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
                     cfg.next_physical = CoreCoord{0, 0};
                     cfg.is_injector = (ci == injector_idx);
                     cfg.is_sink = !cfg.is_injector;
-                    cfg.mcast_num_dests = cfg.is_injector ? chain_len - 1 : 0;
-                    cfg.next_core_q_chunks = cfg.is_injector ? q_interleave_per_core : 0;
+                    cfg.mcast_num_dests = cfg.is_injector ? glen - 1 : 0;
+                    cfg.next_core_q_chunks = cfg.is_injector ? hk_group[2] : 0;
                 }
                 mcast_chains++;
             }

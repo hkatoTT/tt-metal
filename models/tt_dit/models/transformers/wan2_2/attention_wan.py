@@ -16,7 +16,7 @@ from ....layers.module import Module
 from ....layers.normalization import DistributedRMSNorm
 from ....parallel.config import DiTParallelConfig
 from ....parallel.manager import CCLManager
-from ....utils.matmul import get_matmul_config, register_matmul_configs
+from ....utils.matmul import get_matmul_config, mm_grid, register_matmul_configs
 from ....utils.substate import pop_substate, rename_substate
 from ....utils.tensor import bf16_tensor
 
@@ -320,7 +320,7 @@ class WanAttention(Module):
 
         if parallel_config is not None and parallel_config.tensor_parallel.factor > 1:
             M, K, N = x.padded_shape[-2], weight.padded_shape[-2], weight.padded_shape[-1]
-            full_grid = self.mesh_device.compute_with_storage_grid_size()
+            full_grid = mm_grid(self.mesh_device)
             core_grid = ttnn.CoreCoord(full_grid.x, full_grid.y - 1)
             matmul_config = get_matmul_config(M, K, N, core_grid)
 
@@ -356,7 +356,7 @@ class WanAttention(Module):
             )[0]
         else:
             M, K, N_out = x.padded_shape[-2], x.padded_shape[-1], weight.padded_shape[-1]
-            core_grid = self.mesh_device.compute_with_storage_grid_size()
+            core_grid = mm_grid(self.mesh_device)
             matmul_config = get_matmul_config(M, K, N_out, core_grid)
 
             output = ttnn.experimental.dit_minimal_matmul_addcmul_fused(
@@ -671,7 +671,7 @@ class WanAttention(Module):
                             multi_device_global_semaphore=self.ccl_manager.get_ag_ping_pong_semaphore(
                                 self.parallel_config.sequence_parallel.mesh_axis
                             ),
-                            num_links=self.ccl_manager.num_links,
+                            num_links=self.ccl_manager.links_for_axis(self.parallel_config.sequence_parallel.mesh_axis),
                             cluster_axis=self.parallel_config.sequence_parallel.mesh_axis,
                             mesh_device=self.mesh_device,
                             topology=self.ccl_manager.topology,

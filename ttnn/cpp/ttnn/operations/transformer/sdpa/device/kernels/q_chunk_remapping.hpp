@@ -81,7 +81,16 @@ struct GlobalQIndex {
 FORCE_INLINE GlobalQIndex decompose_global_q_index(uint32_t idx, uint32_t num_q_chunks, uint32_t NQH, bool use_zigzag) {
 #if defined(SDPA_Q_INTERLEAVE_PER_CORE) && defined(SDPA_Q_INTERLEAVE_CORES)
     // Q interleave: a core's contiguous flat range [c*P, c*P+P) maps to chunks c, c+C, c+2C, ... (one per pass).
-    idx = (idx % SDPA_Q_INTERLEAVE_PER_CORE) * SDPA_Q_INTERLEAVE_CORES + idx / SDPA_Q_INTERLEAVE_PER_CORE;
+#if defined(SDPA_Q_IL_Z1_START)
+    // (hkato) zone 1: the cores past zone 0 own SDPA_Q_IL_Z1_PER_CORE chunks each, interleaved among themselves
+    if (idx >= SDPA_Q_IL_Z1_START) {
+        const uint32_t j = idx - SDPA_Q_IL_Z1_START;
+        idx = SDPA_Q_IL_Z1_START + (j % SDPA_Q_IL_Z1_PER_CORE) * SDPA_Q_IL_Z1_CORES + j / SDPA_Q_IL_Z1_PER_CORE;
+    } else
+#endif
+    {
+        idx = (idx % SDPA_Q_INTERLEAVE_PER_CORE) * SDPA_Q_INTERLEAVE_CORES + idx / SDPA_Q_INTERLEAVE_PER_CORE;
+    }
 #endif
     const uint32_t remapped = remap_q_index(idx, num_q_chunks, use_zigzag);
     return {

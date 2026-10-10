@@ -31,6 +31,7 @@ from ....utils.matmul import (
     FusedMMRSConfig,
     get_matmul_config,
     get_matmul_core_grid,
+    mm_grid,
     register_fused_mmrs_configs,
     register_matmul_configs,
     resolves_fused_mmrs_config,
@@ -327,7 +328,7 @@ class WanTransformerBlock(Module):
             spatial_normed_1BND.padded_shape[-2],
             self.ffn_dim // self.parallel_config.tensor_parallel.factor,
             self.dim,
-            self.mesh_device.compute_with_storage_grid_size(),
+            mm_grid(self.mesh_device),
         ):
             # Unfused ff1 (AGMM) -> ff2 (matmul + reduce-scatter) -> addcmul when no measured or rule-derived
             # fused MM+RS blocking resolves for this (M, K, N) on the device grid: the fused op's default

@@ -293,6 +293,8 @@ def get_updated_device_params(device_params):
                 f"Blackhole with fabric_config and fabric_tensix_config enabled, using fabric_tensix_config={fabric_tensix_config}"
             )
 
+    if dispatch_core_type is None and os.environ.get("HK_ETH_DISPATCH") == "1":
+        dispatch_core_type = ttnn.device.DispatchCoreType.ETH
     dispatch_core_config = ttnn.DispatchCoreConfig(dispatch_core_type, dispatch_core_axis, fabric_tensix_config)
     new_device_params["dispatch_core_config"] = dispatch_core_config
 

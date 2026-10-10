@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dispatch_query_manager.hpp"
+#include <cstdlib>
 
 #include <initializer_list>
 #include <optional>
@@ -148,6 +149,12 @@ void DispatchQueryManager::reset(DispatchCoreConfig& dispatch_core_config, uint8
             (num_hw_cqs == 1 or dispatch_core_config_.get_dispatch_core_type() == DispatchCoreType::WORKER);
         distributed_dispatcher_ =
             (num_hw_cqs == 1 and dispatch_core_config_.get_dispatch_core_type() == DispatchCoreType::ETH);
+        // HK_ETH_NO_DISPATCH_S=1: ethernet dispatch with 2 cores per chip (prefetch + dispatch, no dispatch_s)
+        if (dispatch_core_config_.get_dispatch_core_type() == DispatchCoreType::ETH &&
+            std::getenv("HK_ETH_NO_DISPATCH_S") != nullptr) {
+            dispatch_s_enabled_ = false;
+            distributed_dispatcher_ = false;
+        }
     }
 
     go_signal_noc_ = (dispatch_s_enabled_ and arch != tt::ARCH::QUASAR) ? NOC::NOC_1 : NOC::NOC_0;

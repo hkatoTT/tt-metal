@@ -447,7 +447,11 @@ class WanCausalConv3d(Module):
                 neighbor_sems.append(
                     self.ccl_manager.get_np_ping_pong_semaphore(self.parallel_config.height_parallel.mesh_axis)
                 )
-                links.append(get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 2))
+                links.append(
+                    get_neighbor_pad_num_links(
+                        self.ccl_manager, x_BTHWC, 2, self.parallel_config.height_parallel.mesh_axis
+                    )
+                )
             if w_pad_needed:
                 dims.append(3)
                 pad_left.append(self.external_padding[2])
@@ -456,7 +460,11 @@ class WanCausalConv3d(Module):
                 neighbor_sems.append(
                     self.ccl_manager.get_np_ping_pong_semaphore(self.parallel_config.width_parallel.mesh_axis)
                 )
-                links.append(get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 3))
+                links.append(
+                    get_neighbor_pad_num_links(
+                        self.ccl_manager, x_BTHWC, 3, self.parallel_config.width_parallel.mesh_axis
+                    )
+                )
 
             fused_logical_h = (
                 logical_h
@@ -860,7 +868,11 @@ class WanConv2d(Module):
                 neighbor_sems.append(
                     self.ccl_manager.get_np_ping_pong_semaphore(self.parallel_config.height_parallel.mesh_axis)
                 )
-                links.append(get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 2))
+                links.append(
+                    get_neighbor_pad_num_links(
+                        self.ccl_manager, x_BTHWC, 2, self.parallel_config.height_parallel.mesh_axis
+                    )
+                )
             if w_pad_needed:
                 dims.append(3)
                 pad_left.append(self.external_padding[2])
@@ -869,7 +881,11 @@ class WanConv2d(Module):
                 neighbor_sems.append(
                     self.ccl_manager.get_np_ping_pong_semaphore(self.parallel_config.width_parallel.mesh_axis)
                 )
-                links.append(get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 3))
+                links.append(
+                    get_neighbor_pad_num_links(
+                        self.ccl_manager, x_BTHWC, 3, self.parallel_config.width_parallel.mesh_axis
+                    )
+                )
 
             fused_logical_h = (
                 logical_h
@@ -2004,14 +2020,15 @@ class WanEncoder(Module):
         return (output_BCTHW, new_logical_h, new_logical_w)
 
 
-def get_neighbor_pad_num_links(ccl_manager, input_tensor, dim):
+def get_neighbor_pad_num_links(ccl_manager, input_tensor, dim, mesh_axis=None):
     """
     Neighbor pad can use no more links than the product of the upper dimensions of the input tensor.
     """
     upper_dims = 1
     for i in range(dim):
         upper_dims *= input_tensor.shape[i]
-    return min(upper_dims, ccl_manager.num_links)
+    links = ccl_manager.links_for_axis(mesh_axis) if mesh_axis is not None else ccl_manager.num_links
+    return min(upper_dims, links)
 
 
 class WanVAEDecoderAdapter:

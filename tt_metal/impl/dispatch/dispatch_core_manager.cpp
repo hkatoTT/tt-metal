@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dispatch_core_manager.hpp"
+#include <cstdlib>
 
 #include <algorithm>
 #include <functional>
@@ -337,8 +338,21 @@ void dispatch_core_manager::reset_dispatch_core_manager(
 
         // Remove service-owned cores so FD never allocates them.
         auto claimed = ctx_.get_service_core_manager().claimed_cores(device_id);
+        size_t hk_before = logical_dispatch_cores.size();
         if (!claimed.empty()) {
             logical_dispatch_cores.remove_if([&claimed](const CoreCoord& c) { return claimed.contains(c); });
+        }
+        if (std::getenv("HK_DISPATCH_POOL_LOG") != nullptr && device_id == 0) {
+            std::string cores;
+            for (const auto& c : logical_dispatch_cores) {
+                cores += c.str() + " ";
+            }
+            log_warning(
+                tt::LogMetal,
+                "HK dispatch pool dev0: {} before claims, {} after: {}",
+                hk_before,
+                logical_dispatch_cores.size(),
+                cores);
         }
     }
 }
@@ -364,6 +378,9 @@ CoreCoord dispatch_core_manager::get_next_available_dispatch_core(ChipId device_
     }
     CoreCoord avail_dispatch_core = this->available_dispatch_cores_by_device.at(device_id).front();
     this->available_dispatch_cores_by_device.at(device_id).pop_front();
+    if (std::getenv("HK_DISPATCH_POOL_LOG") != nullptr && device_id == 0) {
+        log_warning(tt::LogMetal, "HK dispatch pool dev0: took {}", avail_dispatch_core.str());
+    }
     return avail_dispatch_core;
 }
 

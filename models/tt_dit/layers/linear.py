@@ -411,6 +411,8 @@ class ColParallelLinear(Module):
             # ethernet dispatch) even when WAN_MM_GRID clamps the others
             if str(N) in os.environ.get("WAN_AGMM_WIDE_N", "").split(","):
                 full_grid = self.mesh_device.compute_with_storage_grid_size()
+                if os.environ.get("HK_SYNC_BEFORE_WIDE") == "1":  # EXPERIMENT (hkato): race localization
+                    ttnn.synchronize_device(self.mesh_device)
 
             # Fabric-bound path: known shapes route to the optimized strided all-gather-matmul op.
             # N is the weight width, so a fused-SwiGLU layer keys on its packed [gate|up] width.

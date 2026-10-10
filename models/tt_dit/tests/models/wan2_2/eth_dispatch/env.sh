@@ -17,10 +17,7 @@ export TT_MESH_GRAPH_DESC_PATH=$(realpath $D/galaxy_torus_xy_ch$((4 - K)).textpr
 export WAN_AXIS_NUM_LINKS=1:$((4 - K))
 if [ "$K" = 1 ]; then
   export HK_ETH_NO_DISPATCH_S=1 TT_RING_AG_BANK_OWNED_WH=1
-  # the matmuls keep their 8x9 blockings (QKV / FFN1 on the extra row race with 3 SP links, see #155)
-  export WAN_MM_GRID=8,9
-else
-  # the matmuls keep their 8x9 blockings; QKV and FFN1 use the extra row
-  export WAN_MM_GRID=8,9 WAN_AGMM_WIDE_N=3840,3456
-  export "WAN_AGMM_OVR_89=8192x5120x3840=16,8,14,4,2;8192x5120x3456=16,8,12,4,2"
 fi
+# the matmuls keep their 8x9 blockings; QKV and FFN1 use the extra row
+export WAN_MM_GRID=8,9 WAN_AGMM_WIDE_N=3840,3456
+export "WAN_AGMM_OVR_89=8192x5120x3840=16,8,14,4,2;8192x5120x3456=16,8,12,4,2"

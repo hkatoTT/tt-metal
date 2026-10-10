@@ -223,7 +223,7 @@ class CCLManager:
         return self._ping_pong_buffer_cache[cache_key][current_idx]
 
     def get_ag_ping_pong_buffer(
-        self, shape, dim, mesh_axis, dtype=ttnn.bfloat16, device_synchronize=True, capacity=None
+        self, shape, dim, mesh_axis, dtype=ttnn.bfloat16, device_synchronize=True, capacity=None, tag=None
     ):
         """
         Get or create ping pong buffers for all gather operations.
@@ -244,6 +244,8 @@ class CCLManager:
         output_buffer_shape = list(shape)
         output_buffer_shape[dim] = capacity or shape[dim] * self.mesh_device.shape[mesh_axis]
         cache_key = ("ag", tuple(output_buffer_shape), dim, mesh_axis, dtype)
+        if tag is not None:  # separate ping-pong pairs for same-shape inputs of one op (e.g. ring SDPA K and V)
+            cache_key = cache_key + (tag,)
 
         # Create buffers if not cached
         if cache_key not in self._ping_pong_buffer_cache:

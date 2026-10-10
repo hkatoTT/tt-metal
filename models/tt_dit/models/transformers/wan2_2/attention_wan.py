@@ -656,10 +656,18 @@ class WanAttention(Module):
                             dummy_joint,
                             dummy_joint,
                             persistent_output_buffer_k=self.ccl_manager.get_ag_ping_pong_buffer(
-                                k.shape, 2, self.parallel_config.sequence_parallel.mesh_axis, dtype=k.dtype
+                                k.shape,
+                                2,
+                                self.parallel_config.sequence_parallel.mesh_axis,
+                                dtype=k.dtype,
+                                tag="k" if os.environ.get("WAN_AG_PP_FIX") == "1" else None,
                             ),
                             persistent_output_buffer_v=self.ccl_manager.get_ag_ping_pong_buffer(
-                                v.shape, 2, self.parallel_config.sequence_parallel.mesh_axis, dtype=v.dtype
+                                v.shape,
+                                2,
+                                self.parallel_config.sequence_parallel.mesh_axis,
+                                dtype=v.dtype,
+                                tag="v" if os.environ.get("WAN_AG_PP_FIX") == "1" else None,
                             ),
                             joint_strategy="rear",
                             logical_n=N,

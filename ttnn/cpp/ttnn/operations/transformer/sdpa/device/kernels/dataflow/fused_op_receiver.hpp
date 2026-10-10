@@ -56,6 +56,14 @@ struct RingSDPAOpReceiver {
 
     uint32_t get_next_ring_id_and_sync() {
         ASSERT(initialized);
+#if defined(HK_WAIT_ALL)
+        // EXPERIMENT (hkato): wait for the whole all-gather before the first K/V shard (race localization)
+        if (this->wait_for_op_signal && this->seq.transfer_idx == 0) {
+            const uint32_t split_extra = this->split_forwarding_enabled ? 1u : 0u;
+            Semaphore<>(this->signal_op_semaphore_ids[0]).wait_min(this->seq.expected[0] + 1 + split_extra);
+            Semaphore<>(this->signal_op_semaphore_ids[1]).wait_min(this->seq.expected[1]);
+        }
+#endif
         uint32_t ring_id = seq.get_next_ring_id([&](uint32_t dir, uint32_t val) {
             if (this->wait_for_op_signal) {
                 Semaphore<>(this->signal_op_semaphore_ids[dir]).wait_min(val);

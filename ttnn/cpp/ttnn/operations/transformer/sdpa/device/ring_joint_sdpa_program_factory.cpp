@@ -1319,6 +1319,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         (args.all_gather_operation_attributes.ring_size % 2 == 0) &&
         (args.all_gather_operation_attributes.ring_size > 2) && !tensor_args.has_latent_v() &&
         !args.has_sliding_window();
+    if (std::getenv("TT_RING_SDPA_NO_SPLIT") != nullptr) {  // EXPERIMENT (hkato): race localization
+        sdpa_fused_op_signaler->split_forwarding_enabled = false;
+    }
 
     log_debug(tt::LogOp, "num_cores: {}", num_cores);
     log_debug(
@@ -2850,6 +2853,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
             num_cores,
             num_q_chunks,
             cores_doing_extra_work);
+    }
+    if (std::getenv("TT_RING_SDPA_WAIT_ALL") != nullptr) {  // EXPERIMENT (hkato): see fused_op_receiver.hpp
+        defines["HK_WAIT_ALL"] = "1";
     }
     if (q_interleave) {
         defines["SDPA_Q_INTERLEAVE_PER_CORE"] = std::to_string(q_interleave_per_core);

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "ring_attention_all_gather_async_multi_core_with_workers_program_factory.hpp"
 #include "ring_attention_all_gather_async_device_operation_types.hpp"
 #include <algorithm>
@@ -166,7 +167,13 @@ bool supports_output_bank_owned_schedule(
     }
     const auto* device = output_tensors.front().device();
     const uint32_t num_dram_banks = device->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
-    return device->arch() == tt::ARCH::BLACKHOLE && num_dram_banks > 0 &&
+    // EXPERIMENT (hkato): TT_RING_AG_BANK_OWNED_WH=1 also uses the bank-owned schedule (4 pages per packet instead
+    // of 2 scattered pages) on Wormhole
+    const bool hk_wh_bank_owned = device->arch() == tt::ARCH::WORMHOLE_B0 && [] {
+        const char* e = std::getenv("TT_RING_AG_BANK_OWNED_WH");
+        return e != nullptr && e[0] == 1;
+    }();
+    return (device->arch() == tt::ARCH::BLACKHOLE || hk_wh_bank_owned) && num_dram_banks > 0 &&
            std::all_of(
                output_tensors.begin(),
                output_tensors.end(),

@@ -847,6 +847,13 @@ class WanPipeline(PipelineAPIMixin):
                 if step_timing:
                     ttnn.synchronize_device(self.mesh_device)
                     logger.info(f"WAN_TIMING step {i} total={(time.perf_counter() - step_start) * 1e3:.2f} ms")
+                if os.environ.get("WAN_STEP_HASH") == "1":  # DEBUG (hkato): bit-exact fingerprint per step
+                    import hashlib
+
+                    hk_h = hashlib.md5()
+                    for hk_dt in ttnn.get_device_tensors(permuted_latent_tt):
+                        hk_h.update(ttnn.to_torch(hk_dt).float().numpy().tobytes())
+                    logger.info(f"WAN_STEP_HASH step {i} {hk_h.hexdigest()}")
 
                 progress_bar.update()
                 if i < 2:

@@ -326,9 +326,15 @@ def test_wan_transformer_block(
     )
     # WAN_BLOCK_TEST_ITERS=N runs the block N times back to back, so a device profile of the last
     # iteration shows warm (host-ahead-of-device) timing.
-    for _ in range(int(os.environ.get("WAN_BLOCK_TEST_ITERS", "1"))):
+    hk_iters = int(os.environ.get("HK_BLOCK_ITERS", os.environ.get("WAN_BLOCK_TEST_ITERS", "1")))
+    for hk_it in range(hk_iters):
+        hk_in = tt_spatial
+        if os.environ.get("HK_BLOCK_VARY") == "1" and hk_it > 0:  # DEBUG (hkato): different input per iteration
+            hk_in = ttnn.multiply(tt_spatial, 1.0 + 0.01 * hk_it)
+        if os.environ.get("HK_BLOCK_VARY") == "chain" and hk_it > 0:  # DEBUG (hkato): any error propagates
+            hk_in = ttnn.add(tt_spatial, ttnn.multiply(tt_spatial_out, 1e-3))
         tt_spatial_out = tt_model(
-            spatial_1BND=tt_spatial,
+            spatial_1BND=hk_in,
             prompt_1BLP=tt_prompt,
             temb_1BTD=tt_temb,
             N=spatial_seq_len,
@@ -336,6 +342,19 @@ def test_wan_transformer_block(
             rope_sin=tt_rope_sin,
             trans_mat=tt_trans_mat,
         )
+        if os.environ.get("HK_BLOCK_HASH") == "1" or (
+            os.environ.get("HK_BLOCK_HASH") == "last" and hk_it == hk_iters - 1
+        ):
+            import hashlib
+
+            hk_dims = [None, None]
+            hk_dims[sp_axis] = 2
+            hk_dims[tp_axis] = 3
+            hk_t = ttnn.to_torch(
+                tt_spatial_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=hk_dims, mesh_shape=tuple(mesh_device.shape)),
+            )
+            print("HK_BLOCK_HASH", hk_it, hashlib.md5(hk_t.float().numpy().tobytes()).hexdigest(), flush=True)
 
     spatial_concat_dims = [None, None]
     spatial_concat_dims[sp_axis] = 2

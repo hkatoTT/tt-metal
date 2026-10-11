@@ -115,6 +115,45 @@ constexpr uint32_t sliding_q_plan_max_source_ranges =
 constexpr bool sliding_local_first = SLIDING_LOCAL_FIRST;
 #else
 constexpr bool sliding_local_first = false;
+#ifdef HK_PV_SUM
+// EXPERIMENT (hkato): softmax row sums from the P.V matmul. A fifth SrcA tile per K row, the ones column
+// (1 in column 0, V's format, made by the writer), turns P[r,k] x ones into the row sum of P[r,k] in column 0 of
+// a fifth DEST tile, so sub_exp no longer packs every P tile a second time (L1-accumulated) for the sums.
+// Unpack: the stock reuse-A matmul MOP unpacks the vDHt V tiles of the K row, then SrcA is pointed at the ones tile
+// for one more UNPACR inside the same config context. Math: the stock no-MOP 1 x (vDHt + 1) matmul (its
+// t_dim == 1 replay clears SrcA after every tile and SrcB at the end).
+#ifdef TRISC_UNPACK
+template <uint32_t vDHt>
+inline void hk_unpack_pv_sum(uint32_t in0_cb, uint32_t in1_cb, uint32_t in0_index, uint32_t in1_index) {
+    const uint32_t a_id = get_operand_id(in0_cb);
+    const uint32_t b_id = get_operand_id(in1_cb);
+    const uint32_t ones_id = get_operand_id(HK_ONES_CB);
+    const uint32_t address_a =
+        get_local_cb_interface(a_id).fifo_rd_ptr - 1 + get_local_cb_interface(a_id).fifo_page_size * in0_index;
+    const uint32_t address_b =
+        get_local_cb_interface(b_id).fifo_rd_ptr - 1 + get_local_cb_interface(b_id).fifo_page_size * in1_index;
+    const uint32_t ones_addr = get_local_cb_interface(ones_id).fifo_rd_ptr - 1;
+    volatile uint32_t* cfg = get_cfg_pointer();
+    wait_for_next_context(2);
+    _llk_unpack_configure_addresses_(address_b, address_a, cfg);
+    semaphore_post(semaphore::UNPACK_SYNC);
+    TTI_STALLWAIT(p_stall::STALL_UNPACK, p_stall::TRISC_CFG);
+    TTI_UNPACR(SrcB, 0, 0, 0, 0, 1, 1, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
+    TT_MOP(0, vDHt - 1, unp_cfg_context == 0 ? 0 : 0xff);
+    TT_SETDMAREG(0, LOWER_HALFWORD(ones_addr), 0, LO_16(p_gpr_unpack::TMP0));
+    TT_SETDMAREG(0, UPPER_HALFWORD(ones_addr), 0, HI_16(p_gpr_unpack::TMP0));
+    if (0 == unp_cfg_context) {
+        TTI_REG2FLOP(1, 0, 0, 0, THCON_SEC0_REG3_Base_address_ADDR32 - THCON_CFGREG_BASE_ADDR32, p_gpr_unpack::TMP0);
+    } else {
+        TTI_REG2FLOP(
+            1, 0, 0, 0, THCON_SEC0_REG3_Base_cntx1_address_ADDR32 - THCON_CFGREG_BASE_ADDR32, p_gpr_unpack::TMP0);
+    }
+    TTI_DMANOP;
+    TTI_UNPACR(SrcA, 0, 0, 0, 0, 1, 1, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
+    t6_semaphore_get(semaphore::UNPACK_SYNC);
+    switch_config_context(unp_cfg_context);
+}
+#endif
 #endif
 
 // Template-driven profiling: MaybeDeviceZoneScopedN(ENABLED, name)
@@ -337,7 +376,32 @@ ALWI bool configure_row_pack_width(uint32_t cb, uint32_t pack_width) {
     return use_blocked_pack_width;
 }
 
+// EXPERIMENT (hkato): HK_SFPU_GO. The pack-thread SFPU (softmax exp, SALAD correction factor) is gated in hardware
+// by STALLWAIT(STALL_SFPU, MATH) in the SFPU prologue: the pack thread's DEST wait only stalls its pack
+// instructions, so its SFPU instructions are held until the math engine is idle. Rare ring SDPA hangs show math
+// stuck on its DEST commit (which waits for the SFPU to be idle) while the pack thread's held SFPU instructions wait
+// for math; the held instructions seem to count as SFPU activity. Here math posts a dedicated semaphore after
+// committing a block the pack thread runs SFPU on, and the pack TRISC polls it (and takes the token) before issuing
+// any SFPU instruction, so no pack-thread SFPU instruction is held in hardware waiting for math.
+#ifdef HK_SFPU_GO
+constexpr uint32_t hk_sfpu_go_sem = semaphore::UNPACK_TO_DEST;  // unused by the bf16-DEST streaming kernel
+ALWI void hk_sfpu_go_post() { MATH((t6_semaphore_post<>(hk_sfpu_go_sem))); }
+ALWI void hk_sfpu_go_wait() {
+    PACK(({
+        while (semaphore_read(hk_sfpu_go_sem) == 0) {
+        }
+        semaphore_get(hk_sfpu_go_sem);
+    }));
+}
+#else
+ALWI void hk_sfpu_go_post() {}
+ALWI void hk_sfpu_go_wait() {}
+#endif
+
 ALWI void init_sdpa_streaming_semaphores() {
+#ifdef HK_SFPU_GO
+    MATH((t6_semaphore_init(hk_sfpu_go_sem, 0, 4)));
+#endif
     // reduce_trigger runs the QK row-max reduce as a split MOP gated by a PACK->UNPACK handshake on
     // two T6 tokens (firmware inits neither). FPU_SFPU, posted after pack + mask + push, gates run()#2
     // (and run()#1 on the non-overlap path). UNPACK_MATH_DONE (the first-half token) is borrowed (unused elsewhere
@@ -454,6 +518,46 @@ void blocked_matmul_and_pack(
         out_cb, row_subblock_idx * subblock_h, subblock_h, out_num_cols, out_col_offset, subblock_w);
     tile_regs_release();
 }
+
+#ifdef HK_PV_SUM
+// EXPERIMENT (hkato): one Q tile row of P.V plus its row sums (see hk_unpack_pv_sum). DEST 0..vDHt-1 -> out_cb row
+// out_row (blocked pack, configured by the caller), DEST vDHt -> sum_cb tile out_row. The L1-accumulate state of the
+// caller applies to both packs.
+template <uint32_t vDHt>
+#if defined(ARCH_WORMHOLE)
+__attribute__((noinline))
+#endif
+void hk_pv_sum_matmul_and_pack(
+    uint32_t in0_cb,
+    uint32_t in1_cb,
+    uint32_t out_cb,
+    uint32_t sum_cb,
+    uint32_t in0_index,
+    uint32_t in1_index,
+    uint32_t out_row,
+    uint32_t inner_dim) {
+    tile_regs_acquire();
+    for (uint32_t inner = 0; inner < inner_dim; ++inner) {
+#ifndef HK_SKIP_MM
+        UNPACK((hk_unpack_pv_sum<vDHt>(in0_cb, in1_cb, in0_index, in1_index)));
+        if constexpr (sdpa_matmul_fidelity_set) {
+            MATH((llk_math_matmul_no_mop<sdpa_matmul_fidelity, MM_THROTTLE>(in0_cb, in1_cb, 0, vDHt + 1, 1)));
+        } else {
+            MATH((llk_math_matmul_no_mop<MATH_FIDELITY, MM_THROTTLE>(in0_cb, in1_cb, 0, vDHt + 1, 1)));
+        }
+#endif
+        in0_index++;
+        in1_index += vDHt;
+    }
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_contiguous_rows_nocfg(out_cb, out_row, 1, vDHt, 0, vDHt);
+    configure_single_tile_pack(sum_cb);
+    sdpa_pack_tile_ooo(vDHt, sum_cb, out_row);
+    configure_row_pack_width(out_cb, vDHt);
+    tile_regs_release();
+}
+#endif
 
 /**
  * Matmul + pack of scores against in-place latent V (V read from K^T: V[sk][vd] == K^T[vd][sk]).
@@ -682,8 +786,10 @@ void sub_exp_block_bcast_cols(
         }
     }
     tile_regs_commit();
+    hk_sfpu_go_post();
 
     tile_regs_wait();
+    hk_sfpu_go_wait();
     PACK((llk_pack_relu_config(ReluConfig::zero())));
     {
         MaybeDeviceZoneScopedN(profiling_enabled, "EXP");
@@ -741,6 +847,10 @@ void sub_exp_block_bcast_cols(
         } else {
             pack_contiguous_rows(inout_cb, max_row_base, tiles_per_row, cols_in_row, global_col_base, tiles_per_column);
         }
+#ifdef HK_PV_SUM
+        if (true) {
+        } else  // EXPERIMENT (hkato): the row sums come from the P.V matmul
+#endif
 #ifdef HK_SUM_STRIDE0
         // EXPERIMENT (hkato): the P pack above left a tiles_per_column-wide blocked-pack MOP (the sum CB has the
         // same bf16 format). With the pack OUTPUT_ADDR_OFFSET GPR at 0 every tile of that MOP lands on the same L1
@@ -815,10 +925,12 @@ void sub_exp_first_col_blocks(uint32_t in0_cb, uint32_t in1_cb, uint32_t out_cb,
             sub_tiles(in0_cb, in1_cb, tile_index, tile_index, i);
         }
         tile_regs_commit();
+        hk_sfpu_go_post();
     }
 
     {
         tile_regs_wait();
+        hk_sfpu_go_wait();
         for (uint32_t dst_index = 0; dst_index < tiles_per_row; dst_index++) {
             PACK((exp_tile_first_column<EXP_APPROX_MODE, scale_bf16>(dst_index)));
         }
@@ -1940,23 +2052,36 @@ static void sdpa_inner_loop_step(
                             UNPACK((t6_semaphore_wait_on_zero<p_stall::STALL_SYNC>(semaphore::PACK_DONE)));
                             UNPACK((t6_semaphore_get<>(semaphore::PACK_DONE)));
                         }
-                        for (uint32_t v_subblock = 0; v_subblock < qktv_v_num_subblocks; ++v_subblock) {
-                            const uint32_t qktv_in1_index = kt_sub * matmul_inner * vDHt + v_index_offset;
-                            blocked_matmul_and_pack<false, vDHt, vDHt>(
-                                cb_qkt_im,
-                                cb_v_in,
-                                out_cb,
-                                qktv_in0_index_offset + kt_sub * matmul_inner,
-                                qktv_in1_index,
-                                0,
-                                v_subblock * qktv_subblock_w,
-                                qktv_subblock_w,
-                                qktv_h,
-                                matmul_inner,
-                                KT_stride,
-                                /*skip_pack_configure=*/true);
-                            v_index_offset += qktv_subblock_w;
-                        }
+#ifdef HK_PV_SUM
+                        static_assert(qktv_h == 1 && qktv_subblock_w == vDHt && vDHt + 1 <= dst_size);
+                        hk_pv_sum_matmul_and_pack<vDHt>(
+                            cb_qkt_im,
+                            cb_v_in,
+                            out_cb,
+                            cur.sum,
+                            qktv_in0_index_offset + kt_sub * matmul_inner,
+                            kt_sub * matmul_inner * vDHt,
+                            0,
+                            matmul_inner);
+                        if constexpr (false)
+#endif
+                            for (uint32_t v_subblock = 0; v_subblock < qktv_v_num_subblocks; ++v_subblock) {
+                                const uint32_t qktv_in1_index = kt_sub * matmul_inner * vDHt + v_index_offset;
+                                blocked_matmul_and_pack<false, vDHt, vDHt>(
+                                    cb_qkt_im,
+                                    cb_v_in,
+                                    out_cb,
+                                    qktv_in0_index_offset + kt_sub * matmul_inner,
+                                    qktv_in1_index,
+                                    0,
+                                    v_subblock * qktv_subblock_w,
+                                    qktv_subblock_w,
+                                    qktv_h,
+                                    matmul_inner,
+                                    KT_stride,
+                                    /*skip_pack_configure=*/true);
+                                v_index_offset += qktv_subblock_w;
+                            }
                         sdpa_maybe_reconfig_data_format<cb_v_in, cb_qkt_im, cb_qkt_im, cb_qkt_im>();
                     }
 
@@ -2122,28 +2247,33 @@ static void sdpa_inner_loop_step(
                 sdpa_pv_mm_setup(cb_qkt_im, cb_v_in, false, qktv_subblock_w, cur_h, KT_stride);
                 // Configure once before v_subblock loop; skip inside.
                 configure_row_pack_width(out_cb, qktv_subblock_w);
-                for (uint32_t v_subblock = 0; v_subblock < qktv_v_num_subblocks; ++v_subblock) {
-                    // Same in-place-vs-materialized V addressing as the q_subblock-0 drain above.
-                    // kt_inplace_v is constexpr-true only when Sq_chunk_t == 1, which yields a
-                    // single row-group — so this outer q_subblock loop is skipped entirely on that
-                    // path and kt_inplace_v is effectively false here. The ternary is kept symmetric
-                    // with the q_subblock-0 site so the addressing forms stay paired.
-                    const uint32_t qktv_in1_index = kt_inplace_v ? (v_subblock * KT_stride) : v_index_offset;
-                    blocked_matmul_and_pack<false, kt_inplace_v ? 1 : vDHt, vDHt>(
-                        cb_qkt_im,
-                        cb_v_in,
-                        out_cb,
-                        qktv_in0_index_offset,
-                        qktv_in1_index,
-                        w_q,
-                        v_subblock * qktv_subblock_w,
-                        qktv_subblock_w,
-                        cur_h,
-                        active_Sk,
-                        KT_stride,
-                        /*skip_pack_configure=*/true);
-                    v_index_offset += qktv_subblock_w;
-                }
+#ifdef HK_PV_SUM
+                hk_pv_sum_matmul_and_pack<vDHt>(
+                    cb_qkt_im, cb_v_in, out_cb, cur.sum, qktv_in0_index_offset, 0, w_q, active_Sk);
+                if constexpr (false)
+#endif
+                    for (uint32_t v_subblock = 0; v_subblock < qktv_v_num_subblocks; ++v_subblock) {
+                        // Same in-place-vs-materialized V addressing as the q_subblock-0 drain above.
+                        // kt_inplace_v is constexpr-true only when Sq_chunk_t == 1, which yields a
+                        // single row-group — so this outer q_subblock loop is skipped entirely on that
+                        // path and kt_inplace_v is effectively false here. The ternary is kept symmetric
+                        // with the q_subblock-0 site so the addressing forms stay paired.
+                        const uint32_t qktv_in1_index = kt_inplace_v ? (v_subblock * KT_stride) : v_index_offset;
+                        blocked_matmul_and_pack<false, kt_inplace_v ? 1 : vDHt, vDHt>(
+                            cb_qkt_im,
+                            cb_v_in,
+                            out_cb,
+                            qktv_in0_index_offset,
+                            qktv_in1_index,
+                            w_q,
+                            v_subblock * qktv_subblock_w,
+                            qktv_subblock_w,
+                            cur_h,
+                            active_Sk,
+                            KT_stride,
+                            /*skip_pack_configure=*/true);
+                        v_index_offset += qktv_subblock_w;
+                    }
                 sdpa_maybe_reconfig_data_format<cb_v_in, cb_qkt_im, cb_qkt_im, cb_qkt_im>();
             }
 
@@ -2719,6 +2849,9 @@ void sdpa_ring_v2(
     // Rows of newest slabs this pass appends (packed_kv_pass_rows).
     const uint32_t packed_newest_rows = 0) {
     init_sdpa_streaming_semaphores();
+#ifdef HK_PV_SUM
+    CircularBuffer(HK_ONES_CB).wait_front(1);  // EXPERIMENT (hkato): ones-column tile from the writer (never popped)
+#endif
     const bool packed_sources = packed_kv_enabled && packed_source_count > 1;
     const ring_joint::PackedKVGroupPlan packed_kv = ring_joint::packed_kv_pass_plan(
         {ring_joint::packed_kv_source_tiles(local_padded_Nt, logical_nt, kv_region_Nt, ring_size),

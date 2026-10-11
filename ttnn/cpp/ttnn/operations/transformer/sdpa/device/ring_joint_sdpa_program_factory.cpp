@@ -1352,6 +1352,17 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     // phase-2 matmul consumes one V column tile per issue (out_subblock_w=1). The kernels derive the
     // same predicate from their compile-time args via the shared kt_inplace_v_enabled() helper.
     const bool kt_inplace_v = kt_inplace_v_enabled(v_shares_k_buffer, Sq_chunk_t);
+    // EXPERIMENT (hkato): TT_RING_SDPA_PV_SUM=1 -> softmax row sums from the P.V matmul with a ones column as a
+    // fifth V tile (one pack per row instead of one L1-accumulating pack per P tile). Needs the streaming kernel,
+    // a materialized V in bf8 / bf16 and a DEST that holds vDHt + 1 tiles; P.V then runs one Q tile row at a time.
+    const bool hk_pv_sum =
+        [] {
+            const char* e = std::getenv("TT_RING_SDPA_PV_SUM");
+            return e != nullptr && e[0] == '1';
+        }() &&
+        !fp32_dest_acc_en && !kt_inplace_v && !v_shares_k_buffer &&
+        (gathered_input_tensor_v.dtype() == DataType::BFLOAT8_B ||
+         gathered_input_tensor_v.dtype() == DataType::BFLOAT16);
 
     // These tile capacity counts for CBs need to match the number of tiles expected by the kernel (softmax.cpp)
     uint32_t q_tiles = Sq_chunk_t * DHt * q_buffer_factor;
@@ -1471,14 +1482,23 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         dst_size,
         /*max_subblock_h=*/use_streaming_compute ? 2 : UINT32_MAX,
         /*max_subblock_w=*/kt_inplace_v ? 1u : UINT32_MAX);
+    if (hk_pv_sum) {
+        TT_FATAL(
+            out_out_subblock_w == vDHt && vDHt + 1 <= dst_size,
+            "TT_RING_SDPA_PV_SUM needs the whole head dim ({}) plus one tile in DEST ({})",
+            vDHt,
+            dst_size);
+        out_out_subblock_h = 1;
+    }
     // Streaming compute may widen the QKT@V row group beyond the host matmul subblock
     // height for odd Q chunks. The writer must drain cb_out with the same row-group
     // cadence that compute pushes, otherwise deferred-save rows can be popped and
     // reused before the matching grouped write has safely landed.
     const uint32_t writer_out_row_group_h =
-        use_streaming_compute
-            ? ttnn::transformer::sdpa::streaming_qktv_h(out_out_subblock_h, out_out_subblock_w, dst_size, Sq_chunk_t)
-            : out_out_subblock_h;
+        use_streaming_compute ? (hk_pv_sum ? 1u
+                                           : ttnn::transformer::sdpa::streaming_qktv_h(
+                                                 out_out_subblock_h, out_out_subblock_w, dst_size, Sq_chunk_t))
+                              : out_out_subblock_h;
     // The K-split merge walks whole row groups (static_assert in ring_joint_sdpa.cpp); odd Q chunks stay unsplit.
     if (Sq_chunk_t % writer_out_row_group_h != 0) {
         ksplit_count = 1;
@@ -1931,6 +1951,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     if (const char* hk_e = std::getenv("TT_RING_SDPA_EXP_BATCH"); hk_e != nullptr && hk_e[0] == '1') {
         defines["HK_EXP_BATCH"] = "1";  // EXPERIMENT (hkato)
     }
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_SFPU_GO"); hk_e != nullptr && hk_e[0] == '1') {
+        defines["HK_SFPU_GO"] = "1";  // EXPERIMENT (hkato): pack TRISC waits in software before pack-thread SFPU
+    }
     if (const char* hk_e = std::getenv("TT_RING_SDPA_EXP_OVF"); hk_e != nullptr && hk_e[0] == '1') {
         defines["HK_EXP_OVF"] = "1";  // EXPERIMENT (hkato, optional, default off): one-LOADMACRO-per-row exp
     }
@@ -2081,6 +2104,8 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     if (hk_final_bf8) {
         hk_final_cb = allocate_tile_cb(out0_t, tt::tile_size(tt::DataFormat::Bfp8_b), tt::DataFormat::Bfp8_b);
     }
+    // EXPERIMENT (hkato): TT_RING_SDPA_PV_SUM ones-column tile in V's format
+    const uint32_t hk_ones_cb = hk_pv_sum ? allocate_tile_cb(1, v_tile_size, v_df) : 0;
 
     // These CBs carry accumulator state between passes: DRAM save/restore across ring iterations, or the K-split
     // reducer's partial results from the other bands. Unsplit sliding attention folds every K/V range into one pass per
@@ -3175,6 +3200,11 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     KernelDescriptor::Defines kernel_defines(defines.begin(), defines.end());
     if (hk_final_bf8) {
         kernel_defines.emplace_back("HK_FINAL_CB", std::to_string(hk_final_cb));  // EXPERIMENT (hkato)
+    }
+    if (hk_pv_sum) {  // EXPERIMENT (hkato)
+        kernel_defines.emplace_back("HK_PV_SUM", "1");
+        kernel_defines.emplace_back("HK_ONES_CB", std::to_string(hk_ones_cb));
+        kernel_defines.emplace_back("HK_ONES_BF8", v_df == tt::DataFormat::Bfp8_b ? "1" : "0");
     }
 
     // Build kernel descriptors locally so we can append per-core runtime args

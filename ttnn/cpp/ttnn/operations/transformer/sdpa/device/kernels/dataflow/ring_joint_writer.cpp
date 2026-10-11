@@ -789,6 +789,33 @@ void kernel_main() {
 
     generate_bcast_unary_scalar(CircularBuffer(cb_scale_in), scale_val);
     generate_bcast_col_scalar(CircularBuffer(cb_col_identity), identity_scalar_packed);
+#ifdef HK_PV_SUM
+    // EXPERIMENT (hkato): ones-column tile (1.0 in column 0, zeros elsewhere) in V's format. The compute multiplies
+    // each P tile with it as a fifth V column, so column 0 of that output tile is the softmax row sum.
+    {
+        CircularBuffer hk_ones(HK_ONES_CB);
+        hk_ones.reserve_back(1);
+        constexpr uint32_t hk_bytes = get_tile_size(HK_ONES_CB);
+        volatile tt_l1_ptr uint32_t* hk_w = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(hk_ones.get_write_ptr());
+        for (uint32_t i = 0; i < hk_bytes / 4; i++) {
+            hk_w[i] = 0;
+        }
+        volatile tt_l1_ptr uint8_t* hk_b = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(hk_ones.get_write_ptr());
+        // Column 0 lies in faces 0 and 2 (16 rows each).
+        for (uint32_t face = 0; face < 4; face += 2) {
+            for (uint32_t r = 0; r < 16; r++) {
+#if HK_ONES_BF8
+                hk_b[face * 16 + r] = 127;              // bfp8_b: shared exponent of the face row
+                hk_b[64 + face * 256 + r * 16] = 0x40;  // sign 0, mantissa 1.000000
+#else
+                hk_b[2 * (face * 256 + r * 16)] = 0x80;  // bf16 1.0 = 0x3F80 (little endian)
+                hk_b[2 * (face * 256 + r * 16) + 1] = 0x3F;
+#endif
+            }
+        }
+        hk_ones.push_back(1);
+    }
+#endif
     dataflow_kernel_lib::calculate_and_prepare_reduce_scaler<
         cb_identity_scale_in,
         ckernel::PoolType::MAX,

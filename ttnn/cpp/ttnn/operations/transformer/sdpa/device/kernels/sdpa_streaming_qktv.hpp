@@ -15,7 +15,12 @@ namespace ttnn::transformer::sdpa {
 constexpr uint32_t streaming_qktv_h(uint32_t subblock_h, uint32_t subblock_w, uint32_t dst_size, uint32_t Sq_chunk_t) {
     // Host subblock solver requires Sq_chunk_t % h == 0, so it falls back to h=1 for odd
     // Sq_chunk_t. The kernel can use h=2 when dest fits 2*w and handle the leftover explicitly.
+#ifdef HK_PV_SUM
+    // EXPERIMENT (hkato): the P.V row-sum column takes subblock_w + 1 DEST tiles per row, so no widening.
+    return subblock_h;
+#else
     return (subblock_h == 1 && 2 * subblock_w <= dst_size && Sq_chunk_t >= 2) ? 2u : subblock_h;
+#endif
 }
 
 }  // namespace ttnn::transformer::sdpa

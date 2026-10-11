@@ -18,7 +18,12 @@ inline void _llk_math_eltwise_sfpu_start_(const std::uint32_t dst_index)
 {
     math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(dst_index);
     math::set_addr_mod_base();
+#if defined(TRISC_PACK) && defined(HK_SFPU_GO)
+    // EXPERIMENT (hkato): SDPA pack-thread SFPU. The pack TRISC itself waited for math's commit of this DEST half
+    // (hk_sfpu_go_wait in the SDPA streaming kernel), so the SFPU instructions are issued only once they can run.
+#else
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
+#endif
 }
 
 inline void _llk_math_eltwise_sfpu_done_()

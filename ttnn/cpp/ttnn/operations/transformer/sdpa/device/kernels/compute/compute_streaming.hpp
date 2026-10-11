@@ -2211,42 +2211,108 @@ static void sdpa_inner_loop_step(
         // remainder row(s) with a smaller V matmul height.
         constexpr uint32_t total_v_row_groups = qktv_q_num_subblocks + (has_qktv_remainder ? 1 : 0);
         exp_packthread_tile_init<EXP_APPROX_MODE>();
-        for (uint32_t q_subblock = 1; q_subblock < total_v_row_groups; ++q_subblock) {
-            MaybeDeviceZoneScopedN(profiling_enabled, "Softmax(Q@KT)@V");
-            const bool is_remainder_iter = has_qktv_remainder && (q_subblock == qktv_q_num_subblocks);
-            const uint32_t cur_h = is_remainder_iter ? qktv_remainder_h : qktv_h;
-            uint32_t salad_row = q_subblock - 1;
-            uint32_t w_salad = salad_row - pushed_rows;
-            // For remainder: convert group index to tile-row index so pack addressing is correct
-            // when cur_h < qktv_h (the matmul uses cur_h as subblock_h, so row_subblock_idx * cur_h
-            // must equal the actual tile-row offset).
-            uint32_t w_q =
-                is_remainder_iter ? (qktv_q_num_subblocks - pushed_rows) * qktv_h : (q_subblock - pushed_rows);
-
-            // SALAD for previous group (always a full group, h=qktv_h)
+#ifdef HK_CORR_ALL
+        // EXPERIMENT (hkato): the SALAD correction factors exp(prev max - cur max) of all Q tile rows in one call
+        // (every row max is known after Phase 1) instead of one call per P.V row group (4 with one Q tile row per
+        // group): one sub / exp / pack setup instead of four. SALAD reads the factors from the front row by row.
+        constexpr bool hk_corr_all = total_v_row_groups > 1 && !has_qktv_remainder;
+        if constexpr (hk_corr_all) {
             if (!is_first_iter) {
-                CircularBuffer(cb_exp_max_diff).reserve_back(qktv_h);
+                CircularBuffer(cb_exp_max_diff).reserve_back(Sq_chunk_t);
                 sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
-                    prev.max, cur.max, cb_exp_max_diff, salad_row, qktv_h);
-                CircularBuffer(cb_exp_max_diff).push_back(qktv_h);
+                    prev.max, cur.max, cb_exp_max_diff, 0, Sq_chunk_t);
+                CircularBuffer(cb_exp_max_diff).push_back(Sq_chunk_t);
             }
-
-            // V matmul for current row group — cur_h adapts for remainder
-            if (is_remainder_iter) {
-                CircularBuffer(cb_qkt_im).wait_front(Sq_chunk_t * KT_stride);
-            } else {
+        }
+#else
+        constexpr bool hk_corr_all = false;
+#endif
+#if defined(HK_SALAD_LATE) && defined(HK_PV_SUM)
+        constexpr bool hk_salad_late = hk_corr_all && qktv_h == 1;
+#else
+        constexpr bool hk_salad_late = false;
+#endif
+        if constexpr (hk_salad_late) {
+#if defined(HK_SALAD_LATE) && defined(HK_PV_SUM)
+            // EXPERIMENT (hkato): P.V of rows 1..N-1 back to back with one setup / one pair of unpack format
+            // switches (no SALAD in between to reconfigure the unpacker), then SALAD and the push / normalize of
+            // every row. Nothing is pushed before the SALADs, so P.V packs at absolute rows and SALAD at the front.
+            sdpa_maybe_reconfig_data_format<cb_normalized_out, cb_v_in, cb_normalized_out, cb_qkt_im>(out_cb, out_cb);
+            sdpa_pv_mm_setup(cb_qkt_im, cb_v_in, false, qktv_subblock_w, qktv_h, KT_stride);
+            configure_row_pack_width(out_cb, qktv_subblock_w);
+            for (uint32_t q_subblock = 1; q_subblock < total_v_row_groups; ++q_subblock) {
                 CircularBuffer(cb_qkt_im).wait_front(qktv_in0_wait_tiles);
+                hk_pv_sum_matmul_and_pack<vDHt>(
+                    cb_qkt_im, cb_v_in, out_cb, cur.sum, qktv_in0_index_offset, 0, q_subblock, active_Sk);
+                qktv_in0_index_offset += qktv_h * KT_stride;
+                qktv_in0_wait_tiles += qktv_h * KT_stride;
             }
-            {
-                MaybeDeviceZoneScopedN(profiling_enabled, "QKT@V MM+Pack");
-                uint32_t v_index_offset = 0;
-                sdpa_maybe_reconfig_data_format<cb_normalized_out, cb_v_in, cb_normalized_out, cb_qkt_im>(
-                    out_cb, out_cb);
-                // See the q_subblock-0 V matmul above: active_Sk can be narrower than the physical
-                // cb_qkt_im row stride, but the unpacker is configured for the physical layout.
-                sdpa_pv_mm_setup(cb_qkt_im, cb_v_in, false, qktv_subblock_w, cur_h, KT_stride);
-                // Configure once before v_subblock loop; skip inside.
-                configure_row_pack_width(out_cb, qktv_subblock_w);
+            sdpa_maybe_reconfig_data_format<cb_v_in, cb_qkt_im, cb_qkt_im, cb_qkt_im>();
+#ifdef HK_SALAD_MERGE
+            // EXPERIMENT (hkato): the SALAD corrections of all rows in one call (one init, 3 DEST batches instead of 4
+            // calls); the pushes / normalizes follow row by row as before.
+            if (!is_first_iter) {
+                PACK((llk_pack_reconfig_l1_acc(1)));
+                salad_correct_fused<Sq_chunk_t, vDHt, dst_size>(
+                    prev.out, prev.sum, cb_exp_max_diff, out_cb, cur.sum, 0, 0, 0);
+                CircularBuffer(cb_exp_max_diff).pop_front(Sq_chunk_t);
+                CircularBuffer(prev.out).pop_front(Sq_chunk_t * vDHt);
+                PACK((llk_pack_reconfig_l1_acc(0)));
+            }
+            constexpr bool hk_salad_merged = true;
+#else
+            constexpr bool hk_salad_merged = false;
+#endif
+            for (uint32_t r = 0; r < total_v_row_groups; ++r) {
+                if (!is_first_iter && !hk_salad_merged) {
+                    salad_correct_row(r, r - pushed_rows, qktv_h);
+                }
+                if (is_last_iter) {
+                    normalize_row(pushed_rows, qktv_h);
+                } else {
+                    CircularBuffer(cur.sum).push_back(qktv_h);
+                    CircularBuffer(out_cb).push_back(qktv_h * vDHt);
+                    pushed_rows++;
+                }
+            }
+#endif
+        } else {
+            for (uint32_t q_subblock = 1; q_subblock < total_v_row_groups; ++q_subblock) {
+                MaybeDeviceZoneScopedN(profiling_enabled, "Softmax(Q@KT)@V");
+                const bool is_remainder_iter = has_qktv_remainder && (q_subblock == qktv_q_num_subblocks);
+                const uint32_t cur_h = is_remainder_iter ? qktv_remainder_h : qktv_h;
+                uint32_t salad_row = q_subblock - 1;
+                uint32_t w_salad = salad_row - pushed_rows;
+                // For remainder: convert group index to tile-row index so pack addressing is correct
+                // when cur_h < qktv_h (the matmul uses cur_h as subblock_h, so row_subblock_idx * cur_h
+                // must equal the actual tile-row offset).
+                uint32_t w_q =
+                    is_remainder_iter ? (qktv_q_num_subblocks - pushed_rows) * qktv_h : (q_subblock - pushed_rows);
+
+                // SALAD for previous group (always a full group, h=qktv_h)
+                if (!is_first_iter && !hk_corr_all) {
+                    CircularBuffer(cb_exp_max_diff).reserve_back(qktv_h);
+                    sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
+                        prev.max, cur.max, cb_exp_max_diff, salad_row, qktv_h);
+                    CircularBuffer(cb_exp_max_diff).push_back(qktv_h);
+                }
+
+                // V matmul for current row group — cur_h adapts for remainder
+                if (is_remainder_iter) {
+                    CircularBuffer(cb_qkt_im).wait_front(Sq_chunk_t * KT_stride);
+                } else {
+                    CircularBuffer(cb_qkt_im).wait_front(qktv_in0_wait_tiles);
+                }
+                {
+                    MaybeDeviceZoneScopedN(profiling_enabled, "QKT@V MM+Pack");
+                    uint32_t v_index_offset = 0;
+                    sdpa_maybe_reconfig_data_format<cb_normalized_out, cb_v_in, cb_normalized_out, cb_qkt_im>(
+                        out_cb, out_cb);
+                    // See the q_subblock-0 V matmul above: active_Sk can be narrower than the physical
+                    // cb_qkt_im row stride, but the unpacker is configured for the physical layout.
+                    sdpa_pv_mm_setup(cb_qkt_im, cb_v_in, false, qktv_subblock_w, cur_h, KT_stride);
+                    // Configure once before v_subblock loop; skip inside.
+                    configure_row_pack_width(out_cb, qktv_subblock_w);
 #ifdef HK_PV_SUM
                 hk_pv_sum_matmul_and_pack<vDHt>(
                     cb_qkt_im, cb_v_in, out_cb, cur.sum, qktv_in0_index_offset, 0, w_q, active_Sk);
@@ -2275,7 +2341,7 @@ static void sdpa_inner_loop_step(
                         v_index_offset += qktv_subblock_w;
                     }
                 sdpa_maybe_reconfig_data_format<cb_v_in, cb_qkt_im, cb_qkt_im, cb_qkt_im>();
-            }
+                }
 
             // SALAD corrections for previous group (always full, h=qktv_h) + row-by-row push
             if (!is_first_iter) {
@@ -2286,10 +2352,12 @@ static void sdpa_inner_loop_step(
                     const uint32_t drain_salad_row =
                         has_qktv_remainder ? (qktv_q_num_subblocks * qktv_h) : (qktv_q_num_subblocks - 1);
 
-                    CircularBuffer(cb_exp_max_diff).reserve_back(drain_h);
-                    sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
-                        prev.max, cur.max, cb_exp_max_diff, drain_salad_row, drain_h);
-                    CircularBuffer(cb_exp_max_diff).push_back(drain_h);
+                    if constexpr (!hk_corr_all) {
+                        CircularBuffer(cb_exp_max_diff).reserve_back(drain_h);
+                        sub_exp_first_col_blocks<profiling_enabled, scale_fp32>(
+                            prev.max, cur.max, cb_exp_max_diff, drain_salad_row, drain_h);
+                        CircularBuffer(cb_exp_max_diff).push_back(drain_h);
+                    }
 
                     salad_correct_row(salad_row, w_salad, qktv_h);
                     if (is_last_iter) {
@@ -2330,7 +2398,7 @@ static void sdpa_inner_loop_step(
 
             qktv_in0_index_offset += cur_h * KT_stride;
             qktv_in0_wait_tiles += cur_h * KT_stride;
-        }
+            }
 
         // Pipeline drain: SALAD for the last group
         {
@@ -2367,6 +2435,7 @@ static void sdpa_inner_loop_step(
                 }
             }
         }
+        }  // HK_SALAD_LATE else
 
         // All rows pushed individually — no bulk push needed.
 

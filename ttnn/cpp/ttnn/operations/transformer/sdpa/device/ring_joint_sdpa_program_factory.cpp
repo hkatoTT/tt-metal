@@ -1951,6 +1951,15 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     if (const char* hk_e = std::getenv("TT_RING_SDPA_EXP_BATCH"); hk_e != nullptr && hk_e[0] == '1') {
         defines["HK_EXP_BATCH"] = "1";  // EXPERIMENT (hkato)
     }
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_SALAD_MERGE"); hk_e != nullptr && hk_e[0] == '1') {
+        defines["HK_SALAD_MERGE"] = "1";  // EXPERIMENT (hkato)
+    }
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_SALAD_LATE"); hk_e != nullptr && hk_e[0] == '1') {
+        defines["HK_SALAD_LATE"] = "1";  // EXPERIMENT (hkato)
+    }
+    if (const char* hk_e = std::getenv("TT_RING_SDPA_CORR_ALL"); hk_e != nullptr && hk_e[0] == '1') {
+        defines["HK_CORR_ALL"] = "1";  // EXPERIMENT (hkato)
+    }
     if (const char* hk_e = std::getenv("TT_RING_SDPA_SFPU_GO"); hk_e != nullptr && hk_e[0] == '1') {
         defines["HK_SFPU_GO"] = "1";  // EXPERIMENT (hkato): pack TRISC waits in software before pack-thread SFPU
     }

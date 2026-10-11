@@ -40,7 +40,12 @@ ttnn::Tensor scaled_dot_product_attention(
     /// tensor, read at runtime rather than baked into the program. Shard it on the sequence-parallel axis
     /// so every device runs the SAME program yet sees its own origin. Overrides the scalar when set.
     const std::optional<ttnn::Tensor>& windowed_q_token_offset_tensor = std::nullopt,
-    bool output_concat_heads = false);
+    bool output_concat_heads = false,
+    /// EXPERIMENT (hkato): the softmax denominator weighs key column c (position mod 32) by `sum_col_weight` for
+    /// c >= `sum_col_weight_start` (32 = off). Used with V rows pre-scaled by the same weight, so a key in such a
+    /// column counts as `sum_col_weight` identical keys (exact for a dyadic weight).
+    uint32_t sum_col_weight_start = 32,
+    float sum_col_weight = 1.0f);
 
 /// Chunked SDPA over paged K/V: one Q chunk per call, K/V in paged layout.
 /// Two overloads: legacy (chunk_start_idx as int) or flexible (chunk_start_idx_tensor on device).

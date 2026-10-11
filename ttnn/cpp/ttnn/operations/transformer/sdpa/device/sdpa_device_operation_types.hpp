@@ -34,6 +34,8 @@ struct SDPAParams {
     // ttnn::operations::transformer::PagedCacheGeometryOverride.
     ttnn::operations::transformer::PagedCacheGeometryOverride paged_cache_geometry;
     bool output_concat_heads = false;
+    uint32_t sum_col_weight_start = 32;  // EXPERIMENT (hkato): see scaled_dot_product_attention
+    float sum_col_weight = 1.0f;
 };
 
 struct SDPAInputs {

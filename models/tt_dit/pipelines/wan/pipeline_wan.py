@@ -488,7 +488,8 @@ class WanPipeline(PipelineAPIMixin):
             )
 
     def prepare_text_conditioning(self, tt_model, prompt_embeds, buffer, traced=False):
-        prompt_1BLP = tt_model.prepare_text_conditioning(prompt_embeds)
+        hk_lens = getattr(self._text_encoder, "hk_token_lens", None)  # EXPERIMENT (hkato): for WAN_XATTN_COMPACT
+        prompt_1BLP = tt_model.prepare_text_conditioning(prompt_embeds, hk_max_len=max(hk_lens) if hk_lens else None)
         if buffer is None or not traced:
             buffer = prompt_1BLP
         else:

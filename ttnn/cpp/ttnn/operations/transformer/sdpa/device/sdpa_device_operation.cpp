@@ -32,6 +32,13 @@ void SDPAOperation::validate_on_program_cache_miss(const SDPAParams& attrs, cons
                 !tensors.chunk_start_idx_tensor.has_value(),
             "output_concat_heads is supported for the plain (non-chunked, non-paged) SDPA only");
     }
+    if (attrs.sum_col_weight_start < 32) {  // EXPERIMENT (hkato)
+        TT_FATAL(
+            !tensors.page_table.has_value() && !attrs.chunk_start_idx.has_value() &&
+                !tensors.chunk_start_idx_tensor.has_value() && !tensors.attn_mask.has_value() && !attrs.is_causal &&
+                !tensors.attention_sink.has_value() && !attrs.is_windowed,
+            "sum_col_weight is supported for the plain non-causal SDPA without mask / sink only");
+    }
 
     const Tensor& q = tensors.q;
     const Tensor& k = tensors.k;
@@ -660,7 +667,9 @@ Tensor sdpa(
     uint32_t windowed_q_token_offset,
     const std::optional<Tensor>& windowed_q_token_offset_tensor,
     std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
-    bool output_concat_heads) {
+    bool output_concat_heads,
+    uint32_t sum_col_weight_start,
+    float sum_col_weight) {
     using OperationType = ttnn::prim::SDPAOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
@@ -681,6 +690,8 @@ Tensor sdpa(
             .paged_cache_geometry =
                 paged_cache_geometry.value_or(ttnn::operations::transformer::PagedCacheGeometryOverride{}),
             .output_concat_heads = output_concat_heads,
+            .sum_col_weight_start = sum_col_weight_start,
+            .sum_col_weight = sum_col_weight,
         },
         OperationType::tensor_args_t{
             .q = input_tensor_q,

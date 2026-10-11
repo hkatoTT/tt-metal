@@ -21,6 +21,26 @@ from ....utils.substate import pop_substate, rename_substate
 from ....utils.tensor import bf16_tensor
 
 
+def hk_xattn_compact_layout(max_len: int, seq_len: int = 512):
+    """EXPERIMENT (hkato): key layout for the exact text compaction of the cross-attention, or None.
+
+    The text encoder zero-pads every prompt to 512 tokens and the model attends to all of them (no mask), so all
+    padding positions have the same K and V: n identical keys act like one key whose softmax weight is n times
+    larger. The compacted prompt has 8 key tiles (256 slots); in every tile the first r columns hold real tokens
+    (or padding) with weight 1 and the other k = 32 - r columns hold padding with weight w. The SDPA row-sum
+    reduce weighs columns >= r by w (`sum_col_weight`) and those V rows are pre-scaled by w. The weights must
+    add up to the original 512 keys: 8 * (r + k * w) = 512, so w = 1 + 32 / k, a small dyadic number (exact in
+    bf16 / bf8 and in a LoFi multiply) for k in {16, 8, 4, 2, 1}. Returns (r, w) for the smallest w that still
+    has room for `max_len` real tokens (8 * r >= max_len).
+    """
+    if seq_len != 512:
+        return None
+    for k in (16, 8, 4, 2, 1):
+        if 8 * (32 - k) >= max_len:
+            return (32 - k, 1.0 + 32.0 / k)
+    return None
+
+
 class WanAttention(Module):
     # Map from (is_blackhole, sp_factor, tp_factor) -> (q_chunk_size, k_chunk_size)
     sdpa_chunk_size_map = {
@@ -133,6 +153,19 @@ class WanAttention(Module):
             exp_approx_mode=os.environ.get("WAN_XSDPA_EXP_APPROX") == "1",  # NOTE: False is more correct
         )
 
+        # EXPERIMENT (hkato): exact text compaction for the cross-attention (see hk_xattn_compact_layout); the
+        # transformer sets the layout from the prompt lengths (WAN_XATTN_COMPACT=1), WAN_XATTN_COMPACT_LMAX=<n>
+        # forces it for block tests. One K chunk covers the 256 compacted keys.
+        hk_lmax = os.environ.get("WAN_XATTN_COMPACT_LMAX")
+        self._hk_xcompact = hk_xattn_compact_layout(int(hk_lmax)) if hk_lmax else None
+        self._hk_xc_program_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=full_grid,
+            q_chunk_size=int(os.environ.get("WAN_XSDPA_CHUNK_XC", f"{hk_xq},256").split(",")[0]),
+            k_chunk_size=int(os.environ.get("WAN_XSDPA_CHUNK_XC", f"{hk_xq},256").split(",")[1]),
+            exp_approx_mode=os.environ.get("WAN_XSDPA_EXP_APPROX") == "1",
+        )
+        self._hk_xc_consts = {}
+
         self.sdpa_worker_grid = (full_grid.x - 1, full_grid.y)  # Reserve last column for CCL
         # The CFG head fold (see forward) runs one 2H-head ring SDPA. On WH 4x8 480p its 2 x 10 x 16 = 320 Q chunks
         # split evenly over 8x8 workers (5 per core) with the ring all-gather workers on the last row, while 7x9
@@ -226,6 +259,25 @@ class WanAttention(Module):
                     }
                 }
             )
+
+    def _hk_xc_tensors(self, r: float, w: float, head_dim: int):
+        """EXPERIMENT (hkato): selection matrix [1, 1, 256, 512] (slot 32 t + c <- token r t + c for c < r, else the
+        last token, which is padding) and the V row scale [1, 1, 256, head_dim] (w for columns >= r) for the text
+        compaction."""
+        key = (r, w, head_dim)
+        if key not in self._hk_xc_consts:
+            sel = torch.zeros(1, 1, 256, 512)
+            vs = torch.ones(1, 1, 256, head_dim)
+            for p in range(256):
+                t, c = divmod(p, 32)
+                sel[0, 0, p, r * t + c if c < r else 511] = 1.0
+                if c >= r:
+                    vs[0, 0, p, :] = w
+            self._hk_xc_consts[key] = (
+                bf16_tensor(sel, device=self.mesh_device),
+                bf16_tensor(vs, device=self.mesh_device),
+            )
+        return self._hk_xc_consts[key]
 
     def clear_cross_kv_cache(self) -> None:
         self._cross_kv_cache.clear()
@@ -521,14 +573,34 @@ class WanAttention(Module):
             if prompt_pair is not None:
                 # K/V per prompt, stacked on the batch dim; cached under the pair of prompt tensors
                 if self._cross_kv_cache_enabled:
-                    cross_kv_key = ("pairfold" if x_fold else "pair", id(prompt_pair[0]), id(prompt_pair[1]))
+                    cross_kv_key = (
+                        "pairfold" if x_fold else "pair",
+                        id(prompt_pair[0]),
+                        id(prompt_pair[1]),
+                        self._hk_xcompact,
+                    )
                 cached_kv = self._cross_kv_cache.get(cross_kv_key) if cross_kv_key is not None else None
                 if cached_kv is None:
                     ks, vs = [], []
+                    hk_xc = self._hk_xcompact
+                    if hk_xc is not None:
+                        assert prompt_pair[0].shape[2] == 512, "text compaction expects 512-token prompts"
+                        hk_sel, hk_vscale = self._hk_xc_tensors(hk_xc[0], hk_xc[1], self.head_dim)
+                        hk_exact = ttnn.init_device_compute_kernel_config(
+                            self.mesh_device.arch(),
+                            math_fidelity=ttnn.MathFidelity.HiFi4,
+                            math_approx_mode=False,
+                            fp32_dest_acc_en=True,
+                        )
                     for prompt in prompt_pair:
+                        if hk_xc is not None:  # EXPERIMENT (hkato): 512 -> 256 tokens, a pure row selection
+                            prompt = ttnn.matmul(hk_sel, prompt, compute_kernel_config=hk_exact, dtype=prompt.dtype)
                         k_p, v_p = self.to_kv(prompt, compute_kernel_config=self.mm_compute_kernel_config)
                         ks.append(self.norm_k(k_p, num_heads_per_device=self.n_local_heads))
-                        vs.append(create_heads(v_p))
+                        v_h = create_heads(v_p)
+                        if hk_xc is not None:
+                            v_h = ttnn.multiply(v_h, hk_vscale)
+                        vs.append(v_h)
                     if x_fold:
                         # [1, H, L, E] x2 -> [1, H, 2L, E] -> [1, 2H, L, E]: head 2h+b holds prompt b of head h
                         def _fold(ts):
@@ -721,15 +793,20 @@ class WanAttention(Module):
         else:
             # Cross attention
             hk_pairfold = head_fold and os.environ.get("TT_SDPA_OUT_PAIRFOLD") == "1"  # EXPERIMENT (hkato)
+            hk_xc_kw = {}
+            if self._hk_xcompact is not None and k_BHNE.shape[2] == 256:  # EXPERIMENT (hkato): compacted text
+                hk_w = 1.0 if os.environ.get("HK_XC_SABOTAGE") == "1" else self._hk_xcompact[1]
+                hk_xc_kw = {"sum_col_weight_start": self._hk_xcompact[0], "sum_col_weight": hk_w}
             spatial_BHNE = ttnn.transformer.scaled_dot_product_attention(
                 q_BHNE,
                 k_BHNE,
                 v_BHNE,
                 is_causal=False,
                 attn_mask=cross_attn_mask,
-                program_config=self.sdpa_program_config,
+                program_config=self._hk_xc_program_config if hk_xc_kw else self.sdpa_program_config,
                 compute_kernel_config=self.sdpa_compute_kernel_config,
                 **({"output_concat_heads": True} if hk_pairfold else {}),
+                **hk_xc_kw,
             )
             if hk_pairfold:
                 hk_out_concat = "x"

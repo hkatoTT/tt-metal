@@ -1426,6 +1426,13 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
         e != nullptr && std::string(e) == "1" && operation_attributes.output_concat_heads) {
         writer_desc.defines.emplace_back("HK_OUT_PAIRFOLD", "1");  // EXPERIMENT (hkato)
     }
+    if (operation_attributes.sum_col_weight_start < 32) {  // EXPERIMENT (hkato): weighted row-sum columns
+        class bfloat16 hk_w(operation_attributes.sum_col_weight);
+        writer_desc.defines.emplace_back(
+            "HK_SUM_COLW_START", std::to_string(operation_attributes.sum_col_weight_start));
+        writer_desc.defines.emplace_back(
+            "HK_SUM_COLW_BITS", std::to_string(pack_two_bfloat16_into_uint32({hk_w, hk_w}) >> 16));
+    }
     writer_desc.config = WriterConfigDescriptor{};
 
     KernelDescriptor compute_desc;

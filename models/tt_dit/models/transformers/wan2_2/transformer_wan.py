@@ -41,7 +41,7 @@ from ....utils.padding import pad_vision_seq_parallel
 from ....utils.substate import pop_substate, rename_substate
 from ....utils.tensor import bf16_tensor, from_torch, unflatten
 from ....utils.tracing import traced_function
-from .attention_wan import WanAttention
+from .attention_wan import WanAttention, hk_xattn_compact_layout
 
 
 class WanTransformerBlock(Module):
@@ -553,10 +553,16 @@ class WanTransformer3DModel(Module):
         for block in self.blocks:
             block.attn2.set_cross_kv_cache_enabled(enabled)
 
-    def prepare_text_conditioning(self, encoder_hidden_states):
+    def prepare_text_conditioning(self, encoder_hidden_states, hk_max_len=None):
         # new text conditioning: drop cross-attention K/V cached for previous prompt tensors
+        hk_set = os.environ.get("WAN_XATTN_COMPACT") == "1" and hk_max_len is not None  # EXPERIMENT (hkato)
+        hk_layout = hk_xattn_compact_layout(hk_max_len) if hk_set else None
         for block in self.blocks:
             block.attn2.clear_cross_kv_cache()
+            if hk_set:
+                block.attn2._hk_xcompact = hk_layout
+        if hk_set:
+            logger.info(f"cross-attention text compaction for {hk_max_len} tokens: {hk_layout}")
         tt_prompt_1BLP = self.condition_embedder.forward_text(encoder_hidden_states)
 
         logger.info(f"TT prompt shape: {tt_prompt_1BLP.shape}")

@@ -371,7 +371,9 @@ void bind_sdpa(nb::module_& mod) {
         nb::arg("cu_window_seqlens") = nb::none(),
         nb::arg("windowed_q_token_offset") = 0,
         nb::arg("windowed_q_token_offset_tensor") = nb::none(),
-        nb::arg("output_concat_heads") = false);
+        nb::arg("output_concat_heads") = false,
+        nb::arg("sum_col_weight_start") = 32,
+        nb::arg("sum_col_weight") = 1.0f);
 
     ttnn::bind_function<"sparse_sdpa", "ttnn.transformer.">(
         mod,

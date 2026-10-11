@@ -306,6 +306,12 @@ def test_wan_transformer_block(
 
     # Create TT tensors
     tt_spatial = bf16_tensor_2dshard(spatial_padded, device=mesh_device, shard_mapping={sp_axis: 2, tp_axis: 3})
+    hk_xc_test = os.environ.get("HK_XC_TEST")  # DEBUG (hkato): "L0,L1" -> text compaction exactness check
+    if hk_xc_test:
+        hk_xc_lens = [int(v) for v in hk_xc_test.split(",")]
+        prompt_input = prompt_input.clone()
+        for b, n in enumerate(hk_xc_lens[: prompt_input.shape[0]]):
+            prompt_input[b, n:] = prompt_input[b, n]  # padding rows of a real prompt are all the same
     if cfg_batch:
         tt_prompt = tuple(bf16_tensor(prompt_input[i : i + 1].unsqueeze(0), device=mesh_device) for i in range(2))
         tt_temb = from_torch(
@@ -355,6 +361,48 @@ def test_wan_transformer_block(
                 mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=hk_dims, mesh_shape=tuple(mesh_device.shape)),
             )
             print("HK_BLOCK_HASH", hk_it, hashlib.md5(hk_t.float().numpy().tobytes()).hexdigest(), flush=True)
+
+    if hk_xc_test:  # DEBUG (hkato): the same block with the compacted text must match the uncompacted one
+        from models.tt_dit.models.transformers.wan2_2.attention_wan import hk_xattn_compact_layout
+
+        hk_dims = [None, None]
+        hk_dims[sp_axis] = 2
+        hk_dims[tp_axis] = 3
+        hk_comp = ttnn.ConcatMesh2dToTensor(mesh_device, dims=hk_dims, mesh_shape=tuple(mesh_device.shape))
+        hk_a = ttnn.to_torch(tt_spatial_out, mesh_composer=hk_comp).float()
+        hk_ref_in = tt_spatial
+        if os.environ.get("HK_BLOCK_VARY") == "chain" and hk_iters > 1:
+            raise AssertionError("HK_XC_TEST needs a single fixed input (no chain)")
+        if os.environ.get("HK_XC_CTRL") == "1":  # control: no compaction, K chunk 256 instead (same math)
+            tt_model.attn2.sdpa_program_config = ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=mesh_device.compute_with_storage_grid_size(),
+                q_chunk_size=256,
+                k_chunk_size=256,
+                exp_approx_mode=False,
+            )
+        else:
+            tt_model.attn2._hk_xcompact = hk_xattn_compact_layout(max(hk_xc_lens))
+        tt_model.attn2.clear_cross_kv_cache()
+        hk_b = ttnn.to_torch(
+            tt_model(
+                spatial_1BND=hk_ref_in,
+                prompt_1BLP=tt_prompt,
+                temb_1BTD=tt_temb,
+                N=spatial_seq_len,
+                rope_cos=tt_rope_cos,
+                rope_sin=tt_rope_sin,
+                trans_mat=tt_trans_mat,
+            ),
+            mesh_composer=hk_comp,
+        ).float()
+        hk_d = (hk_a - hk_b).abs()
+        hk_pcc = torch.corrcoef(torch.stack([hk_a.flatten(), hk_b.flatten()]))[0, 1].item()
+        print(
+            f"HK_XC layout {tt_model.attn2._hk_xcompact} pcc {hk_pcc:.7f} max {hk_d.max().item():.4g} "
+            f"mean {hk_d.mean().item():.4g} (|out| mean {hk_a.abs().mean().item():.4g})",
+            flush=True,
+        )
+        return
 
     spatial_concat_dims = [None, None]
     spatial_concat_dims[sp_axis] = 2

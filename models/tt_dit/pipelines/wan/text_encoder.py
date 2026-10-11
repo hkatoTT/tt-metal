@@ -156,6 +156,7 @@ class TextEncoder:
             return_tensors="pt",
         )
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
+        self.hk_token_lens = [int(v) for v in mask.sum(dim=1)]  # EXPERIMENT (hkato): real tokens per prompt
 
         # Shard on batch dimension. On non TP axis
         dims = [None, None]

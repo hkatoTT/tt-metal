@@ -118,7 +118,23 @@ void kernel_main() {
         ckernel::PoolType::MAX,
         ckernel::ReduceDim::REDUCE_ROW,
         dataflow_kernel_lib::SUM_AND_MAX_REDUCE_FACTOR>();
+#ifdef HK_SUM_COLW_START
+    // EXPERIMENT (hkato): the row sums are col_identity-reduced P tiles accumulated column-wise over the K tiles, so
+    // element (c, 0) of col_identity weighs every key at position c mod 32; columns >= HK_SUM_COLW_START count
+    // HK_SUM_COLW_BITS (bf16) times (their V rows are pre-scaled by the same weight).
+    {
+        CircularBuffer cb(cb_col_identity);
+        cb.reserve_back(1);
+        volatile tt_l1_ptr uint16_t* p = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cb.get_write_ptr());
+        const uint16_t one = identity_scalar_packed >> 16;
+        for (uint32_t c = 0; c < 32; c++) {
+            p[(c < 16 ? 0 : 512) + (c % 16) * 16] = c >= HK_SUM_COLW_START ? HK_SUM_COLW_BITS : one;
+        }
+        cb.push_back(1);
+    }
+#else
     generate_bcast_col_scalar(CircularBuffer(cb_col_identity), identity_scalar_packed);
+#endif
 
     // Lightweight mask: generate template tiles once, leave permanently fronted.
     // Sliding layout: [neginf, trailing_primary, leading_prev, leading_current, trailing_next, k_partial?].

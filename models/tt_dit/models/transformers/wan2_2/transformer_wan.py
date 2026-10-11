@@ -39,7 +39,7 @@ from ....utils.matmul import (
 from ....utils.mochi import get_rot_transformation_mat
 from ....utils.padding import pad_vision_seq_parallel
 from ....utils.substate import pop_substate, rename_substate
-from ....utils.tensor import bf16_tensor, from_torch, unflatten
+from ....utils.tensor import bf16_tensor, float32_tensor, from_torch, unflatten
 from ....utils.tracing import traced_function
 from .attention_wan import WanAttention, hk_xattn_compact_layout
 
@@ -575,6 +575,26 @@ class WanTransformer3DModel(Module):
         logger.info(f"TT timestep proj shape: {tt_timestep_proj_1BTD.shape}")
         return tt_temb_11BD, tt_timestep_proj_1BTD
 
+    def hk_prefill_temb(self, timesteps: list[float]) -> None:
+        """EXPERIMENT (hkato, WAN_TEMB_BATCH=1): the timestep embeddings of the whole run in one forward.
+
+        The embedding only depends on t; one step's MLP (fp32, M = 1) costs ~4 ms, mostly weight reads. Placing the
+        timesteps on the row axis makes one M = len(timesteps) pass, and each step takes its row.
+        """
+        # a fixed row count (repeating the last t), so the short warm-up run compiles every program of the real run
+        rows = list(timesteps) + [timesteps[-1]] * max(
+            0, int(os.environ.get("WAN_TEMB_BATCH_ROWS", "40")) - len(timesteps)
+        )
+        t_all = float32_tensor(torch.tensor(rows, dtype=torch.float32).reshape(1, 1, -1, 1), device=self.mesh_device)
+        temb_all, proj_all = self.condition_embedder.forward_timestep(t_all, timestep_seq_len=None)
+        cache = {}
+        for i, v in enumerate(rows):
+            temb = ttnn.slice(temb_all, [0, 0, i, 0], [1, 1, i + 1, temb_all.shape[3]])
+            proj = ttnn.slice(proj_all, [0, 0, i, 0], [1, 1, i + 1, proj_all.shape[3]])
+            proj = unflatten(ttnn.squeeze(proj, -2), -1, (6, -1))
+            cache.setdefault(float(v), (temb, proj))
+        self._hk_temb_cache = cache
+
     def prepare_conditioning(self, timestep, encoder_hidden_states):
         """
         Given inputs, execute the combined timestep and text embedding.
@@ -848,13 +868,38 @@ class WanTransformer3DModel(Module):
         again where needed (blocks see `_cfg_batch == 2`). Returns (cond, uncond), each laid out like inner_step's.
         """
         hk_marks = [self._synced_time()] if os.environ.get("WAN_FWD_TIMING") == "1" else None
-        temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
+        hk_fine = os.environ.get("HK_FWD_FINE") == "1" and hk_marks is not None
+        hk_cache = getattr(self, "_hk_temb_cache", None)
+        hk_t = getattr(self, "_hk_cur_t", None)
+        if hk_cache is not None and hk_t in hk_cache:  # EXPERIMENT (hkato): WAN_TEMB_BATCH (hk_prefill_temb)
+            temb_11BD, timestep_proj_1BTD = hk_cache[hk_t]
+            if os.environ.get("HK_TEMB_CHECK") == "1":
+                ref_temb, ref_proj = self.prepare_timestep_conditioning(timestep)
+                for name, a, b in (("temb", temb_11BD, ref_temb), ("proj", timestep_proj_1BTD, ref_proj)):
+                    ta = ttnn.to_torch(ttnn.get_device_tensors(a)[0]).float()
+                    tb = ttnn.to_torch(ttnn.get_device_tensors(b)[0]).float()
+                    print(
+                        f"HK_TEMB_CHECK {name} {tuple(ta.shape)} {tuple(tb.shape)} maxdiff {float((ta - tb).abs().max()):.3e}",
+                        flush=True,
+                    )
+        else:
+            temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
         if os.environ.get("WAN_TEMB_PRESLICE") == "1":  # EXPERIMENT (hkato): chunk once per step for all blocks
             timestep_proj_1BTD = tuple(ttnn.chunk(timestep_proj_1BTD, 6, dim=2))
+        if hk_fine:
+            hk_t1 = self._synced_time()
         spatial_1BND = self.patch_embedding(spatial_1BNI)
+        if hk_fine:
+            hk_t2 = self._synced_time()
         spatial_1BND = ttnn.concat([spatial_1BND, spatial_1BND], dim=2)
         if hk_marks:
             hk_marks.append(self._synced_time())
+            if hk_fine:
+                print(
+                    f"WAN_FWD_FINE temb={(hk_t1 - hk_marks[0]) * 1e3:.2f} patch={(hk_t2 - hk_t1) * 1e3:.2f} "
+                    f"concat={(hk_marks[-1] - hk_t2) * 1e3:.2f} ms",
+                    flush=True,
+                )
 
         for block in self.blocks:
             block.attn1._cfg_batch = 2
@@ -891,6 +936,9 @@ class WanTransformer3DModel(Module):
         spatial_norm_1BND = self.norm_out(
             spatial_1BND, dynamic_weight=(1 + scale_11BD), dynamic_bias=shift_11BD, dtype=ttnn.float32
         )
+        if hk_marks and os.environ.get("HK_FWD_FINE") == "1":
+            hk_t3 = self._synced_time()
+            print(f"WAN_FWD_FINE norm_out={(hk_t3 - hk_marks[-1]) * 1e3:.2f} ms", flush=True)
         if os.environ.get("WAN_PROJ_OUT_TP") == "1" and self.parallel_config.tensor_parallel.factor > 1:
             spatial_1BNI = self._hk_proj_out_tp(spatial_norm_1BND)
         else:

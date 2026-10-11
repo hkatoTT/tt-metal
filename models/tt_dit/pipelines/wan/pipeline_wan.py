@@ -783,6 +783,10 @@ class WanPipeline(PipelineAPIMixin):
                         ts.model, negative_prompt_embeds, ts.negative_prompt_buffer, traced
                     )
                     prepared_prompts[transformer_idx] = True
+                    if os.environ.get("WAN_TEMB_BATCH") == "1" and not traced and not self._expand_timesteps:
+                        ts.model.hk_prefill_temb([float(hk_t) for hk_t in timesteps])  # EXPERIMENT (hkato)
+                if os.environ.get("WAN_TEMB_BATCH") == "1":
+                    ts.model._hk_cur_t = float(t)
 
                 if permuted_latent_tt is None:
                     # First iteration, preprocess spatial input and prepare rope features

@@ -151,14 +151,19 @@ WH_4X8_DEVICE_PARAMS = (
     else ring_params_req_exact_devices
 )
 # EXPERIMENT (hkato): WAN_KCFG_EXTRA_KB=<KB> grows the Tensix kernel-config ring (69 KB by default on WH) by
-# shrinking worker_l1_size, so the next program's binaries can be written while a large one (ring SDPA ~60 KB) runs
-# Not with the 1-CQ ethernet dispatch without dispatch_s (HK_ETH_NO_DISPATCH_S, eth_dispatch/env.sh): with the larger
-# ring, 40-step runs stop being bit-identical (2 runs diverged at step 32; without it 3/3 identical, +3.6 ms/step).
-if os.environ.get("WAN_KCFG_EXTRA_KB") and os.environ.get("HK_ETH_NO_DISPATCH_S") != "1":
+# shrinking worker_l1_size, so the next program's binaries can be written while a large one (ring SDPA ~60 KB) runs.
+# With the 1-CQ ethernet dispatch without dispatch_s (HK_ETH_NO_DISPATCH_S, eth_dispatch/env.sh) the growth is capped
+# at WAN_KCFG_NODS_MAX_KB (64, 0 = off): the rare run-to-run divergence first blamed on the growth (#157) is a
+# pre-existing race whose rate follows the machine state; interleaved with the base, +64 KB runs were 6/6 identical
+# while the base had one divergence and one hang (#165).
+_hk_kcfg_kb = int(os.environ.get("WAN_KCFG_EXTRA_KB") or 0)
+if os.environ.get("HK_ETH_NO_DISPATCH_S") == "1":
+    _hk_kcfg_kb = min(_hk_kcfg_kb, int(os.environ.get("WAN_KCFG_NODS_MAX_KB", "64")))
+if _hk_kcfg_kb > 0:
     _WH_DEFAULT_WORKER_L1_SIZE = 1499136 - 105696  # MEM_L1_SIZE - (MEM_MAP_END + 69 KB, aligned)
     WH_4X8_DEVICE_PARAMS = {
         **WH_4X8_DEVICE_PARAMS,
-        "worker_l1_size": _WH_DEFAULT_WORKER_L1_SIZE - int(os.environ["WAN_KCFG_EXTRA_KB"]) * 1024,
+        "worker_l1_size": _WH_DEFAULT_WORKER_L1_SIZE - _hk_kcfg_kb * 1024,
     }
 
 

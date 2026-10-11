@@ -732,14 +732,18 @@ class WanAttention(Module):
                                 2,
                                 self.parallel_config.sequence_parallel.mesh_axis,
                                 dtype=k.dtype,
-                                tag="k" if os.environ.get("WAN_AG_PP_FIX") == "1" else None,
+                                # K and V have the same shape: without their own tags they share one ping-pong
+                                # pair and every call gets the same two buffers, so a column one block ahead
+                                # writes the next K/V into buffers a slower device still reads (WAN_AG_PP_FIX=0
+                                # restores the shared pair).
+                                tag="k" if os.environ.get("WAN_AG_PP_FIX", "1") == "1" else None,
                             ),
                             persistent_output_buffer_v=self.ccl_manager.get_ag_ping_pong_buffer(
                                 v.shape,
                                 2,
                                 self.parallel_config.sequence_parallel.mesh_axis,
                                 dtype=v.dtype,
-                                tag="v" if os.environ.get("WAN_AG_PP_FIX") == "1" else None,
+                                tag="v" if os.environ.get("WAN_AG_PP_FIX", "1") == "1" else None,
                             ),
                             joint_strategy="rear",
                             logical_n=N,

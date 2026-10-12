@@ -547,7 +547,7 @@ def _reassemble_2d(
                 # permuted shards straight into them from a thread pool (no per-shard contiguous temp).
                 key = (tuple(out_shape), out_dtype)
                 bufs = _HK_D2H_BUFS.setdefault(key, [])
-                if len(bufs) < 2:
+                while len(bufs) < 2:  # both on the first call, so a later call never faults in a new 97 MB buffer
                     bufs.append(torch.empty(out_shape, dtype=out_dtype).fill_(0))
                 out = bufs[_HK_D2H_IDX.get(key, 0) % len(bufs)]
                 _HK_D2H_IDX[key] = _HK_D2H_IDX.get(key, 0) + 1

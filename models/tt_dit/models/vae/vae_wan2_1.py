@@ -2366,8 +2366,13 @@ class WanVAEDecoderAdapter:
         _hk_mark("start")
         latents = latents.to(self._torch_vae.dtype)
         latents = latents * self._latents_std + self._latents_mean
+        _hk_mark("scale")
 
         tt_latents_BTHWC, logical_h, logical_w = self._decoder.prepare_input(latents)
+        if self._decoder.dtype == ttnn.bfloat16 and os.environ.get("WAN_VAE_IN_BF16", "1") != "0":
+            # ttnn.from_torch converts float32 -> bfloat16 slowly on the host (same rounding as torch).
+            tt_latents_BTHWC = tt_latents_BTHWC.to(torch.bfloat16).contiguous()
+        _hk_mark("prep")
         tt_latents_BTHWC = typed_tensor_2dshard(
             tt_latents_BTHWC,
             self.device,

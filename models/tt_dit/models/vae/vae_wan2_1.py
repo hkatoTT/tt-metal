@@ -58,6 +58,16 @@ _RM_RESID = os.environ.get("WAN_VAE_RM_RESID", "1") == "1"
 # Drops the cache concat (a copy of every chunk input) and the unpadded cache slices. WAN_VAE_NP_CACHE=0 restores
 # the concat path.
 _NP_CACHE = os.environ.get("WAN_VAE_NP_CACHE", "1") == "1"
+
+
+# The residual add of the row-major residual blocks is done inside conv2 (conv3d residual_tensor: the writer reads
+# the residual rows, compute adds them to the bf16 conv result before the untilize; bit-identical). Only for conv2
+# configs with one C_in block and full-block output (see WanCausalConv3d.can_fuse_residual). WAN_VAE_C3D_RESID=0
+# restores the separate add.
+def _c3d_resid() -> bool:
+    return os.environ.get("WAN_VAE_C3D_RESID", "1") == "1"
+
+
 # EXPERIMENT (hkato): a row-major RMSNorm in front of a padded-cache conv writes straight into the interior of the
 # neighbor-pad buffer, and neighbor pad then fills only halos, borders and front frames (no interior copy).
 _NP_NORM = os.environ.get("WAN_VAE_NP_NORM", "1") != "0"
@@ -562,9 +572,10 @@ class WanCausalConv3d(Module):
         logical_h: int,
         padded_cache_BTHWC: ttnn.Tensor | None,
         logical_w: int = 0,
+        residual: ttnn.Tensor | None = None,
     ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         """norm(x) followed by forward_np_cache, the row-major norm output written straight into the interior of
-        the padded neighbor-pad buffer (see _NP_NORM)."""
+        the padded neighbor-pad buffer (see _NP_NORM). `residual` is added to the conv output (_c3d_resid)."""
         hf = self.parallel_config.height_parallel.factor
         wf = self.parallel_config.width_parallel.factor
         assert x_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT
@@ -594,9 +605,19 @@ class WanCausalConv3d(Module):
             t_front_pad=CACHE_T,
             front_tensor=padded_cache_BTHWC,
         )
-        return self._conv_padded(padded)
+        return self._conv_padded(padded, residual)
 
-    def _conv_padded(self, padded: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+    def can_fuse_residual(self) -> bool:
+        """conv3d residual_tensor support: bf16, one C_in block, full-block output, tile-aligned patch blocks."""
+        cfg = self.conv_config
+        return (
+            self.dtype == ttnn.bfloat16
+            and cfg.C_in_block == self.in_channels
+            and cfg.C_out_block > 32
+            and (cfg.T_out_block * cfg.H_out_block * cfg.W_out_block) % 32 == 0
+        )
+
+    def _conv_padded(self, padded: ttnn.Tensor, residual: ttnn.Tensor | None = None) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         next_cache_BTHWC = padded[:, -CACHE_T:, :, :, :]
         out_BTHWC = ttnn.experimental.conv3d(
             input_tensor=padded,
@@ -611,6 +632,7 @@ class WanCausalConv3d(Module):
             padding_mode="zeros",
             dtype=self.dtype,
             compute_kernel_config=self.compute_kernel_config,
+            residual_tensor=residual,
         )
         return out_BTHWC, next_cache_BTHWC
 
@@ -903,6 +925,7 @@ class WanResidualBlock(Module):
             x_conv_BTHWC = self.conv1(x_BTHWC, logical_h, logical_w=logical_w)
 
         fuse_norm2 = _NP_NORM and feat_cache is not None and self.conv2.np_cache
+        fuse_resid = fuse_norm2 and row_major and _c3d_resid() and self.conv2.can_fuse_residual()
         if not fuse_norm2:
             x_BTHWC = self.norm2(x_conv_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
 
@@ -916,8 +939,11 @@ class WanResidualBlock(Module):
                 logical_h,
                 feat_cache[idx],
                 logical_w=logical_w,
+                residual=h_tile_BTHWC if fuse_resid else None,
             )
             feat_idx[0] += 1
+            if fuse_resid:
+                return x_conv_BTHWC
         elif feat_cache is not None and self.conv2.np_cache:
             idx = feat_idx[0]
             x_conv_BTHWC, feat_cache[idx] = self.conv2.forward_np_cache(

@@ -63,12 +63,16 @@ void kernel_main() {
     constexpr uint32_t output_pad_w = get_compile_time_arg_val(24);
     constexpr uint32_t cb_weight_lo_tiled = get_compile_time_arg_val(25);
     constexpr bool operand_split = get_compile_time_arg_val(26) == 1;
+    // EXPERIMENT (hkato): fused residual add -- the reducer reads each block's residual rows for compute.
+    constexpr uint32_t cb_resid_rm_id = get_compile_time_arg_val(27);
+    constexpr bool use_resid = get_compile_time_arg_val(28) == 1;
 
     uint32_t argidx = 0;
     const uint32_t out_addr = get_arg_val<uint32_t>(argidx++);
     const uint32_t weight_addr = get_arg_val<uint32_t>(argidx++);
     const uint32_t bias_addr = get_arg_val<uint32_t>(argidx++);
     const uint32_t weight_lo_addr = get_arg_val<uint32_t>(argidx++);
+    const uint32_t resid_addr = get_arg_val<uint32_t>(argidx++);
     const uint32_t c_in_block_start = get_arg_val<uint32_t>(argidx++);
     const uint32_t c_in_block_end = get_arg_val<uint32_t>(argidx++);
     const uint32_t c_out_block_start = get_arg_val<uint32_t>(argidx++);
@@ -96,11 +100,13 @@ void kernel_main() {
     experimental::CB cb_interm(cb_matmul_interm_tiled);
     experimental::CB cb_reduction(cb_reduction_tiled);
     experimental::CB cb_ack(cb_worker_ack_back);
+    experimental::CB cb_resid(use_resid ? cb_resid_rm_id : cb_matmul_result_rm);
     Semaphore<> sem(semaphore_id);
-    constexpr auto out_args = TensorAccessorArgs<27>();
+    constexpr auto out_args = TensorAccessorArgs<29>();
     constexpr auto weight_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
     constexpr auto bias_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
     constexpr auto weight_lo_args = TensorAccessorArgs<bias_args.next_compile_time_args_offset()>();
+    constexpr auto resid_args = TensorAccessorArgs<weight_lo_args.next_compile_time_args_offset()>();
     constexpr auto weight_mcast = dataflow_kernel_lib::McastArgs<
         get_named_compile_time_arg_val("weights_mcast_ct_offset"),
         get_named_compile_time_arg_val("weights_mcast_rt_offset")>();
@@ -125,6 +131,8 @@ void kernel_main() {
     const auto weight_reader = TensorAccessor(weight_args, weight_addr);
     const auto bias_reader = TensorAccessor(bias_args, bias_addr);
     const auto weight_lo_reader = TensorAccessor(weight_lo_args, weight_lo_addr);
+    const auto resid_reader = TensorAccessor(resid_args, resid_addr);
+    constexpr uint32_t resid_block_rows = T_block_size * H_block_size * W_block_size;
 
     constexpr uint32_t output_tiles = matmul_M_t * matmul_N_t;
     constexpr uint32_t weight_tiles = matmul_K_t * matmul_N_t;
@@ -211,6 +219,29 @@ void kernel_main() {
                                 cb_ack.push_back(1);
                             } else {
                                 // I'm a reducer.
+                                if constexpr (use_resid) {
+                                    // Residual rows of this block, packed like the output rows (padding rows unused).
+                                    cb_resid.reserve_back(resid_block_rows);
+                                    uint32_t resid_offset = 0;
+                                    for (uint32_t t = t_block; t < t_block_end; ++t) {
+                                        for (uint32_t h = h_block; h < h_block_end; ++h) {
+                                            for (uint32_t w = w_block; w < w_block_end; ++w) {
+                                                const uint32_t resid_page =
+                                                    batch_idx * T_out * H_out * W_out + (t * H_out + h) * W_out + w;
+                                                noc.async_read(
+                                                    resid_reader,
+                                                    cb_resid,
+                                                    C_out_block_bytes,
+                                                    {.page_id = resid_page,
+                                                     .offset_bytes = c_out_block * C_out_block_bytes},
+                                                    {.offset_bytes = resid_offset});
+                                                resid_offset += C_out_block_bytes;
+                                            }
+                                        }
+                                    }
+                                    noc.async_read_barrier();
+                                    cb_resid.push_back(resid_block_rows);
+                                }
                                 if (num_workers > 0) {
                                     // Wait for all workers to finish.
                                     sem.wait(num_workers);

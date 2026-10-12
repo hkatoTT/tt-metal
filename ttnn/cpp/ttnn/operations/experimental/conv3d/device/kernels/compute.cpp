@@ -355,7 +355,9 @@ template <
     bool use_bias,
     uint32_t inout_cb,
     uint32_t bias_cb,
-    uint32_t out_cb>
+    uint32_t out_cb,
+    uint32_t resid_rm_cb = 32,
+    uint32_t resid_tiled_cb = 32>
 void bias_untilize_fullblock_math() {
     CircularBuffer inout_cb_obj(inout_cb);
     inout_cb_obj.wait_front(rows * cols);
@@ -370,6 +372,21 @@ void bias_untilize_fullblock_math() {
             }
             add_bias_inplace<rows, cols, compute_kernel_lib::DEST_AUTO_LIMIT>(inout_cb, bias_cb);
         }
+    }
+    if constexpr (resid_rm_cb < 32) {
+        // EXPERIMENT (hkato): fused residual add (bf16 interm, one C_in block; see the program factory).
+        compute_kernel_lib::tilize<
+            cols,
+            resid_rm_cb,
+            resid_tiled_cb,
+            compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
+            compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
+            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
+            compute_kernel_lib::tilize_config::Fp32Mode::Fast,
+            compute_kernel_lib::tilize_config::RemapMode::AssumeConfigured>(rows, rows * tt::constants::TILE_HEIGHT);
+        CircularBuffer resid_tiled_obj(resid_tiled_cb);
+        resid_tiled_obj.wait_front(rows * cols);
+        add_block_inplace_math<rows * cols, compute_kernel_lib::DEST_AUTO_LIMIT>(inout_cb, resid_tiled_cb);
     }
     untilize_block<rows, cols, use_fp32_partials || use_fp32_exact, inout_cb, out_cb>();
 }
@@ -418,13 +435,25 @@ template <
     uint32_t remote_cb,
     uint32_t bias_cb,
     uint32_t out_cb,
-    uint32_t acc_cb>
+    uint32_t acc_cb,
+    uint32_t resid_rm_cb = 32,
+    uint32_t resid_tiled_cb = 32>
 void reduce_bias_untilize_fullblock(uint32_t num_workers) {
     if (num_workers > 0) {
         reduce_fullblock_inplace_math<rows, cols, use_fp32_partials, use_fp32_exact, local_cb, remote_cb, acc_cb>(
             num_workers);
     }
-    bias_untilize_fullblock_math<rows, cols, use_fp32_partials, use_fp32_exact, use_bias, local_cb, bias_cb, out_cb>();
+    bias_untilize_fullblock_math<
+        rows,
+        cols,
+        use_fp32_partials,
+        use_fp32_exact,
+        use_bias,
+        local_cb,
+        bias_cb,
+        out_cb,
+        resid_rm_cb,
+        resid_tiled_cb>();
 }
 
 void kernel_main() {
@@ -473,6 +502,8 @@ void kernel_main() {
     constexpr uint32_t cb_x_lo_tiled = get_compile_time_arg_val(32);
     constexpr uint32_t cb_weight_lo_tiled = get_compile_time_arg_val(33);
     constexpr bool operand_split = get_compile_time_arg_val(34) == 1;
+    constexpr uint32_t cb_resid_rm = get_compile_time_arg_val(35);     // 32 when unused
+    constexpr uint32_t cb_resid_tiled = get_compile_time_arg_val(36);  // 32 when unused
     constexpr uint32_t cb_matmul_in0 = operand_split ? cb_x_hi_tiled : cb_vol2col_tiled;
 
     constexpr uint32_t weight_tiles = matmul_K_t * matmul_N_t;
@@ -678,7 +709,9 @@ void kernel_main() {
                                         cb_reduction_tiled,
                                         cb_bias_tiled,
                                         cb_matmul_result_rm,
-                                        cb_reduction_acc_tiled>(num_workers);
+                                        cb_reduction_acc_tiled,
+                                        cb_resid_rm,
+                                        cb_resid_tiled>(num_workers);
                                 }
                             }  // end if constexpr (!enable_streaming_output)
                         }

@@ -214,6 +214,21 @@ void Conv3dDeviceOperation::validate_on_program_cache_miss(
             "weight_lo_tensor is only read with enable_fp32_operand_split=True.");
     }
 
+    if (tensor_args.residual_tensor.has_value()) {
+        const auto& residual = tensor_args.residual_tensor.value();
+        TT_FATAL(
+            residual.layout() == Layout::ROW_MAJOR && residual.dtype() == DataType::BFLOAT16 &&
+                input_tensor_a.dtype() == DataType::BFLOAT16,
+            "residual_tensor needs bfloat16 row-major data (input {} / residual {} {})",
+            input_tensor_a.dtype(),
+            residual.dtype(),
+            residual.layout());
+        TT_FATAL(
+            args.output_pad_h == 0 && args.output_pad_w == 0,
+            "residual_tensor needs the compact output (no output_pad)");
+        TT_FATAL(residual.buffer() != nullptr && residual.is_allocated(), "residual_tensor must be on the device");
+    }
+
     // Add grid size validation
     const auto& device_grid = input_tensor_a.device()->compute_with_storage_grid_size();
     TT_FATAL(
@@ -395,6 +410,9 @@ tt::tt_metal::operation::OpPerformanceModelGeneral<Tensor> Conv3dDeviceOperation
     if (tensor_args.weight_lo_tensor.has_value()) {
         input_tensors.push_back(tensor_args.weight_lo_tensor.value());
     }
+    if (tensor_args.residual_tensor.has_value()) {
+        input_tensors.push_back(tensor_args.residual_tensor.value());
+    }
     tt::tt_metal::operation::OpPerformanceModelGeneral<tensor_return_value_t> result(
         input_tensors, output_tensor, ideal_dev_clock_cycles);
 
@@ -426,7 +444,8 @@ ttnn::experimental::prim::Conv3dDeviceOperation::tensor_return_value_t conv3d(
     const std::optional<Tensor>& pad_offset_tensor,
     uint32_t output_pad_h,
     uint32_t output_pad_w,
-    const std::optional<Tensor>& weight_lo_tensor) {
+    const std::optional<Tensor>& weight_lo_tensor,
+    const std::optional<Tensor>& residual_tensor) {
     using OperationType = ttnn::experimental::prim::Conv3dDeviceOperation;
 
     auto kernel_config_val = init_device_compute_kernel_config(
@@ -466,7 +485,8 @@ ttnn::experimental::prim::Conv3dDeviceOperation::tensor_return_value_t conv3d(
         .bias_tensor = bias_tensor,
         .halo_buffer = halo_buffer,
         .pad_offset_tensor = pad_offset_tensor,
-        .weight_lo_tensor = weight_lo_tensor};
+        .weight_lo_tensor = weight_lo_tensor,
+        .residual_tensor = residual_tensor};
 
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }

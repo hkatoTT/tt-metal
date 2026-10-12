@@ -62,7 +62,8 @@ ttnn::Tensor conv3d(
     const std::optional<ttnn::Tensor>& pad_offset_tensor,
     uint32_t output_pad_h,
     uint32_t output_pad_w,
-    const std::optional<ttnn::Tensor>& weight_lo_tensor) {
+    const std::optional<ttnn::Tensor>& weight_lo_tensor,
+    const std::optional<ttnn::Tensor>& residual_tensor) {
     // Shared with prepare_conv3d_weights so the prepared weight's K-row blocking always matches the
     // conv compute -- a mismatch is near-zero PCC (#47316) -- and the minimal block keeps large
     // kernels within L1 (#42146).
@@ -114,7 +115,8 @@ ttnn::Tensor conv3d(
         pad_offset_tensor,
         output_pad_h,
         output_pad_w,
-        prepared_weight_lo_tensor);
+        prepared_weight_lo_tensor,
+        residual_tensor);
 }
 
 }  // namespace ttnn::experimental

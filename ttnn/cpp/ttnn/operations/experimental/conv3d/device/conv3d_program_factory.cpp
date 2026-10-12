@@ -338,6 +338,51 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
         });
     }
 
+    // EXPERIMENT (hkato): fused residual add. The reducer's writer reads the residual rows of each output block
+    // (one C_out_block row per patch, in output order) into resid_rm; compute tilizes them into resid_tiled and adds
+    // them to the conv result after the bias, before the untilize. bf16, one C_in block (the conv result is the
+    // bf16 interm tile, so this matches conv + a separate add), full-block (non-streaming) tail only.
+    const bool use_resid = tensor_args.residual_tensor.has_value();
+    uint32_t cb_resid_rm_id = 32;
+    uint32_t cb_resid_tiled_id = 32;
+    if (use_resid) {
+        TT_FATAL(
+            C_in_num_blocks == 1 && !enable_streaming_output && !use_fp32_exact && !use_fp32_partials &&
+                data_format == tt::DataFormat::Float16_b && num_patches % tt::constants::TILE_HEIGHT == 0,
+            "residual_tensor: unsupported conv3d config (C_in blocks {}, streaming {}, fp32 {}/{}, patches {})",
+            C_in_num_blocks,
+            enable_streaming_output,
+            use_fp32_exact,
+            use_fp32_partials,
+            num_patches);
+        const auto& residual = tensor_args.residual_tensor.value();
+        TT_FATAL(
+            residual.logical_shape() == output_tensor.logical_shape(),
+            "residual_tensor shape {} must match the output {}",
+            residual.logical_shape(),
+            output_tensor.logical_shape());
+        cb_resid_rm_id = next_cb_index++;
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = num_patches * C_out_block_bytes,
+            .core_ranges = CoreRangeSet(core_grid),
+            .format_descriptors = {{CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(cb_resid_rm_id),
+                .data_format = data_format,
+                .page_size = C_out_block_bytes,
+            }}},
+        });
+        cb_resid_tiled_id = next_cb_index++;
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = matmul_M_t * matmul_N_t * tile_size,
+            .core_ranges = CoreRangeSet(core_grid),
+            .format_descriptors = {{CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(cb_resid_tiled_id),
+                .data_format = data_format,
+                .page_size = tile_size,
+            }}},
+        });
+    }
+
     log_debug(
         tt::LogOp,
         "CB vol2col_rm: page_size={} bytes (padded from {}), num_pages={}",
@@ -868,7 +913,9 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
         cb_x_hi_tiled_id,
         cb_x_lo_tiled_id,
         cb_weight_lo_tiled_id,
-        (uint32_t)operand_split};
+        (uint32_t)operand_split,
+        cb_resid_rm_id,
+        cb_resid_tiled_id};
 
     // Deliver every CB the fp32 tail reads UnpackToDestFp32 -- interm (untilize/bias read-back),
     // bias, and, with multiple C_in blocks, reduction + acc. Without the flag the unpacker rounds
@@ -932,12 +979,16 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
         operation_attributes.output_pad_h,
         operation_attributes.output_pad_w,
         cb_weight_lo_tiled_id,
-        (uint32_t)operand_split};
+        (uint32_t)operand_split,
+        cb_resid_rm_id,
+        (uint32_t)use_resid};
     tt::tt_metal::TensorAccessorArgs(*output_tensor.buffer()).append_to(writer_compile_time_args);
     tt::tt_metal::TensorAccessorArgs(*weight_tensor.buffer()).append_to(writer_compile_time_args);
     tt::tt_metal::TensorAccessorArgs(bias_tensor.has_value() ? bias_tensor.value().buffer() : nullptr)
         .append_to(writer_compile_time_args);
     tt::tt_metal::TensorAccessorArgs(operand_split ? tensor_args.weight_lo_tensor.value().buffer() : nullptr)
+        .append_to(writer_compile_time_args);
+    tt::tt_metal::TensorAccessorArgs(use_resid ? tensor_args.residual_tensor.value().buffer() : nullptr)
         .append_to(writer_compile_time_args);
 
     KernelDescriptor writer_desc;
@@ -954,6 +1005,7 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
     tt::tt_metal::Buffer* weight_buffer = weight_tensor.buffer();
     tt::tt_metal::Buffer* bias_buffer = bias_tensor.has_value() ? bias_tensor.value().buffer() : nullptr;
     tt::tt_metal::Buffer* weight_lo_buffer = operand_split ? tensor_args.weight_lo_tensor.value().buffer() : nullptr;
+    tt::tt_metal::Buffer* resid_buffer = use_resid ? tensor_args.residual_tensor.value().buffer() : nullptr;
 
     // Per-core work assignments. Unassigned cores retain empty work ranges.
     struct CoreWork {
@@ -1273,7 +1325,7 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
         // Writer pos[0..2] are the output, weight, and bias buffer addresses. nullptr bias becomes
         // an embedded 0 so the kernel-side address is still well-defined.
         KernelDescriptor::RTArgList writer_args;
-        writer_args.reserve(27 + (num_workers > 0 ? 2 + 2 * num_workers : 0));
+        writer_args.reserve(28 + (num_workers > 0 ? 2 + 2 * num_workers : 0));
         writer_args.push_back(out_buffer);
         writer_args.push_back(weight_buffer);
         if (bias_buffer != nullptr) {
@@ -1283,6 +1335,11 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
         }
         if (weight_lo_buffer != nullptr) {
             writer_args.push_back(weight_lo_buffer);
+        } else {
+            writer_args.push_back(uint32_t{0});
+        }
+        if (resid_buffer != nullptr) {
+            writer_args.push_back(resid_buffer);
         } else {
             writer_args.push_back(uint32_t{0});
         }

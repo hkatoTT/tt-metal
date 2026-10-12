@@ -781,9 +781,11 @@ class CCLManager:
         num_links: list,
         logical_h: int = 0,
         t_front_pad: int = 0,
+        front_tensor: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """
         Helper function to neighbor-pad a tensor with a persistent output buffer.
+        front_tensor: already padded [1, t_front_pad, H', W', C] frames copied in front instead of zeros.
         """
         return self.neighbor_pad(
             tensor,
@@ -797,6 +799,7 @@ class CCLManager:
             use_persistent_buffer=True,
             logical_h=logical_h,
             t_front_pad=t_front_pad,
+            front_tensor=front_tensor,
         )
 
     def neighbor_pad(
@@ -814,6 +817,7 @@ class CCLManager:
         use_persistent_buffer: bool = False,
         logical_h: int = 0,
         t_front_pad: int = 0,
+        front_tensor: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         barrier_sem = self.get_barrier_semaphore(axes[0])
 
@@ -839,6 +843,7 @@ class CCLManager:
             persistent_output_buffer=persistent_buf,
             logical_h=logical_h,
             t_front_pad=t_front_pad,
+            front_tensor=front_tensor,
         )
 
     def reset_global_semaphores(self):

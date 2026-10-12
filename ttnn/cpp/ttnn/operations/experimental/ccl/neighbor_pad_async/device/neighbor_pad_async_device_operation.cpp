@@ -66,6 +66,29 @@ void NeighborPadAsyncDeviceOperation::validate_on_program_cache_miss(
             input_tensor_shape[0]);
     }
 
+    if (args.t_front_from_tensor) {
+        TT_FATAL(tensor_args.front_tensor.has_value(), "t_front_from_tensor needs a front tensor");
+        TT_FATAL(args.t_front_pad > 0, "A front tensor needs t_front_pad > 0");
+        TT_FATAL(args.pad_dim2.has_value(), "A front tensor is supported for the fused 2D padding only");
+        const auto& front = tensor_args.front_tensor.value();
+        TT_FATAL(front.storage_type() == StorageType::DEVICE, "The front tensor must be on device.");
+        TT_FATAL(
+            !front.is_sharded() && front.layout() == Layout::ROW_MAJOR, "The front tensor must be interleaved RM.");
+        TT_FATAL(front.dtype() == tensor_args.input_tensor.dtype(), "The front tensor dtype must match the input.");
+        TT_FATAL(
+            front.buffer()->aligned_page_size() == tensor_args.input_tensor.buffer()->aligned_page_size(),
+            "The front tensor page size must match the input.");
+        auto expected = tensor_args.input_tensor.logical_shape();
+        expected[args.dim] += (args.padding_left + args.padding_right);
+        expected[args.pad_dim2.value()] += (args.pad2_left + args.pad2_right);
+        expected[args.dim - 1] = args.t_front_pad;
+        TT_FATAL(
+            front.logical_shape() == expected,
+            "Front tensor shape {} must be the padded front frames {}",
+            front.logical_shape(),
+            expected);
+    }
+
     // Validate secondary padding dimension (2D padding)
     if (args.pad_dim2.has_value()) {
         uint32_t dim2 = args.pad_dim2.value();
@@ -172,7 +195,8 @@ Tensor neighbor_pad_async(
     std::optional<size_t> pad2_num_links,
     const std::optional<Tensor>& persistent_output_buffer,
     uint32_t logical_h,
-    uint32_t t_front_pad) {
+    uint32_t t_front_pad,
+    const std::optional<Tensor>& front_tensor) {
     using OperationType = ttnn::experimental::prim::NeighborPadAsyncDeviceOperation;
 
     auto* mesh_device = input_tensor.device();
@@ -203,10 +227,11 @@ Tensor neighbor_pad_async(
         pad2_num_links.value_or(0),
         persistent_output_buffer.has_value(),
         logical_h,
-        t_front_pad);
+        t_front_pad,
+        front_tensor.has_value());
 
-    auto tensor_args =
-        OperationType::tensor_args_t{.input_tensor = input_tensor, .preallocated_output = persistent_output_buffer};
+    auto tensor_args = OperationType::tensor_args_t{
+        .input_tensor = input_tensor, .preallocated_output = persistent_output_buffer, .front_tensor = front_tensor};
 
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }

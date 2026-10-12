@@ -87,6 +87,9 @@ void NeighborPadAsyncMeshWorkloadFactory::override_runtime_arguments(
             auto& lr = GetCommonRuntimeArgs(program, shared_vars.local_reader_kernel_id);
             lr[0] = input_addr;
             lr[1] = output_addr;
+            if (tensor_args.front_tensor.has_value()) {
+                lr[6] = tensor_args.front_tensor.value().buffer()->address();
+            }
 
             auto& lw = GetCommonRuntimeArgs(program, shared_vars.local_writer_kernel_id);
             lw[0] = input_addr;
@@ -409,7 +412,8 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
         // the neighbor's output DRAM (same pattern as 1D H). The W reader just waits for
         // the completion semaphore. DRAM write ordering is guaranteed by synchronize_device()
         // before the next op dispatch.
-        w_t_total = outer_dim_size + t_front_pad;
+        // Front frames from a tensor arrive padded: the W exchange skips them (starts at T = t_front_pad).
+        w_t_total = outer_dim_size + (operation_attributes.t_front_from_tensor ? 0 : t_front_pad);
         w_rows_per_link = w_t_total / pad2_num_links;   // reused as t_per_link
         w_extra_rows = w_t_total % pad2_num_links;       // reused as t_extra
     }
@@ -629,6 +633,12 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
             local_reader_cfg.compile_args = {sender_cb_index, page_size};
             local_reader_cfg.defines["HK_LC_BATCH"] = std::to_string(hk_lc_batch);
             TensorAccessorArgs(*input_buffer).append_to(local_reader_cfg.compile_args);
+            Buffer* front_buffer =
+                operation_attributes.t_front_from_tensor ? tensor_args.front_tensor.value().buffer() : nullptr;
+            if (front_buffer != nullptr) {
+                local_reader_cfg.defines["NP_FRONT_TENSOR"] = "1";
+                TensorAccessorArgs(*front_buffer).append_to(local_reader_cfg.compile_args);
+            }
             local_reader_kernel_id = CreateKernel(
                 program,
                 "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/local_copy_reader.cpp",
@@ -637,17 +647,21 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
             SetCommonRuntimeArgs(
                 program,
                 local_reader_kernel_id,
-                {input_buffer->address(),    // CRTA[0]
-                 output_buffer->address(),   // CRTA[1] (unused by reader, reserved for consistency)
-                 0u,                         // CRTA[2]: stick_start_id (always 0)
-                 input_halo_dim_size,        // CRTA[3]
-                 num_sticks_per_halo_dim,    // CRTA[4]: num_sticks_to_read
-                 num_sticks_per_halo_dim});  // CRTA[5]: num_sticks_per_halo_dim
+                {input_buffer->address(),   // CRTA[0]
+                 output_buffer->address(),  // CRTA[1] (unused by reader, reserved for consistency)
+                 0u,                        // CRTA[2]: stick_start_id (always 0)
+                 input_halo_dim_size,       // CRTA[3]
+                 num_sticks_per_halo_dim,   // CRTA[4]: num_sticks_to_read
+                 num_sticks_per_halo_dim,   // CRTA[5]: num_sticks_per_halo_dim
+                 front_buffer != nullptr ? front_buffer->address() : 0u});  // CRTA[6]: front tensor
 
             // Create consolidated local copy writer kernel (uniform compile args)
             auto local_writer_cfg = WriterDataMovementConfig{};
             local_writer_cfg.compile_args = {sender_cb_index, page_size};
             local_writer_cfg.defines["HK_LC_BATCH"] = std::to_string(hk_lc_batch);
+            if (front_buffer != nullptr) {
+                local_writer_cfg.defines["NP_FRONT_TENSOR"] = "1";
+            }
             TensorAccessorArgs(*output_buffer).append_to(local_writer_cfg.compile_args);
             local_writer_kernel_id = CreateKernel(
                 program,
@@ -697,7 +711,8 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
                 // These MUST be set for every core the kernels are placed on -- including cores with no
                 // work -- otherwise a no-work core reuses stale runtime args from a prior program and
                 // reads/writes garbage. Set args first, then skip bookkeeping for no-work cores.
-                SetRuntimeArgs(program, local_reader_kernel_id, {logical_core}, {unit_offset, units_for_core});
+                SetRuntimeArgs(
+                    program, local_reader_kernel_id, {logical_core}, {unit_offset, units_for_core, a_offset, a_count});
                 SetRuntimeArgs(
                     program,
                     local_writer_kernel_id,
@@ -810,7 +825,8 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
         // Set per-core runtime args for W fabric cores
         // w_rows_per_link/w_extra_rows now hold T batches per link (T-batch-aligned distribution).
         for (uint32_t w_link = 0; w_link < pad2_num_links; w_link++) {
-            uint32_t w_t_start = (w_link * w_rows_per_link) + std::min(w_link, w_extra_rows);
+            uint32_t w_t_start = (w_link * w_rows_per_link) + std::min(w_link, w_extra_rows) +
+                                 (operation_attributes.t_front_from_tensor ? t_front_pad : 0);
             uint32_t w_t_count = w_rows_per_link + (w_link < w_extra_rows ? 1 : 0);
             log_trace(
                 tt::LogOp,

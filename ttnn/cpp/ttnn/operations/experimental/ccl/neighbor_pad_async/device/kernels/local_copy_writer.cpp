@@ -57,6 +57,23 @@ void kernel_main() {
     Noc noc_obj;
     CircularBuffer cb_output(cb_output_id);
 
+#ifdef NP_FRONT_TENSOR
+    // Phase A: copy this core's slice of the padded front frames (read by the reader, same page ids).
+    {
+        constexpr uint32_t batch = (HK_LC_BATCH > 1) ? HK_LC_BATCH : 1;
+        for (uint32_t base = 0; base < zero_fill_count; base += batch) {
+            const uint32_t n = (zero_fill_count - base) < batch ? (zero_fill_count - base) : batch;
+            cb_output.wait_front(batch);
+            uint32_t l1_addr = cb_output.get_read_ptr();
+            for (uint32_t i = 0; i < n; ++i) {
+                noc_async_write(l1_addr, dst_accessor.get_noc_addr(zero_fill_start + base + i), stick_size);
+                l1_addr += stick_size;
+            }
+            noc_async_write_barrier();
+            cb_output.pop_front(batch);
+        }
+    }
+#else
     // Phase A: zero-fill this core's slice of the T-front output region.
     // Covers all H positions (interior + H-halo) at T < t_front_pad.
     for (uint32_t s = 0; s < zero_fill_count; ++s) {
@@ -64,6 +81,7 @@ void kernel_main() {
         zeroWrite<stick_size>(dst_noc_addr);
         noc_obj.async_write_barrier();
     }
+#endif
 
     // Phase B: copy input sticks (from CB) to output at T-offset t_front_pad_stick_offset.
     for (uint32_t s = 0; s < rows_count; s++) {

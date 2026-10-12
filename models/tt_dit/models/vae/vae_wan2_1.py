@@ -53,6 +53,11 @@ CACHE_T = 2
 # read row major directly, bit-identical): drops the untilize after norm1 and the tilize before the residual add of
 # every such block, and the layout round trip after the upsamplers. WAN_VAE_RM_RESID=0 restores the tiled stream.
 _RM_RESID = os.environ.get("WAN_VAE_RM_RESID", "1") == "1"
+# Causal 3x3x3 convs keep their temporal cache already padded: the last 2 frames of the neighbor-pad output
+# (halos included) are the next chunk's front frames, which neighbor pad copies in place of zeros (bit-identical).
+# Drops the cache concat (a copy of every chunk input) and the unpadded cache slices. WAN_VAE_NP_CACHE=0 restores
+# the concat path.
+_NP_CACHE = os.environ.get("WAN_VAE_NP_CACHE", "1") == "1"
 
 
 def _get_w_mask(cache, x_BTHWC, logical_w, parallel_config, mesh_device, dtype):
@@ -379,6 +384,64 @@ class WanCausalConv3d(Module):
         self.bias = Parameter(total_shape=[1, self.out_channels], device=mesh_device, pad_value=0, dtype=dtype)
 
         self._w_mask_cache: dict[tuple, ttnn.Tensor] = {}
+        self.np_cache = (
+            _NP_CACHE
+            and self.external_padding[0] == CACHE_T
+            and self.external_padding[1] > 0
+            and self.parallel_config.height_parallel.factor > 1
+            and self.external_padding[2] > 0
+            and self.parallel_config.width_parallel.factor > 1
+        )
+
+    def forward_np_cache(
+        self,
+        x_BTHWC: ttnn.Tensor,
+        logical_h: int,
+        padded_cache_BTHWC: ttnn.Tensor | None,
+        logical_w: int = 0,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """Causal conv with a padded temporal cache (see _NP_CACHE). Returns (output, next padded cache)."""
+        hf = self.parallel_config.height_parallel.factor
+        wf = self.parallel_config.width_parallel.factor
+        assert x_BTHWC.shape[2] * hf <= logical_h, "padded cache path has no row mask"
+        assert logical_w == 0 or x_BTHWC.shape[3] * wf <= logical_w, "padded cache path has no column mask"
+        h_axis = self.parallel_config.height_parallel.mesh_axis
+        w_axis = self.parallel_config.width_parallel.mesh_axis
+        padded = self.ccl_manager.neighbor_pad_persistent_buffer(
+            x_BTHWC,
+            dims=[2, 3],
+            pad_left=[self.external_padding[1], self.external_padding[2]],
+            pad_right=[self.external_padding[1], self.external_padding[2]],
+            padding_mode="zeros",
+            axes=[h_axis, w_axis],
+            neighbor_sems=[
+                self.ccl_manager.get_np_ping_pong_semaphore(h_axis),
+                self.ccl_manager.get_np_ping_pong_semaphore(w_axis),
+            ],
+            num_links=[
+                get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 2, h_axis),
+                get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 3, w_axis),
+            ],
+            logical_h=0,
+            t_front_pad=CACHE_T,
+            front_tensor=padded_cache_BTHWC,
+        )
+        next_cache_BTHWC = padded[:, -CACHE_T:, :, :, :]
+        out_BTHWC = ttnn.experimental.conv3d(
+            input_tensor=padded,
+            weight_tensor=self.weight.data,
+            bias_tensor=self.bias.data,
+            device=self.mesh_device,
+            config=self.conv_config,
+            output_channels=self.out_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.internal_padding,
+            padding_mode="zeros",
+            dtype=self.dtype,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        return out_BTHWC, next_cache_BTHWC
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         if "weight" in state:
@@ -636,7 +699,13 @@ class WanResidualBlock(Module):
         x_BTHWC = x_norm_silu_tile_BTHWC if row_major else ttnn.to_layout(x_norm_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
 
         # Cached conv
-        if feat_cache is not None:
+        if feat_cache is not None and self.conv1.np_cache:
+            idx = feat_idx[0]
+            x_conv_BTHWC, feat_cache[idx] = self.conv1.forward_np_cache(
+                x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None:
             # Prepare to cache the current activation for future use
             idx = feat_idx[0]
             t_start = x_BTHWC.shape[1] - CACHE_T
@@ -655,7 +724,13 @@ class WanResidualBlock(Module):
         x_BTHWC = self.norm2(x_conv_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
 
         # Cached conv
-        if feat_cache is not None:
+        if feat_cache is not None and self.conv2.np_cache:
+            idx = feat_idx[0]
+            x_conv_BTHWC, feat_cache[idx] = self.conv2.forward_np_cache(
+                x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None:
             # Prepare to cache the current activation for future use
             idx = feat_idx[0]
             t_start = x_BTHWC.shape[1] - CACHE_T
@@ -1387,7 +1462,13 @@ class WanDecoder3d(Module):
     ) -> tuple[ttnn.Tensor, int, int]:
         # NOTE: first_chunk is not used. It would be needed for WanResidualUpBlock.
         ## conv1
-        if feat_cache is not None:
+        if feat_cache is not None and self.conv_in.np_cache:
+            idx = feat_idx[0]
+            x_BTHWC, feat_cache[idx] = self.conv_in.forward_np_cache(
+                x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None:
             idx = feat_idx[0]
             t_start = x_BTHWC.shape[1] - CACHE_T
             cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
@@ -1415,7 +1496,13 @@ class WanDecoder3d(Module):
             x_norm_tile_BTHWC = ttnn.to_layout(x_norm_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
         x_BTHWC = x_norm_tile_BTHWC
 
-        if feat_cache is not None:
+        if feat_cache is not None and self.conv_out.np_cache:
+            idx = feat_idx[0]
+            x_BTHWC, feat_cache[idx] = self.conv_out.forward_np_cache(
+                x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None:
             idx = feat_idx[0]
             t_start = x_BTHWC.shape[1] - CACHE_T
             cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]

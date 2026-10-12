@@ -40,6 +40,9 @@ void bind_neighbor_pad_async(nb::module_& mod) {
             memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `input tensor memory config`.
             topology (ttnn.Topology, optional): The topology configuration to run the operation in. Valid options are Ring and Linear. Defaults to `ttnn.Topology.Linear`.
             persistent_output_buffer (ttnn.Tensor, optional): Pre-allocated output buffer. When provided, skips the H writer startup barrier since the output buffer is guaranteed to exist on all devices. Defaults to `None`.
+            logical_h (int, optional): Zero interior rows at global H index >= logical_h (0 = no masking). Defaults to `0`.
+            t_front_pad (int, optional): Number of T frames prepended to the output (zeros unless front_tensor is given). Defaults to `0`.
+            front_tensor (ttnn.Tensor, optional): Already padded [1, t_front_pad, H', W', C] frames (e.g. the tail of a previous output) copied as the T-front frames instead of zeros; no halo exchange for them. Fused 2D padding only. Defaults to `None`.
 
         Returns:
             ttnn.Tensor: the padded output tensor.
@@ -59,7 +62,8 @@ void bind_neighbor_pad_async(nb::module_& mod) {
         nb::arg("topology") = nb::cast(ttnn::ccl::Topology::Linear),
         nb::arg("persistent_output_buffer") = nb::none(),
         nb::arg("logical_h") = 0,
-        nb::arg("t_front_pad") = 0);
+        nb::arg("t_front_pad") = 0,
+        nb::arg("front_tensor") = nb::none());
 }
 
 }  // namespace ttnn::operations::experimental::ccl

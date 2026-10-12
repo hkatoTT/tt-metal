@@ -27,6 +27,8 @@ void kernel_main() {
     uint32_t arg_idx = 0;
     const uint32_t total_rows_start = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t rows_count = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t front_start = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t front_count = get_arg_val<uint32_t>(arg_idx++);
 
     constexpr auto src_args = TensorAccessorArgs<2>();
     uint32_t read_size = stick_size;
@@ -34,6 +36,30 @@ void kernel_main() {
 
     Noc noc_obj;
     CircularBuffer cb_output(cb_output_id);
+
+#ifdef NP_FRONT_TENSOR
+    // Phase A: this core's slice of the already padded front frames, page for page (the writer puts them at the
+    // same output pages, which the zero-fill covers otherwise).
+    {
+        constexpr auto front_args = TensorAccessorArgs<src_args.next_compile_time_args_offset()>();
+        const auto front_accessor = TensorAccessor(front_args, get_common_arg_val<address_t>(6));
+        constexpr uint32_t batch = (HK_LC_BATCH > 1) ? HK_LC_BATCH : 1;
+        for (uint32_t base = 0; base < front_count; base += batch) {
+            const uint32_t n = (front_count - base) < batch ? (front_count - base) : batch;
+            cb_output.reserve_back(batch);
+            uint32_t l1_addr = cb_output.get_write_ptr();
+            for (uint32_t i = 0; i < n; ++i) {
+                noc_async_read(front_accessor.get_noc_addr(front_start + base + i), l1_addr, read_size);
+                l1_addr += stick_size;
+            }
+            noc_async_read_barrier();
+            cb_output.push_back(batch);
+        }
+    }
+#else
+    (void)front_start;
+    (void)front_count;
+#endif
 
     for (uint32_t s = 0; s < rows_count; s++) {
         const uint32_t linear_row = total_rows_start + s;  // [0 .. outer_dim_size*input_halo_dim_size)

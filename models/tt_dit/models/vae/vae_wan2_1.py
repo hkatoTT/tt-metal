@@ -67,6 +67,9 @@ _NP_NORM = os.environ.get("WAN_VAE_NP_NORM", "1") != "0"
 # (no T split) is computed by each device for its own H x W shard only. Bit-identical. WAN_VAE_ATTN_QSPLIT=0
 # restores the replicated queries.
 _ATTN_QSPLIT = os.environ.get("WAN_VAE_ATTN_QSPLIT", "1") == "1"
+# With frames split over the W axis, move each frame to its device with an all-to-all over W and gather it over H,
+# and send the output back with an all-to-all (instead of gathering all frames everywhere): same values.
+_ATTN_A2A = os.environ.get("WAN_VAE_ATTN_A2A", "1") == "1"
 
 
 def _get_w_mask(cache, x_BTHWC, logical_w, parallel_config, mesh_device, dtype):
@@ -192,6 +195,81 @@ class WanAttentionBlock(Module):
         if "norm.gamma" in state:
             state["norm.weight"] = state.pop("norm.gamma").squeeze()
 
+    def _a2a(self, x: ttnn.Tensor, *, in_dim: int, out_dim: int, mesh_axis: int) -> ttnn.Tensor:
+        return ttnn.experimental.all_to_all_async_generic(
+            x,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            num_links=self.ccl_manager.links_for_axis(mesh_axis),
+            topology=self.ccl_manager.topology,
+            cluster_axis=mesh_axis,
+        )
+
+    def _forward_a2a(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int) -> ttnn.Tensor | None:
+        """The qsplit path (one frame per W device, queries split over H) with all-to-all moves; None if it does
+        not apply."""
+        B, T, h, w, C = x_BTHWC.shape
+        pc = self.parallel_config
+        hf, wf = pc.height_parallel.factor, pc.width_parallel.factor
+        h_axis, w_axis = pc.height_parallel.mesh_axis, pc.width_parallel.mesh_axis
+        H, W, BT = h * hf, w * wf, B * T
+        if not (
+            _ATTN_QSPLIT
+            and self.sdpa_t_fracture_w_only
+            and T > 1
+            and hf > 1
+            and wf > 1
+            and BT <= wf
+            and H <= logical_h
+            and (logical_w == 0 or W <= logical_w)
+        ):
+            return None
+        residual_BTHWC = x_BTHWC
+        x = ttnn.reshape(ttnn.to_layout(x_BTHWC, ttnn.ROW_MAJOR_LAYOUT), (BT, 1, h * w, C))
+        if wf > BT:
+            x = ttnn.pad(x, [(0, wf - BT), (0, 0), (0, 0), (0, 0)], value=0.0)
+        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        # frame f -> W device f: (1, wf, h * w, C), the W blocks of this device's frame
+        x = self._a2a(x, in_dim=1, out_dim=0, mesh_axis=w_axis)
+        x = self.ccl_manager.all_gather_persistent_buffer(x, dim=0, mesh_axis=h_axis)  # (hf, wf, h * w, C)
+        x = ttnn.reshape(ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT), (hf, wf, h, w * C))
+        x = ttnn.permute(x, (0, 2, 1, 3))  # raster order: (hf, h, wf, w * C)
+        x_TNC = ttnn.to_layout(ttnn.reshape(x, (1, H * W, C)), ttnn.TILE_LAYOUT)
+
+        x_TNC = self.norm(x_TNC, compute_kernel_config=self.hifi4_compute_kernel_config)
+        default_block_size = (2, 2, 2) if x_TNC.dtype == ttnn.float32 else (8, 8, 8)
+        x_TND = self.to_qkv(
+            x_TNC, compute_kernel_config=self.mm_compute_kernel_config, default_block_size=default_block_size
+        )
+        q_THNC, k_THNC, v_THNC = ttnn.transformer.split_query_key_value_and_split_heads(
+            x_TND, num_heads=1, transpose_key=False
+        )
+        q_rm = ttnn.mesh_partition(ttnn.to_layout(q_THNC, ttnn.ROW_MAJOR_LAYOUT), dim=2, cluster_axis=h_axis)
+        q_THNC = ttnn.to_layout(q_rm, ttnn.TILE_LAYOUT)
+        out_THNC = ttnn.transformer.scaled_dot_product_attention(
+            ttnn.typecast(q_THNC, ttnn.bfloat16) if q_THNC.dtype != ttnn.bfloat16 else q_THNC,
+            ttnn.typecast(k_THNC, ttnn.bfloat16) if k_THNC.dtype != ttnn.bfloat16 else k_THNC,
+            ttnn.typecast(v_THNC, ttnn.bfloat16) if v_THNC.dtype != ttnn.bfloat16 else v_THNC,
+            is_causal=False,
+            program_config=self.sdpa_program_config,
+            compute_kernel_config=self.sdpa_compute_kernel_config,
+        )
+        out_THNC = ttnn.typecast(out_THNC, q_THNC.dtype) if out_THNC.dtype != q_THNC.dtype else out_THNC
+        out_TND = self.proj(
+            ttnn.transformer.concatenate_heads(out_THNC),
+            compute_kernel_config=self.mm_compute_kernel_config,
+            default_block_size=default_block_size,
+        )
+        # (1, h * W, C): this device's frame, its H rows -> W blocks, then back to the frame owners
+        o = ttnn.reshape(ttnn.to_layout(out_TND, ttnn.ROW_MAJOR_LAYOUT), (1, h, wf, w * C))
+        o = ttnn.permute(o, (0, 2, 1, 3))  # (1, wf, h, w * C)
+        o = ttnn.to_layout(ttnn.reshape(o, (1, wf, h * w, C)), ttnn.TILE_LAYOUT)
+        o = self._a2a(o, in_dim=0, out_dim=1, mesh_axis=w_axis)  # (wf, 1, h * w, C): every frame of this W block
+        if wf > BT:
+            o = o[:BT, :, :, :]
+        o = ttnn.reshape(ttnn.to_layout(o, ttnn.ROW_MAJOR_LAYOUT), (B, T, h, w, C))
+        return ttnn.add(ttnn.to_layout(o, ttnn.TILE_LAYOUT), residual_BTHWC)
+
     def forward(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int = 0) -> ttnn.Tensor:
         """
         x_BTHWC: (B, T, H, W, C) fractured on H and W, TILE layout
@@ -201,6 +279,10 @@ class WanAttentionBlock(Module):
         assert len(x_BTHWC.shape) == 5
         assert x_BTHWC.layout == ttnn.TILE_LAYOUT
         residual_BTHWC = x_BTHWC
+        if _ATTN_A2A:
+            out_a2a = self._forward_a2a(x_BTHWC, logical_h, logical_w)
+            if out_a2a is not None:
+                return out_a2a
 
         # Gather height and width for replicated attention
         if self.parallel_config.height_parallel.factor > 1:
@@ -2373,16 +2455,73 @@ class WanVAEDecoderAdapter:
             # ttnn.from_torch converts float32 -> bfloat16 slowly on the host (same rounding as torch).
             tt_latents_BTHWC = tt_latents_BTHWC.to(torch.bfloat16).contiguous()
         _hk_mark("prep")
-        tt_latents_BTHWC = typed_tensor_2dshard(
-            tt_latents_BTHWC,
-            self.device,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            shard_mapping={
-                self._parallel_config.height_parallel.mesh_axis: 2,
-                self._parallel_config.width_parallel.mesh_axis: 3,
-            },
-            dtype=self._decoder.dtype,
-        )
+        shard_mapping = {
+            self._parallel_config.height_parallel.mesh_axis: 2,
+            self._parallel_config.width_parallel.mesh_axis: 3,
+        }
+        mesh_shape = tuple(self.device.shape)
+        hk_in_mode = os.environ.get("WAN_VAE_IN_SHARDS", "2")
+        hk_blocks = None
+        if hk_in_mode == "2" and tt_latents_BTHWC.dtype == torch.bfloat16 and tt_latents_BTHWC.shape[0] == 1:
+            # [1, T, H, W, C] -> [m0, m1, T, h, w, C] blocks in row-major device order, one contiguous copy.
+            _, T_, H, W, C_ = tt_latents_BTHWC.shape
+            h_ax = self._parallel_config.height_parallel.mesh_axis
+            hf, wf = mesh_shape[h_ax], mesh_shape[1 - h_ax]
+            hk_b = tt_latents_BTHWC.reshape(T_, hf, H // hf, wf, W // wf, C_).permute(1, 3, 0, 2, 4, 5)
+            if h_ax == 1:
+                hk_b = hk_b.transpose(0, 1)
+            hk_blocks = hk_b.reshape(mesh_shape[0] * mesh_shape[1], T_, H // hf, W // wf, C_).contiguous()
+            hk_host = ttnn.from_torch(
+                hk_blocks,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=ttnn.ShardTensorToMesh(self.device, dim=0),
+            )
+        elif hk_in_mode == "1" and tt_latents_BTHWC.dtype == torch.bfloat16:
+            # Per-device shards from torch views: ShardTensor2dMesh spends ~8 ms on the host for this 8 MB tensor.
+            H, W = tt_latents_BTHWC.shape[2], tt_latents_BTHWC.shape[3]
+            h_ax = self._parallel_config.height_parallel.mesh_axis
+            w_ax = self._parallel_config.width_parallel.mesh_axis
+            hs, ws = H // mesh_shape[h_ax], W // mesh_shape[w_ax]
+            hk_shards = []
+            for i0 in range(mesh_shape[0]):
+                for i1 in range(mesh_shape[1]):
+                    hi, wi = (i0, i1)[h_ax], (i0, i1)[w_ax]
+                    hk_shards.append(
+                        ttnn.from_torch(
+                            tt_latents_BTHWC[:, :, hi * hs : (hi + 1) * hs, wi * ws : (wi + 1) * ws, :].contiguous(),
+                            dtype=ttnn.bfloat16,
+                            layout=ttnn.ROW_MAJOR_LAYOUT,
+                        )
+                    )
+            hk_host = ttnn.from_host_shards(hk_shards, ttnn.MeshShape(*mesh_shape))
+        else:
+            hk_host = typed_tensor_2dshard(
+                tt_latents_BTHWC,
+                self.device,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                shard_mapping=shard_mapping,
+                dtype=self._decoder.dtype,
+                on_host=True,
+            )
+        _hk_mark("shard")
+        hk_dev = ttnn.to_device(hk_host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if hk_blocks is not None:
+            hk_dev = ttnn.reshape(hk_dev, (1,) + tuple(hk_blocks.shape[1:]))
+        if os.environ.get("WAN_VAE_IN_CHECK") == "1":  # compare with the ShardTensor2dMesh upload
+            hk_ref = typed_tensor_2dshard(
+                tt_latents_BTHWC,
+                self.device,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                shard_mapping=shard_mapping,
+                dtype=self._decoder.dtype,
+            )
+            hk_eq = all(
+                torch.equal(ttnn.to_torch(a), ttnn.to_torch(b))
+                for a, b in zip(ttnn.get_device_tensors(hk_dev), ttnn.get_device_tensors(hk_ref))
+            )
+            print("WAN_VAE_IN_CHECK equal=%s" % hk_eq, flush=True)
+        tt_latents_BTHWC = hk_dev
 
         _hk_mark("input")
         self.reload_weights()

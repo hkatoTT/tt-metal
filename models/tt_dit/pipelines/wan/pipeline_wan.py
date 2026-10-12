@@ -867,16 +867,30 @@ class WanPipeline(PipelineAPIMixin):
 
         self._current_timestep = None
 
+        _hk_lt = os.environ.get("WAN_VAE_TIMING") == "1"  # EXPERIMENT (hkato): time the latent hand-off
+        if _hk_lt:
+            ttnn.synchronize_device(self.mesh_device)
+            _hk_l0 = time.perf_counter()
         sp_axis = ts.model.parallel_config.sequence_parallel.mesh_axis
         permuted_latent_tt = ts.model.ccl_manager.all_gather_persistent_buffer(
             permuted_latent_tt, dim=2, mesh_axis=sp_axis
         )
+        if _hk_lt:
+            ttnn.synchronize_device(self.mesh_device)
+            _hk_l1 = time.perf_counter()
         permuted_latent = tensor.local_device_to_torch(permuted_latent_tt)
+        if _hk_lt:
+            _hk_l2 = time.perf_counter()
 
         # Postprocess spatial output
         latents = ts.model.postprocess_spatial_output_host(
             permuted_latent, F=latent_frames, H=latent_height, W=latent_width, N=latents_sequence_length
         )
+        if _hk_lt:
+            logger.info(
+                "WAN_LATENT_TIMING gather=%.1f d2h=%.1f post=%.1f ms"
+                % ((_hk_l1 - _hk_l0) * 1e3, (_hk_l2 - _hk_l1) * 1e3, (time.perf_counter() - _hk_l2) * 1e3)
+            )
 
         on_event(SectionEnd("denoising"))
 

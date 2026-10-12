@@ -340,15 +340,17 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
 
     // EXPERIMENT (hkato): fused residual add. The reducer's writer reads the residual rows of each output block
     // (one C_out_block row per patch, in output order) into resid_rm; compute tilizes them into resid_tiled and adds
-    // them to the conv result after the bias, before the untilize. bf16, one C_in block (the conv result is the
-    // bf16 interm tile, so this matches conv + a separate add), full-block (non-streaming) tail only.
+    // them to the conv result after the bias, before the untilize. bf16 data, full-block (non-streaming) tail
+    // only. With fp32 partials (several C_in blocks) the result is rounded to bf16 into resid_round first, so this
+    // matches conv + a separate add.
     const bool use_resid = tensor_args.residual_tensor.has_value();
     uint32_t cb_resid_rm_id = 32;
     uint32_t cb_resid_tiled_id = 32;
+    uint32_t cb_resid_round_id = 32;
     if (use_resid) {
         TT_FATAL(
-            C_in_num_blocks == 1 && !enable_streaming_output && !use_fp32_exact && !use_fp32_partials &&
-                data_format == tt::DataFormat::Float16_b && num_patches % tt::constants::TILE_HEIGHT == 0,
+            !enable_streaming_output && !use_fp32_exact && data_format == tt::DataFormat::Float16_b &&
+                num_patches % tt::constants::TILE_HEIGHT == 0,
             "residual_tensor: unsupported conv3d config (C_in blocks {}, streaming {}, fp32 {}/{}, patches {})",
             C_in_num_blocks,
             enable_streaming_output,
@@ -381,6 +383,18 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
                 .page_size = tile_size,
             }}},
         });
+        if (use_fp32_partials) {
+            cb_resid_round_id = next_cb_index++;
+            desc.cbs.push_back(CBDescriptor{
+                .total_size = matmul_M_t * matmul_N_t * tile_size,
+                .core_ranges = CoreRangeSet(core_grid),
+                .format_descriptors = {{CBFormatDescriptor{
+                    .buffer_index = static_cast<uint8_t>(cb_resid_round_id),
+                    .data_format = data_format,
+                    .page_size = tile_size,
+                }}},
+            });
+        }
     }
 
     log_debug(
@@ -915,7 +929,8 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
         cb_weight_lo_tiled_id,
         (uint32_t)operand_split,
         cb_resid_rm_id,
-        cb_resid_tiled_id};
+        cb_resid_tiled_id,
+        cb_resid_round_id};
 
     // Deliver every CB the fp32 tail reads UnpackToDestFp32 -- interm (untilize/bias read-back),
     // bias, and, with multiple C_in blocks, reduction + acc. Without the flag the unpacker rounds

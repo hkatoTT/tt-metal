@@ -68,6 +68,11 @@ def _c3d_resid() -> bool:
     return os.environ.get("WAN_VAE_C3D_RESID", "1") == "1"
 
 
+# Also the conv2 with several C_in blocks (fp32 partials, rounded to bf16 before the add).
+def _c3d_resid_all() -> bool:
+    return os.environ.get("WAN_VAE_C3D_RESID_ALL", "1") == "1"
+
+
 # EXPERIMENT (hkato): a row-major RMSNorm in front of a padded-cache conv writes straight into the interior of the
 # neighbor-pad buffer, and neighbor pad then fills only halos, borders and front frames (no interior copy).
 _NP_NORM = os.environ.get("WAN_VAE_NP_NORM", "1") != "0"
@@ -608,11 +613,11 @@ class WanCausalConv3d(Module):
         return self._conv_padded(padded, residual)
 
     def can_fuse_residual(self) -> bool:
-        """conv3d residual_tensor support: bf16, one C_in block, full-block output, tile-aligned patch blocks."""
+        """conv3d residual_tensor support: bf16, full-block output, tile-aligned patch blocks."""
         cfg = self.conv_config
         return (
             self.dtype == ttnn.bfloat16
-            and cfg.C_in_block == self.in_channels
+            and (_c3d_resid_all() or cfg.C_in_block == self.in_channels)
             and cfg.C_out_block > 32
             and (cfg.T_out_block * cfg.H_out_block * cfg.W_out_block) % 32 == 0
         )

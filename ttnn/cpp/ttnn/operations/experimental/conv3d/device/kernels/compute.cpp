@@ -357,7 +357,8 @@ template <
     uint32_t bias_cb,
     uint32_t out_cb,
     uint32_t resid_rm_cb = 32,
-    uint32_t resid_tiled_cb = 32>
+    uint32_t resid_tiled_cb = 32,
+    uint32_t resid_round_cb = 32>
 void bias_untilize_fullblock_math() {
     CircularBuffer inout_cb_obj(inout_cb);
     inout_cb_obj.wait_front(rows * cols);
@@ -374,21 +375,50 @@ void bias_untilize_fullblock_math() {
         }
     }
     if constexpr (resid_rm_cb < 32) {
-        // EXPERIMENT (hkato): fused residual add (bf16 interm, one C_in block; see the program factory).
+        // EXPERIMENT (hkato): fused residual add (see the program factory). With fp32 partials the conv result is
+        // first rounded to bf16 the way the untilize would read it (srcA copy, pack to bf16), so the add sees the
+        // same operands as a separate add of the bf16 conv output.
+        constexpr bool round_first = resid_round_cb < 32;
+        constexpr uint32_t sum_cb = round_first ? resid_round_cb : inout_cb;
+        if constexpr (round_first) {
+            CircularBuffer round_obj(resid_round_cb);
+            reconfig_data_format_srca(inout_cb);
+            pack_reconfig_data_format(resid_round_cb);
+            copy_tile_to_dst_init_short(inout_cb);
+            for (uint32_t i = 0; i < rows * cols; ++i) {
+                tile_regs_acquire();
+                copy_tile(inout_cb, i, 0);
+                tile_regs_commit();
+                round_obj.reserve_back(1);
+                tile_regs_wait();
+                pack_tile(0, resid_round_cb);
+                tile_regs_release();
+                round_obj.push_back(1);
+            }
+            inout_cb_obj.pop_front(rows * cols);
+            round_obj.wait_front(rows * cols);
+        }
         compute_kernel_lib::tilize<
             cols,
             resid_rm_cb,
             resid_tiled_cb,
             compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
             compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
-            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
+            round_first ? compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::UnpackAndPackReconfigure
+                        : compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
             compute_kernel_lib::tilize_config::Fp32Mode::Fast,
             compute_kernel_lib::tilize_config::RemapMode::AssumeConfigured>(rows, rows * tt::constants::TILE_HEIGHT);
         CircularBuffer resid_tiled_obj(resid_tiled_cb);
         resid_tiled_obj.wait_front(rows * cols);
-        add_block_inplace_math<rows * cols, compute_kernel_lib::DEST_AUTO_LIMIT>(inout_cb, resid_tiled_cb);
+        if constexpr (round_first) {
+            reconfig_data_format(sum_cb, resid_tiled_cb);
+            pack_reconfig_data_format(sum_cb);
+        }
+        add_block_inplace_math<rows * cols, compute_kernel_lib::DEST_AUTO_LIMIT>(sum_cb, resid_tiled_cb);
+        untilize_block<rows, cols, true, sum_cb, out_cb>();
+    } else {
+        untilize_block<rows, cols, use_fp32_partials || use_fp32_exact, inout_cb, out_cb>();
     }
-    untilize_block<rows, cols, use_fp32_partials || use_fp32_exact, inout_cb, out_cb>();
 }
 
 template <
@@ -437,7 +467,8 @@ template <
     uint32_t out_cb,
     uint32_t acc_cb,
     uint32_t resid_rm_cb = 32,
-    uint32_t resid_tiled_cb = 32>
+    uint32_t resid_tiled_cb = 32,
+    uint32_t resid_round_cb = 32>
 void reduce_bias_untilize_fullblock(uint32_t num_workers) {
     if (num_workers > 0) {
         reduce_fullblock_inplace_math<rows, cols, use_fp32_partials, use_fp32_exact, local_cb, remote_cb, acc_cb>(
@@ -453,7 +484,8 @@ void reduce_bias_untilize_fullblock(uint32_t num_workers) {
         bias_cb,
         out_cb,
         resid_rm_cb,
-        resid_tiled_cb>();
+        resid_tiled_cb,
+        resid_round_cb>();
 }
 
 void kernel_main() {
@@ -504,6 +536,7 @@ void kernel_main() {
     constexpr bool operand_split = get_compile_time_arg_val(34) == 1;
     constexpr uint32_t cb_resid_rm = get_compile_time_arg_val(35);     // 32 when unused
     constexpr uint32_t cb_resid_tiled = get_compile_time_arg_val(36);  // 32 when unused
+    constexpr uint32_t cb_resid_round = get_compile_time_arg_val(37);  // 32 unless fp32 partials
     constexpr uint32_t cb_matmul_in0 = operand_split ? cb_x_hi_tiled : cb_vol2col_tiled;
 
     constexpr uint32_t weight_tiles = matmul_K_t * matmul_N_t;
@@ -711,7 +744,8 @@ void kernel_main() {
                                         cb_matmul_result_rm,
                                         cb_reduction_acc_tiled,
                                         cb_resid_rm,
-                                        cb_resid_tiled>(num_workers);
+                                        cb_resid_tiled,
+                                        cb_resid_round>(num_workers);
                                 }
                             }  // end if constexpr (!enable_streaming_output)
                         }

@@ -189,6 +189,22 @@ std::optional<tt::DataFormat> dfb_data_format(const m2::ProgramSpec& spec, const
 }  // namespace CMAKE_UNIQUE_NAMESPACE
 }  // namespace
 
+// Row-major input: the in-flight tilize / untilize and the per-block passes work on full blocks, so a block size
+// that divides Wt avoids padding tiles (Wt = 3 -> 3, 6 -> 3, 12 -> 4). TT_LN_BLK_DIV=0 restores the DEST-limit size.
+static std::uint32_t hk_ln_block_size(bool fp32_dest_acc_en, std::uint32_t width_tiles, bool input_is_row_major) {
+    const std::uint32_t max_block = fp32_dest_acc_en ? 4 : 8;
+    const char* e = std::getenv("TT_LN_BLK_DIV");
+    if (!input_is_row_major || (e != nullptr && std::string(e) == "0") || width_tiles == 0) {
+        return max_block;
+    }
+    for (std::uint32_t b = max_block; b > 1; --b) {
+        if (width_tiles % b == 0) {
+            return b;
+        }
+    }
+    return max_block;
+}
+
 LayerNormInterleavedPlan LayerNormMultiCoreProgramFactory::select_plan(
     const LayerNormParams& operation_attributes,
     const LayerNormInputs& tensor_args,
@@ -232,7 +248,7 @@ LayerNormInterleavedPlan LayerNormMultiCoreProgramFactory::select_plan(
     if (width_tiles == 0 || num_tile_rows == 0) {
         return {};
     }
-    const std::uint32_t block_size = fp32_dest_acc_en ? 4 : 8;
+    const std::uint32_t block_size = hk_ln_block_size(fp32_dest_acc_en, width_tiles, input_is_row_major);
 
     const auto input_format = datatype_to_dataformat_converter(input.dtype());
     const auto output_format = input_format;
@@ -484,7 +500,7 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
 
     // Block size that maximizes dest usage depending on
     // whether fp32 accumulation is enabled
-    std::uint32_t block_size = fp32_dest_acc_en ? 4 : 8;
+    std::uint32_t block_size = hk_ln_block_size(fp32_dest_acc_en, Wt, input_is_row_major);
 
     tt::DataFormat in_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
     tt::DataFormat out_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
@@ -1085,6 +1101,21 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
     if (input_is_row_major) {
         compute.compiler_options.defines.emplace("TILIZE_IN", "1");
         compute.compiler_options.defines.emplace("UNTILIZE_OUT", "1");
+        // After each tile-row tilize, re-arm only the DST sync and the packer instead of a full hw startup (the
+        // data formats are reprogrammed by the passes). TT_LN_NO_RESTART=0 restores the full re-init.
+        const char* hk_nr = std::getenv("TT_LN_NO_RESTART");
+        if (hk_nr == nullptr || std::atoi(hk_nr) != 0) {
+            compute.compiler_options.defines.emplace("HK_LN_NO_RESTART", "1");
+        }
+    }
+    // EXPERIMENT (hkato): row-major RMSNorm with gamma and no beta: the gamma (+ activation) pass packs straight to the
+    // row-major output with pack_untilize from DEST instead of packing tiles that a separate pass untilizes (the tiled
+    // output CB has the output format, so the packed values are the same). TT_LN_FUSED_UNTILIZE=0 restores the pass.
+    if (input_is_row_major && rms_norm && gamma.has_value() && !beta.has_value() && !fuse_pre_add) {
+        const char* hk_e = std::getenv("TT_LN_FUSED_UNTILIZE");
+        if (hk_e == nullptr || std::atoi(hk_e) != 0) {
+            compute.compiler_options.defines.emplace("HK_LN_FUSED_UNTILIZE", "1");
+        }
     }
     if (welford_fp32_alias) {
         compute.compiler_options.defines.emplace("WELFORD_FP32_ALIAS", "1");

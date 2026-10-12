@@ -317,7 +317,41 @@ void kernel_main() {
             reconfig_data_format_srca(dfb_xmm_id, dfb_fusion_id);
 #endif
 #endif
-#ifdef FUSE_GAMMA
+#if defined(FUSE_GAMMA) && defined(HK_LN_FUSED_UNTILIZE)
+            {
+                // EXPERIMENT (hkato): gamma (+ activation) packed straight to the row-major output (see the factory).
+                constexpr auto dfb_out_rm_id = dfb::out_rm;
+                DataflowBuffer dfb_out_rm(dfb_out_rm_id);
+                DataflowBuffer dfb_fusion_buf(dfb_fusion_id);
+                DataflowBuffer dfb_gamma_buf(dfb_gamma_id);
+                pack_reconfig_data_format(dfb_out_rm_id);
+                reconfig_data_format_srcb(dfb_ex2pe_id, dfb_gamma_id);
+                mul_bcast_rows_init(dfb_fusion_id, dfb_gamma_id);
+                if constexpr (activate_after_gamma) {
+                    FusedActivation::init();
+                }
+                pack_untilize_dest_init<block_size, block_size>(dfb_out_rm_id);
+                dfb_gamma_buf.wait_front(block.start() + block.full_block_size());
+                dfb_fusion_buf.wait_front(block.full_block_size());
+                dfb_out_rm.reserve_back(block.full_block_size());
+                tile_regs_acquire();
+                for (uint32_t j = 0; j < block.size(); ++j) {
+                    mul_tiles_bcast_rows(dfb_fusion_id, dfb_gamma_id, j, block.start() + j, j);
+                }
+                if constexpr (activate_after_gamma) {
+                    for (uint32_t i = 0; i < block.size(); ++i) {
+                        FusedActivation::exec_impl(i);
+                    }
+                }
+                tile_regs_commit();
+                tile_regs_wait();
+                pack_untilize_dest<block_size, block_size>(dfb_out_rm_id, 1, 0);
+                tile_regs_release();
+                pack_untilize_uninit(dfb_out_rm_id);
+                dfb_out_rm.push_back(block.full_block_size());
+                dfb_fusion_buf.pop_front(block.full_block_size());
+            }
+#elif defined(FUSE_GAMMA)
             constexpr uint32_t dfb_outg_id = do_beta ? dfb_fusion_id : dfb_out_id;
             if constexpr (!do_beta) {
                 pack_reconfig_data_format(dfb_out_id);
@@ -394,7 +428,7 @@ void kernel_main() {
         dfb_ex2pe.pop_front(1);
         dfb_xmm.pop_front(total_buffer_size);
 
-#ifdef UNTILIZE_OUT
+#if defined(UNTILIZE_OUT) && !(defined(FUSE_GAMMA) && defined(HK_LN_FUSED_UNTILIZE))
         constexpr auto dfb_out_rm_id = dfb::out_rm;
         DataflowBuffer dfb_out_rm(dfb_out_rm_id);
         untilize_all_blocks_from_dfb<block_size>(dfb_out, dfb_out_rm, Wt);

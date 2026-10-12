@@ -872,13 +872,40 @@ class WanPipeline(PipelineAPIMixin):
             ttnn.synchronize_device(self.mesh_device)
             _hk_l0 = time.perf_counter()
         sp_axis = ts.model.parallel_config.sequence_parallel.mesh_axis
-        permuted_latent_tt = ts.model.ccl_manager.all_gather_persistent_buffer(
-            permuted_latent_tt, dim=2, mesh_axis=sp_axis
-        )
-        if _hk_lt:
-            ttnn.synchronize_device(self.mesh_device)
-            _hk_l1 = time.perf_counter()
-        permuted_latent = tensor.local_device_to_torch(permuted_latent_tt)
+        if os.environ.get("WAN_LAT_SHARDS", "1") != "0" and not ttnn.using_distributed_env():
+            # One batched read of every device's sequence shard (the async readers run all devices at once), then
+            # concatenate the shards of one device per sequence position: the all-gathered latent, without the
+            # all-gather and the 4 MB read through a single command queue.
+            if _hk_lt:
+                _hk_l1 = time.perf_counter()
+            hk_coords = list(permuted_latent_tt.tensor_topology().mesh_coords())
+            hk_by_pos = {}
+            if os.environ.get("WAN_LAT_SHARDS", "1") == "2":
+                # only the devices of one sequence-parallel row (the other axis holds replicas)
+                for hk_c, hk_dt in zip(hk_coords, ttnn.get_device_tensors(permuted_latent_tt)):
+                    if int(hk_c[1 - sp_axis]) == 0:
+                        hk_by_pos[int(hk_c[sp_axis])] = hk_dt.cpu(blocking=False)
+                ttnn.synchronize_device(self.mesh_device)
+            else:
+                hk_host = permuted_latent_tt.cpu(blocking=False)
+                ttnn.synchronize_device(self.mesh_device)
+                for hk_c, hk_sh in zip(hk_coords, ttnn.get_device_tensors(hk_host)):
+                    if int(hk_c[1 - sp_axis]) == 0:
+                        hk_by_pos[int(hk_c[sp_axis])] = hk_sh
+            permuted_latent = torch.cat([ttnn.to_torch(hk_by_pos[i]) for i in range(len(hk_by_pos))], dim=2)
+            if os.environ.get("WAN_VAE_IN_CHECK") == "1":
+                hk_ref = tensor.local_device_to_torch(
+                    ts.model.ccl_manager.all_gather_persistent_buffer(permuted_latent_tt, dim=2, mesh_axis=sp_axis)
+                )
+                logger.info("WAN_LAT_CHECK equal=%s" % torch.equal(hk_ref, permuted_latent))
+        else:
+            permuted_latent_tt = ts.model.ccl_manager.all_gather_persistent_buffer(
+                permuted_latent_tt, dim=2, mesh_axis=sp_axis
+            )
+            if _hk_lt:
+                ttnn.synchronize_device(self.mesh_device)
+                _hk_l1 = time.perf_counter()
+            permuted_latent = tensor.local_device_to_torch(permuted_latent_tt)
         if _hk_lt:
             _hk_l2 = time.perf_counter()
 

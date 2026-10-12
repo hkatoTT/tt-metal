@@ -2506,6 +2506,122 @@ class WanVAEDecoderAdapter:
         )
 
     @torch.no_grad()
+    def decode_tokens(
+        self,
+        tokens_tt: ttnn.Tensor,
+        *,
+        F: int,
+        H: int,
+        W: int,
+        N: int,
+        patch_size: tuple[int, int, int],
+        out_channels: int,
+        sp_axis: int,
+        output_type: str,
+    ) -> torch.Tensor:
+        """EXPERIMENT (hkato): decode straight from the DiT's sequence-sharded latent tokens on the device.
+
+        Same values as reading the tokens, unpatchifying, scaling and uploading on the host (see decode): the
+        tokens are all-gathered over the sequence axis, scaled per channel in fp32, cast to bf16, unpatchified with
+        a reshape / permute, padded to the conv channel alignment and partitioned over the VAE's H and W axes.
+        """
+        import time as hk_time
+
+        hk_tm = os.environ.get("WAN_HK_TOK_T") == "1"
+        hk_m = [("start", hk_time.perf_counter())]
+
+        def hk_mark(n):
+            if hk_tm:
+                ttnn.synchronize_device(self.device)
+                hk_m.append((n, hk_time.perf_counter()))
+
+        hk_mark("start")
+        pF, pH, pW = patch_size
+        C = out_channels
+        assert pF == 1 and tokens_tt.shape[-1] == pH * pW * C
+        reps = pH * pW
+        key = (tuple(tokens_tt.shape), C, reps)
+        hk_sc = getattr(self, "_hk_tok_scale", None)
+        if hk_sc is None or hk_sc[0] != key:
+            rep = ttnn.ReplicateTensorToMesh(self.device)
+            std = self._latents_std.reshape(C).float().repeat(reps).reshape(1, 1, 1, reps * C)
+            mean = self._latents_mean.reshape(C).float().repeat(reps).reshape(1, 1, 1, reps * C)
+            hk_sc = (
+                key,
+                ttnn.from_torch(std, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device, mesh_mapper=rep),
+                ttnn.from_torch(mean, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device, mesh_mapper=rep),
+            )
+            self._hk_tok_scale = hk_sc
+        _, std_tt, mean_tt = hk_sc
+        # Scale and cast the sequence shards first (elementwise, so it commutes with the gather), then gather bf16.
+        x = ttnn.add(ttnn.multiply(tokens_tt, std_tt), mean_tt)
+        x = ttnn.typecast(x, ttnn.bfloat16)
+        hk_mark("scale")
+        x = self._ccl_manager.all_gather_persistent_buffer(x, dim=2, mesh_axis=sp_axis)
+        hk_mark("gather")
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        x = x[:, :, :N, :]
+        Hp, Wp = H // pH, W // pW
+        x = ttnn.reshape(x, (F * Hp, Wp, pH, pW * C))
+        x = ttnn.permute(x, (0, 2, 1, 3))  # (F * Hp, pH, Wp, pW * C)
+        x = ttnn.reshape(x, (1, F, H, W, C))
+        hk_mark("unpatch")
+        x = ttnn.mesh_partition(x, dim=2, cluster_axis=self._parallel_config.height_parallel.mesh_axis)
+        x = ttnn.mesh_partition(x, dim=3, cluster_axis=self._parallel_config.width_parallel.mesh_axis)
+        Cp = aligned_channels(C)
+        if Cp != C:
+            x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, 0), (0, Cp - C)], value=0.0)
+        tt_latents_BTHWC = x
+        hk_mark("partition")
+        if os.environ.get("WAN_LAT_DEVICE_CHECK") == "1":  # compare with the host path's upload
+            hk_tok = local_device_to_torch(
+                self._ccl_manager.all_gather_persistent_buffer(tokens_tt, dim=2, mesh_axis=sp_axis)
+            )[:, :, :N, :]
+            hk_lat = hk_tok.reshape(1, F, Hp, Wp, pH, pW, C).permute(0, 6, 1, 2, 4, 3, 5).reshape(1, C, F, H, W)
+            hk_lat = (hk_lat.to(self._torch_vae.dtype) * self._latents_std + self._latents_mean).to(torch.bfloat16)
+            hk_ref = torch.nn.functional.pad(hk_lat.permute(0, 2, 3, 4, 1), (0, Cp - C))
+            hk_got = ttnn.to_torch(
+                tt_latents_BTHWC,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    self.device,
+                    mesh_shape=tuple(self.device.shape),
+                    dims={
+                        self._parallel_config.height_parallel.mesh_axis: 2,
+                        self._parallel_config.width_parallel.mesh_axis: 3,
+                    },
+                ),
+            )
+            print(
+                "WAN_LAT_DEVICE_CHECK equal=%s max=%.4g"
+                % (torch.equal(hk_got, hk_ref), (hk_got.float() - hk_ref.float()).abs().max().item()),
+                flush=True,
+            )
+
+        self.reload_weights()
+        tt_video_BCTHW, new_logical_h, new_logical_w = self._decoder(
+            tt_latents_BTHWC, H, t_chunk_size=self._t_chunk_size, logical_w=W
+        )
+        concat_dims = [None, None]
+        concat_dims[self._parallel_config.height_parallel.mesh_axis] = 3
+        concat_dims[self._parallel_config.width_parallel.mesh_axis] = 4
+        assert output_type == "uint8"
+        video_torch = fast_device_to_host(
+            tt_video_BCTHW,
+            self.device,
+            concat_dims,
+            ccl_manager=self._ccl_manager,
+            pre_transfer_fn=float_to_uint8,
+            permute=(0, 2, 3, 4, 1),
+        )
+        hk_mark("decode+d2h")
+        if hk_tm:
+            print(
+                "WAN_HK_TOK_T " + " ".join("%s=%.1f" % (b[0], (b[1] - a[1]) * 1e3) for a, b in zip(hk_m[1:], hk_m[2:])),
+                flush=True,
+            )
+        return video_torch[:, :, :new_logical_h, :new_logical_w, :]
+
+    @torch.no_grad()
     def decode(self, latents: torch.Tensor, *, output_type: str) -> torch.Tensor:
         import time as _hk_time  # EXPERIMENT (hkato): WAN_VAE_TIMING=1 section timing
 

@@ -867,6 +867,42 @@ class WanPipeline(PipelineAPIMixin):
 
         self._current_timestep = None
 
+        if (
+            os.environ.get("WAN_LAT_DEVICE", "0") == "1"
+            and output_type == "uint8"
+            and latents.shape[0] == 1
+            and not ttnn.using_distributed_env()
+        ):
+            # EXPERIMENT (hkato): the VAE takes the latent tokens on the device -- no host round trip and no sync, so
+            # the host queues the VAE while the device finishes the last denoising steps.
+            on_event(SectionEnd("denoising"))
+            on_event(SectionStart("vae"))
+            video_torch = self._vae.decode_tokens(
+                permuted_latent_tt,
+                F=latent_frames,
+                H=latent_height,
+                W=latent_width,
+                N=latents_sequence_length,
+                patch_size=tuple(ts.model.patch_size),
+                out_channels=ts.model.out_channels,
+                sp_axis=ts.model.parallel_config.sequence_parallel.mesh_axis,
+                output_type=output_type,
+            )
+            video = video_torch.numpy()
+            on_event(SectionEnd("vae"))
+            if os.environ.get("WAN_DUMP_LATENTS"):  # triage only: read the tokens back after the decode
+                hk_sp = ts.model.parallel_config.sequence_parallel.mesh_axis
+                hk_full = ts.model.ccl_manager.all_gather_persistent_buffer(permuted_latent_tt, dim=2, mesh_axis=hk_sp)
+                hk_lat = ts.model.postprocess_spatial_output_host(
+                    tensor.local_device_to_torch(hk_full),
+                    F=latent_frames,
+                    H=latent_height,
+                    W=latent_width,
+                    N=latents_sequence_length,
+                )
+                torch.save(hk_lat.detach().cpu(), os.environ["WAN_DUMP_LATENTS"])
+            return video
+
         _hk_lt = os.environ.get("WAN_VAE_TIMING") == "1"  # EXPERIMENT (hkato): time the latent hand-off
         if _hk_lt:
             ttnn.synchronize_device(self.mesh_device)

@@ -10,6 +10,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/vector.h>
 
 #include "dit_rms_norm_unary_fused.hpp"
 #include "ttnn-nanobind/bind_function.hpp"
@@ -27,7 +28,9 @@ ttnn::Tensor dit_rms_norm_unary_fused_wrapper(
     const std::optional<MemoryConfig>& memory_config,
     const std::optional<const ttnn::prim::LayerNormProgramConfig>& program_config,
     std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config,
-    const std::optional<std::string>& activation) {
+    const std::optional<std::string>& activation,
+    const std::optional<ttnn::Tensor>& output_tensor,
+    const std::optional<std::vector<uint32_t>>& output_pad) {
     std::optional<ttnn::operations::unary::UnaryWithParam> act_param = std::nullopt;
     if (activation.has_value()) {
         act_param = ttnn::operations::unary::utils::string_to_unary_with_param(activation.value());
@@ -41,7 +44,9 @@ ttnn::Tensor dit_rms_norm_unary_fused_wrapper(
         memory_config,
         program_config,
         compute_kernel_config,
-        act_param);
+        act_param,
+        output_tensor,
+        output_pad);
 }
 
 void bind_dit_rms_norm_unary_fused(nb::module_& mod) {
@@ -110,7 +115,9 @@ void bind_dit_rms_norm_unary_fused(nb::module_& mod) {
             nb::arg("memory_config") = nb::none(),
             nb::arg("program_config") = nb::none(),
             nb::arg("compute_kernel_config") = nb::none(),
-            nb::arg("activation") = nb::none()),
+            nb::arg("activation") = nb::none(),
+            nb::arg("output_tensor") = nb::none(),
+            nb::arg("output_pad") = nb::none()),
         ttnn::overload_t(
             &dit_rms_norm_unary_fused_wrapper,
             nb::arg("input_tensor"),
@@ -122,7 +129,9 @@ void bind_dit_rms_norm_unary_fused(nb::module_& mod) {
             nb::arg("memory_config") = nb::none(),
             nb::arg("program_config") = nb::none(),
             nb::arg("compute_kernel_config") = nb::none(),
-            nb::arg("activation") = nb::none()));
+            nb::arg("activation") = nb::none(),
+            nb::arg("output_tensor") = nb::none(),
+            nb::arg("output_pad") = nb::none()));
 }
 
 }  // namespace ttnn::operations::experimental::transformer

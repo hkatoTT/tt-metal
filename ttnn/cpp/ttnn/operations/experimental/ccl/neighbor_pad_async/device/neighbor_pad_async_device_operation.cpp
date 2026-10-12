@@ -66,6 +66,13 @@ void NeighborPadAsyncDeviceOperation::validate_on_program_cache_miss(
             input_tensor_shape[0]);
     }
 
+    if (args.interior_in_place) {
+        TT_FATAL(
+            tensor_args.preallocated_output.has_value() &&
+                tensor_args.preallocated_output->buffer() == tensor_args.input_tensor.buffer(),
+            "interior_in_place needs the padded tensor as both the input and the persistent output");
+        TT_FATAL(args.pad_dim2.has_value() && args.dim >= 1, "interior_in_place supports the fused 2D padding only");
+    }
     if (args.t_front_from_tensor) {
         TT_FATAL(tensor_args.front_tensor.has_value(), "t_front_from_tensor needs a front tensor");
         TT_FATAL(args.t_front_pad > 0, "A front tensor needs t_front_pad > 0");
@@ -79,8 +86,10 @@ void NeighborPadAsyncDeviceOperation::validate_on_program_cache_miss(
             front.buffer()->aligned_page_size() == tensor_args.input_tensor.buffer()->aligned_page_size(),
             "The front tensor page size must match the input.");
         auto expected = tensor_args.input_tensor.logical_shape();
-        expected[args.dim] += (args.padding_left + args.padding_right);
-        expected[args.pad_dim2.value()] += (args.pad2_left + args.pad2_right);
+        if (!args.interior_in_place) {
+            expected[args.dim] += (args.padding_left + args.padding_right);
+            expected[args.pad_dim2.value()] += (args.pad2_left + args.pad2_right);
+        }
         expected[args.dim - 1] = args.t_front_pad;
         TT_FATAL(
             front.logical_shape() == expected,
@@ -132,12 +141,14 @@ void NeighborPadAsyncDeviceOperation::validate_on_program_cache_miss(
             "Preallocated output tensor memory config must match output_mem_config.");
 
         auto expected_shape = tensor_args.input_tensor.logical_shape();
-        expected_shape[args.dim] += (args.padding_left + args.padding_right);
-        if (args.pad_dim2.has_value()) {
-            expected_shape[args.pad_dim2.value()] += (args.pad2_left + args.pad2_right);
-        }
-        if (args.t_front_pad > 0) {
-            expected_shape[args.dim - 1] += args.t_front_pad;
+        if (!args.interior_in_place) {
+            expected_shape[args.dim] += (args.padding_left + args.padding_right);
+            if (args.pad_dim2.has_value()) {
+                expected_shape[args.pad_dim2.value()] += (args.pad2_left + args.pad2_right);
+            }
+            if (args.t_front_pad > 0) {
+                expected_shape[args.dim - 1] += args.t_front_pad;
+            }
         }
         TT_FATAL(
             output_tensor.logical_shape() == expected_shape,
@@ -150,6 +161,9 @@ void NeighborPadAsyncDeviceOperation::validate_on_program_cache_miss(
 tt::tt_metal::TensorSpec NeighborPadAsyncDeviceOperation::compute_output_specs(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     const auto& input_tensor = tensor_args.input_tensor;
+    if (args.interior_in_place) {
+        return input_tensor.tensor_spec();
+    }
     auto shape = input_tensor.logical_shape();
     shape[args.dim] += (args.padding_left + args.padding_right);
     if (args.pad_dim2.has_value()) {
@@ -196,7 +210,8 @@ Tensor neighbor_pad_async(
     const std::optional<Tensor>& persistent_output_buffer,
     uint32_t logical_h,
     uint32_t t_front_pad,
-    const std::optional<Tensor>& front_tensor) {
+    const std::optional<Tensor>& front_tensor,
+    bool interior_in_place) {
     using OperationType = ttnn::experimental::prim::NeighborPadAsyncDeviceOperation;
 
     auto* mesh_device = input_tensor.device();
@@ -228,7 +243,8 @@ Tensor neighbor_pad_async(
         persistent_output_buffer.has_value(),
         logical_h,
         t_front_pad,
-        front_tensor.has_value());
+        front_tensor.has_value(),
+        interior_in_place);
 
     auto tensor_args = OperationType::tensor_args_t{
         .input_tensor = input_tensor, .preallocated_output = persistent_output_buffer, .front_tensor = front_tensor};

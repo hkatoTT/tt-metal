@@ -41,6 +41,9 @@ struct NeighborPadAsyncParams {
     // The t_front_pad front frames come from a tensor that is already padded ([1, t_front_pad, H', W', C], e.g. the
     // tail of the previous call's output) instead of zeros: copied as is, no halo exchange for them.
     bool t_front_from_tensor = false;
+    // The input already is the padded output (same tensor): its interior holds the data (written there by the
+    // producer), so only the borders, halos and front frames are filled; no interior copy.
+    bool interior_in_place = false;
 
     // Constructor required because GlobalSemaphore is not default constructible
     NeighborPadAsyncParams(
@@ -64,7 +67,8 @@ struct NeighborPadAsyncParams {
         bool using_persistent_buffers = false,
         uint32_t logical_h = 0,
         uint32_t t_front_pad = 0,
-        bool t_front_from_tensor = false) :
+        bool t_front_from_tensor = false,
+        bool interior_in_place = false) :
         dim(dim),
         padding_left(padding_left),
         padding_right(padding_right),
@@ -85,7 +89,8 @@ struct NeighborPadAsyncParams {
         using_persistent_buffers(using_persistent_buffers),
         logical_h(logical_h),
         t_front_pad(t_front_pad),
-        t_front_from_tensor(t_front_from_tensor) {}
+        t_front_from_tensor(t_front_from_tensor),
+        interior_in_place(interior_in_place) {}
 
     // Program-cache hash / canonical-key fields
     static constexpr auto attribute_names = std::make_tuple(
@@ -105,7 +110,8 @@ struct NeighborPadAsyncParams {
         "pad2_num_links",
         "logical_h",
         "t_front_pad",
-        "t_front_from_tensor");
+        "t_front_from_tensor",
+        "interior_in_place");
 
     auto attribute_values() const {
         return std::forward_as_tuple(
@@ -125,7 +131,8 @@ struct NeighborPadAsyncParams {
             this->pad2_num_links,
             this->logical_h,
             this->t_front_pad,
-            this->t_front_from_tensor);
+            this->t_front_from_tensor,
+            this->interior_in_place);
     }
 };
 

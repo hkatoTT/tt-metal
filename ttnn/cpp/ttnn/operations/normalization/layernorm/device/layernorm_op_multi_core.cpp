@@ -1000,10 +1000,18 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
         .runtime_arg_schema = {.runtime_arg_names = {"Wt", "num_tile_rows", "writer_start"}},
         .hw_config = create_writer_datamovement_config(),
     };
+    const auto& hk_out_pad = operation_attributes.output_pad;
+    const bool hk_pad_out = input_is_row_major && (hk_out_pad[0] != 0 || hk_out_pad[1] != 0 || hk_out_pad[2] != 0);
     if (input_is_row_major) {
         // The RM writer needs elem_size to compute per-row NOC write sizes.
         writer.compile_time_args.emplace("elem_size_bytes", static_cast<uint32_t>(output.element_size()));
         writer.runtime_arg_schema.runtime_arg_names.push_back("H_logical");
+        if (hk_pad_out) {
+            // Rows (t, h, w) of the input land at (t + pad_t, h + pad_h, w + pad_w) of the padded output.
+            writer.compiler_options.defines.emplace("HK_LN_PAD_OUT", "1");
+            writer.runtime_arg_schema.runtime_arg_names.insert(
+                writer.runtime_arg_schema.runtime_arg_names.end(), {"pad_W", "pad_H", "pad_t", "pad_h", "pad_w"});
+        }
         bind_dfb(writer, OUT_RM, "out_rm", m2::DFBEndpointType::CONSUMER);
     } else {
         bind_dfb(writer, OUT, "out", m2::DFBEndpointType::CONSUMER);
@@ -1321,6 +1329,16 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
             {{"Wt", Wt}, {"num_tile_rows", num_tile_rows_per_core}, {"writer_start", writer_start}});
         if (input_is_row_major) {
             m2::AddRuntimeArgsForNode(writer_run_args.runtime_arg_values, core, {{"H_logical", H_logical}});
+        }
+        if (hk_pad_out) {
+            m2::AddRuntimeArgsForNode(
+                writer_run_args.runtime_arg_values,
+                core,
+                {{"pad_W", static_cast<uint32_t>(logical_shape[-2])},
+                 {"pad_H", static_cast<uint32_t>(logical_shape[-3])},
+                 {"pad_t", hk_out_pad[0]},
+                 {"pad_h", hk_out_pad[1]},
+                 {"pad_w", hk_out_pad[2]}});
         }
 
         m2::AddRuntimeArgsForNode(compute_run_args.runtime_arg_values, core, {{"NCHt", num_tile_rows_per_core}});

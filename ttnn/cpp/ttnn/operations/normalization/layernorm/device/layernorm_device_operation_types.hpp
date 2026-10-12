@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <optional>
 
 #include "ttnn/tensor/tensor.hpp"
@@ -23,6 +25,9 @@ struct LayerNormParams {
     DeviceComputeKernelConfig compute_kernel_config;
     std::optional<DataType> dtype;
     std::optional<operations::unary::UnaryWithParam> fused_activation;
+    // Row-major output written into the interior of a larger, already allocated [.., T + t, H + 2h, W + 2w, C]
+    // tensor (output_tensor): (t, h, w) = front T frames, H and W border widths. All zero = plain output.
+    std::array<uint32_t, 3> output_pad = {0, 0, 0};
 };
 
 struct LayerNormInputs {
@@ -32,6 +37,7 @@ struct LayerNormInputs {
     std::optional<Tensor> bias;                   // beta
     std::optional<Tensor> stats;                  // for POST_ALL_GATHER
     std::optional<Tensor> recip_tensor;           // reciprocal LUT for welford algorithm
+    std::optional<Tensor> output_tensor;          // preallocated output (required with output_pad)
 };
 
 }  // namespace ttnn::prim

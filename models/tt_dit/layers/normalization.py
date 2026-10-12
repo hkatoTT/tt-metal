@@ -55,7 +55,14 @@ class RMSNorm(Module):
         *,
         compute_kernel_config=None,
         program_config: ttnn.LayerNormDefaultProgramConfig | ttnn.LayerNormShardedMultiCoreProgramConfig | None = None,
+        output_tensor: ttnn.Tensor | None = None,
+        output_pad: tuple[int, int, int] | None = None,
     ) -> ttnn.Tensor:
+        # output_tensor / output_pad: write a row-major result into the interior of a larger padded tensor,
+        # (t, h, w) = front T frames and the H / W border widths.
+        kwargs = {}
+        if output_tensor is not None:
+            kwargs = {"output_tensor": output_tensor, "output_pad": list(output_pad)}
         return ttnn.experimental.dit_rms_norm_unary_fused(
             x,
             weight=self.weight.data if self.weight is not None else None,
@@ -64,6 +71,7 @@ class RMSNorm(Module):
             program_config=program_config,
             compute_kernel_config=compute_kernel_config,
             activation=self.fused_activation,
+            **kwargs,
         )
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:

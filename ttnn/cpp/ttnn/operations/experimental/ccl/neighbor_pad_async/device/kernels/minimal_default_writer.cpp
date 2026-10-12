@@ -22,6 +22,13 @@
 #include <utility>
 #include "api/tensor/noc_traits.h"
 
+#if defined(HK_NP_ZONES)
+#include "tools/profiler/kernel_profiler.hpp"
+#define HK_ZONE(n) DeviceZoneScopedN(n)
+#else
+#define HK_ZONE(n)
+#endif
+
 using address_t = uint32_t;
 using namespace tt::tt_fabric::linear::experimental;
 
@@ -132,6 +139,85 @@ void kernel_main() {
     ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr, unicast_route_info);
     auto pkt_hdr_sem_inc = PacketHeaderPool::allocate_header();
 
+#ifdef HK_NP_SCATTER
+    // EXPERIMENT (hkato): pack up to HK_NP_SCATTER outgoing sticks into one fabric scatter-write packet.
+    // CB pages stay held until the packet (and any local writes from them) has left L1.
+    auto pkt_hdr_sc = PacketHeaderPool::allocate_header();
+    ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr_sc, unicast_route_info);
+    uint32_t hk_k = HK_NP_SCATTER < NOC_SCATTER_WRITE_MAX_CHUNKS ? HK_NP_SCATTER : NOC_SCATTER_WRITE_MAX_CHUNKS;
+    if (!is_last_chip) {
+        const uint32_t slot_payload_bytes = (direction ? fabric_connection.get_backward_connection().buffer_size_bytes
+                                                       : fabric_connection.get_forward_connection().buffer_size_bytes) -
+                                            sizeof(PACKET_HEADER_TYPE);
+        if (slot_payload_bytes / stick_size < hk_k) {
+            hk_k = slot_payload_bytes / stick_size;
+        }
+    }
+    if (hk_k < 1) {
+        hk_k = 1;
+    }
+    uint32_t hk_held = 0;  // CB pages handed out but not popped yet
+    uint32_t hk_n = 0;     // sticks staged for the next packet
+    uint32_t hk_src[NOC_SCATTER_WRITE_MAX_CHUNKS];
+    uint64_t hk_dst[NOC_SCATTER_WRITE_MAX_CHUNKS];
+    auto hk_next_page = [&]() -> uint32_t {
+        cb_output.wait_front(hk_held + 1);
+        const auto& iface = get_local_cb_interface(cb_output_id);
+        uint32_t addr = iface.fifo_rd_ptr + hk_held * iface.fifo_page_size;
+        if (addr >= iface.fifo_limit) {
+            addr -= iface.fifo_size;
+        }
+        hk_held++;
+        return addr;
+    };
+    auto hk_release = [&]() {
+        noc_obj.async_writes_flushed();
+        for (; hk_held > 0; hk_held--) {
+            cb_output.pop_front(1);
+        }
+    };
+    auto hk_send = [&]() {
+        if (hk_n == 0) {
+            return;
+        }
+        auto& conn =
+            direction ? fabric_connection.get_backward_connection() : fabric_connection.get_forward_connection();
+        conn.wait_for_empty_write_slot();
+        if (hk_n == 1) {
+            pkt_hdr->to_noc_unicast_write(tt::tt_fabric::NocUnicastCommandHeader{hk_dst[0]}, stick_size);
+            conn.send_payload_without_header_non_blocking_from_address(hk_src[0], stick_size);
+            conn.send_payload_flush_non_blocking_from_address((uint32_t)pkt_hdr, sizeof(PACKET_HEADER_TYPE));
+        } else {
+            const uint16_t sizes[NOC_SCATTER_WRITE_MAX_CHUNKS - 1] = {stick_size, stick_size, stick_size};
+            pkt_hdr_sc->to_noc_unicast_scatter_write(
+                tt::tt_fabric::NocUnicastScatterCommandHeader(hk_dst, sizes, static_cast<uint8_t>(hk_n)),
+                hk_n * stick_size);
+            for (uint32_t i = 0; i < hk_n; ++i) {
+                conn.send_payload_chunk_to_current_slot_non_blocking(hk_src[i], stick_size, i * stick_size);
+            }
+            conn.send_payload_flush_non_blocking_from_address((uint32_t)pkt_hdr_sc, sizeof(PACKET_HEADER_TYPE));
+        }
+        hk_n = 0;
+        hk_release();
+    };
+#ifdef HK_NP_ZERO_CB
+    // Tensor-edge W pad (is_padding_zeros): the W reader writes it; no CB page for it.
+    constexpr bool hk_zero_local = is_padding_zeros;
+    const uint32_t hk_zero_addr = 0;
+#else
+    constexpr bool hk_zero_local = false;
+    const uint32_t hk_zero_addr = 0;
+#endif
+    auto hk_add = [&](uint32_t src_l1_addr, uint64_t dst_noc_addr) {
+        hk_src[hk_n] = src_l1_addr;
+        hk_dst[hk_n] = dst_noc_addr;
+        hk_n++;
+        if (hk_n >= hk_k) {
+            hk_send();
+        }
+    };
+#endif
+
     // H writers: always open fabric at start (for data transfer in main loop).
     // W writers: open at start only when startup barrier is enabled (defer data transfer until CB ready).
     bool fabric_opened = false;
@@ -236,6 +322,7 @@ void kernel_main() {
             }
 
             // Wait for 1 barrier inc from each adjacent W device (if it exists)
+            HK_ZONE("HKW-BAR");
             uint32_t w_barrier_wait = (is_first_chip ? 0u : 1u) + (is_last_chip ? 0u : 1u);
             if (w_barrier_wait > 0) {
                 noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), w_barrier_wait);
@@ -269,6 +356,124 @@ void kernel_main() {
 #ifdef HK_W_FAST
     uint32_t hk_w_rows_sent = 0;
 #endif
+#ifdef HK_NP_SCATTER
+    auto hk_open = [&]() {
+        if constexpr (is_w_fabric_writer) {
+            if (!fabric_opened) {
+                fabric_connection.open();
+                fabric_opened = true;
+            }
+        }
+    };
+    auto process_one_row = [&]() {
+        if (is_first_chip && !hk_zero_local) {
+            uint32_t dst_stick_id = 0;
+            if (direction) {
+                dst_stick_id = (output_halo_dim_size - padding) * num_sticks_per_halo_dim + stick_start_id;
+            } else {
+                dst_stick_id = stick_start_id;
+            }
+            dst_stick_id += outer_dim_offset;
+            // !is_padding_zeros: one page per stick (replicate a slice of 1); else one zero page for the row.
+            uint32_t l1_read_addr = hk_zero_addr;
+            for (uint32_t iter = 0; iter < num_sticks_to_read; ++iter) {
+                if (!hk_zero_local && (!is_padding_zeros || iter == 0)) {
+                    l1_read_addr = hk_next_page();
+                    hk_open();
+                }
+                for (uint32_t pad_id = 0; pad_id < padding; pad_id++) {
+                    noc_obj.async_write(
+                        CoreLocalMem<uint8_t>(l1_read_addr),
+                        dst_accessor,
+                        stick_size,
+                        {},
+                        {.page_id = dst_stick_id + pad_id * num_sticks_per_halo_dim});
+                }
+                dst_stick_id++;
+                if (!is_padding_zeros && hk_n == 0) {
+                    hk_release();
+                }
+            }
+            if (!hk_zero_local && hk_n == 0) {
+                hk_release();
+            }
+        }
+
+        if (!is_last_chip) {
+            for (uint32_t pad_id = 0; pad_id < padding; pad_id++) {
+                uint32_t dst_stick_id = 0;
+                if (direction) {
+                    dst_stick_id =
+                        (output_halo_dim_size - (padding - pad_id)) * num_sticks_per_halo_dim + stick_start_id;
+                } else {
+                    dst_stick_id = pad_id * num_sticks_per_halo_dim + stick_start_id;
+                }
+                dst_stick_id += outer_dim_offset;
+                for (uint32_t iter = 0; iter < num_sticks_to_read; ++iter) {
+                    const uint32_t l1_read_addr = hk_next_page();
+                    hk_open();
+                    uint64_t dst_noc_addr;
+                    if constexpr (use_l1_intermediate && !is_w_fabric_writer) {
+                        bool is_corner =
+                            (iter < pad2_right_sticks) || (iter >= (num_sticks_to_read - pad2_left_sticks));
+                        if (is_corner) {
+                            // Corners land in the receiver core L1 next to its semaphore: send them as plain
+                            // unicast packets, which the EDM writes on the same VC as the semaphore increment
+                            // (its scatter writes use the default VC, so they could pass the increment).
+                            dst_noc_addr = safe_get_noc_addr(
+                                neighbor_sem_noc0_x, neighbor_sem_noc0_y, recv_buf_base + l1_buf_offset, 0);
+                            l1_buf_offset += stick_size;
+                            hk_send();
+                            hk_add(l1_read_addr, dst_noc_addr);
+                            hk_send();
+                            dst_stick_id++;
+                            continue;
+                        } else {
+                            dst_noc_addr = dst_accessor.get_noc_addr(dst_stick_id, 0, 0);
+                        }
+                    } else if constexpr (use_l1_intermediate) {
+                        dst_noc_addr = safe_get_noc_addr(
+                            neighbor_sem_noc0_x, neighbor_sem_noc0_y, recv_buf_base + l1_buf_offset, 0);
+                        l1_buf_offset += stick_size;
+                        hk_send();
+                        hk_add(l1_read_addr, dst_noc_addr);
+                        hk_send();
+                        dst_stick_id++;
+                        continue;
+                    } else {
+                        dst_noc_addr = dst_accessor.get_noc_addr(dst_stick_id, 0, 0);
+                    }
+                    hk_add(l1_read_addr, dst_noc_addr);
+                    dst_stick_id++;
+                }
+            }
+
+#ifdef HK_W_FAST
+            if constexpr (is_w_fabric_writer) {
+                hk_w_rows_sent++;  // packets may span rows; one cumulative semaphore inc at the end
+                return;
+            }
+#endif
+            hk_send();
+            uint64_t neighbor_sem_noc_addr_in_pkt =
+                safe_get_noc_addr(neighbor_sem_noc0_x, neighbor_sem_noc0_y, neighbor_sem, 0);
+            pkt_hdr_sem_inc->to_noc_unicast_atomic_inc(tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
+                neighbor_sem_noc_addr_in_pkt, static_cast<uint32_t>(1)});
+            if (direction) {
+                fabric_connection.get_backward_connection().wait_for_empty_write_slot();
+                ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr_sem_inc, unicast_route_info);
+                fabric_connection.get_backward_connection().send_payload_flush_blocking_from_address(
+                    (uint32_t)pkt_hdr_sem_inc, sizeof(PACKET_HEADER_TYPE));
+            } else {
+                fabric_connection.get_forward_connection().wait_for_empty_write_slot();
+                ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr_sem_inc, unicast_route_info);
+                fabric_connection.get_forward_connection().send_payload_flush_blocking_from_address(
+                    (uint32_t)pkt_hdr_sem_inc, sizeof(PACKET_HEADER_TYPE));
+            }
+            noc_obj.async_writes_flushed();
+        }
+    };  // end process_one_row (scatter)
+#else
     auto process_one_row = [&]() {
         if (is_first_chip) {
             if (!is_padding_zeros) {
@@ -435,9 +640,11 @@ void kernel_main() {
             noc_obj.async_writes_flushed();
         }
     };  // end process_one_row
+#endif
 
     if constexpr (!is_w_fabric_writer) {
         // H writer: sequential outer_dim loop (unchanged)
+        HK_ZONE("HKH-MAIN");
         for (uint32_t outer_dim = 0; outer_dim < outer_dim_size; outer_dim++) {
             process_one_row();
             // No local interior copy in this kernel. Dedicated local-copy kernels handle that work.
@@ -445,33 +652,48 @@ void kernel_main() {
         }
     } else {
         // W writer two-pass loop.
-        // Pass 1: interior rows (h_pad_top <= row < h_pad_top + h_in per T batch).
-        // CB is fed by W reader Phase 1 which reads from INPUT DRAM — no barrier needed.
-        for (uint32_t t = 0; t < w2_t_count; ++t) {
-            for (uint32_t h = 0; h < w2_h_in; ++h) {
-                // dst_row is the flat output row index for interior row h in T batch (w2_t_start + t)
-                uint32_t dst_row = (w2_t_start + t) * w2_h_out + w2_h_pad_top + h;
-                outer_dim_offset = dst_row * output_halo_dim_size;
-                process_one_row();
+        {
+            HK_ZONE("HKW-P1");
+            // Pass 1: interior rows (h_pad_top <= row < h_pad_top + h_in per T batch).
+            // CB is fed by W reader Phase 1 which reads from INPUT DRAM — no barrier needed.
+            for (uint32_t t = 0; t < w2_t_count; ++t) {
+                for (uint32_t h = 0; h < w2_h_in; ++h) {
+                    // dst_row is the flat output row index for interior row h in T batch (w2_t_start + t)
+                    uint32_t dst_row = (w2_t_start + t) * w2_h_out + w2_h_pad_top + h;
+                    outer_dim_offset = dst_row * output_halo_dim_size;
+                    process_one_row();
+                }
             }
+#ifdef HK_NP_SCATTER
+            hk_send();
+            hk_release();
+#endif
         }
-        // Pass 2: H-pad rows (corners). CB is fed by W reader Phase 2 after H barrier.
-        for (uint32_t t = 0; t < w2_t_count; ++t) {
-            // Top H-pad rows
-            for (uint32_t h = 0; h < w2_h_pad_top; ++h) {
-                uint32_t dst_row = (w2_t_start + t) * w2_h_out + h;
-                outer_dim_offset = dst_row * output_halo_dim_size;
-                process_one_row();
-            }
-            // Bottom H-pad rows
-            for (uint32_t h = 0; h < w2_h_pad_bot; ++h) {
-                uint32_t dst_row = (w2_t_start + t) * w2_h_out + w2_h_pad_top + w2_h_in + h;
-                outer_dim_offset = dst_row * output_halo_dim_size;
-                process_one_row();
+        {
+            HK_ZONE("HKW-P2");
+            // Pass 2: H-pad rows (corners). CB is fed by W reader Phase 2 after H barrier.
+            for (uint32_t t = 0; t < w2_t_count; ++t) {
+                // Top H-pad rows
+                for (uint32_t h = 0; h < w2_h_pad_top; ++h) {
+                    uint32_t dst_row = (w2_t_start + t) * w2_h_out + h;
+                    outer_dim_offset = dst_row * output_halo_dim_size;
+                    process_one_row();
+                }
+                // Bottom H-pad rows
+                for (uint32_t h = 0; h < w2_h_pad_bot; ++h) {
+                    uint32_t dst_row = (w2_t_start + t) * w2_h_out + w2_h_pad_top + w2_h_in + h;
+                    outer_dim_offset = dst_row * output_halo_dim_size;
+                    process_one_row();
+                }
             }
         }
     }
 
+    HK_ZONE("HKW-TAIL");
+#ifdef HK_NP_SCATTER
+    hk_send();
+    hk_release();
+#endif
 #ifdef HK_W_FAST
     if constexpr (is_w_fabric_writer) {
         if (hk_w_rows_sent > 0) {

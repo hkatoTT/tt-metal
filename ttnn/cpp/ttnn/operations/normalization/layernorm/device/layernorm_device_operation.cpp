@@ -58,6 +58,28 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
     const auto& gamma = tensor_args.weight;
     const auto& beta = tensor_args.bias;
     const auto& stats = tensor_args.stats;
+    const auto& out_pad = operation_attributes.output_pad;
+    if (out_pad[0] != 0 || out_pad[1] != 0 || out_pad[2] != 0) {
+        TT_FATAL(tensor_args.output_tensor.has_value(), "output_pad needs a preallocated output_tensor");
+        TT_FATAL(
+            a.layout() == Layout::ROW_MAJOR && !a.is_sharded() &&
+                operation_attributes.distributed_norm_stage == DistributedLayerNormStage::NOT_DISTRIBUTED &&
+                a.logical_shape().rank() >= 4,
+            "output_pad supports row-major interleaved inputs of rank >= 4 only");
+        const auto& out = tensor_args.output_tensor.value();
+        TT_FATAL(
+            out.layout() == Layout::ROW_MAJOR && !out.is_sharded(), "output_pad needs a row-major interleaved output");
+        TT_FATAL(out.dtype() == a.dtype(), "output_pad output dtype must match the input");
+        auto expected = a.logical_shape();
+        expected[-4] += out_pad[0];
+        expected[-3] += 2 * out_pad[1];
+        expected[-2] += 2 * out_pad[2];
+        TT_FATAL(
+            out.logical_shape() == expected,
+            "output_pad output shape {} must be the padded input shape {}",
+            out.logical_shape(),
+            expected);
+    }
     const uint32_t tile_height = a.tensor_spec().tile().get_height();
     const uint32_t tile_width = a.tensor_spec().tile().get_width();
     TT_FATAL(
@@ -483,6 +505,9 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
 
 tt::tt_metal::TensorSpec LayerNormDeviceOperation::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    if (tensor_args.output_tensor.has_value()) {
+        return tensor_args.output_tensor->tensor_spec();
+    }
     const auto& input_tensor = tensor_args.input;
     auto output_shape = input_tensor.logical_shape();
     auto output_padded_shape = input_tensor.padded_shape();
@@ -549,6 +574,9 @@ tt::tt_metal::TensorSpec LayerNormDeviceOperation::compute_output_specs(
 
 Tensor LayerNormDeviceOperation::create_output_tensors(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    if (tensor_args.output_tensor.has_value()) {
+        return tensor_args.output_tensor.value();
+    }
     return std::visit(
         [&](const auto& program_config) -> tensor_return_value_t {
             using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -578,7 +606,9 @@ Tensor layer_norm(
     DistributedLayerNormStage distributed_norm_stage,
     const std::optional<const Tensor>& stats,
     const std::optional<const Tensor>& recip_tensor,
-    const std::optional<operations::unary::UnaryWithParam>& fused_activation) {
+    const std::optional<operations::unary::UnaryWithParam>& fused_activation,
+    const std::optional<Tensor>& output_tensor,
+    std::array<uint32_t, 3> output_pad) {
     auto operation_attributes = LayerNormParams{
         .norm_type = norm_type,
         .distributed_norm_stage = distributed_norm_stage,
@@ -587,7 +617,8 @@ Tensor layer_norm(
         .program_config = program_config,
         .compute_kernel_config = compute_kernel_config,
         .dtype = dtype,
-        .fused_activation = fused_activation};
+        .fused_activation = fused_activation,
+        .output_pad = output_pad};
     auto tensor_args = LayerNormInputs{
         .input = input_tensor,
         .residual_input_tensor = residual_input_tensor,
@@ -595,6 +626,7 @@ Tensor layer_norm(
         .bias = bias,
         .stats = stats,
         .recip_tensor = recip_tensor,
+        .output_tensor = output_tensor,
     };
 
     return ttnn::device_operation::launch<LayerNormDeviceOperation>(operation_attributes, tensor_args);

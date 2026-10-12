@@ -581,6 +581,39 @@ class CCLManager:
         self._ping_pong_buffer_indices[cache_key] = 1 - cur
         return self._ping_pong_buffer_cache[cache_key][cur]
 
+    def neighbor_pad_in_place(
+        self,
+        padded: ttnn.Tensor,
+        /,
+        *,
+        dims: list,
+        pad_left: list,
+        pad_right: list,
+        axes: list,
+        neighbor_sems: list,
+        num_links: list,
+        t_front_pad: int = 0,
+        front_tensor: ttnn.Tensor | None = None,
+    ) -> ttnn.Tensor:
+        """Neighbor pad of a tensor whose interior was already written into the padded buffer `padded` (e.g. by
+        RMSNorm with output_pad): fills the halos, borders and front frames only, no interior copy."""
+        return ttnn.experimental.neighbor_pad_async(
+            padded,
+            dims,
+            pad_left,
+            pad_right,
+            "zeros",
+            axes,
+            neighbor_sems,
+            [self.get_barrier_semaphore(axes[0])],
+            num_links=num_links,
+            topology=ttnn.Topology.Linear,
+            persistent_output_buffer=padded,
+            t_front_pad=t_front_pad,
+            front_tensor=front_tensor,
+            interior_in_place=True,
+        )
+
     def neighbor_pad_halo_only(
         self,
         tensor: ttnn.Tensor,

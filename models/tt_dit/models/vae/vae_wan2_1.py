@@ -58,6 +58,9 @@ _RM_RESID = os.environ.get("WAN_VAE_RM_RESID", "1") == "1"
 # Drops the cache concat (a copy of every chunk input) and the unpadded cache slices. WAN_VAE_NP_CACHE=0 restores
 # the concat path.
 _NP_CACHE = os.environ.get("WAN_VAE_NP_CACHE", "1") == "1"
+# EXPERIMENT (hkato): a row-major RMSNorm in front of a padded-cache conv writes straight into the interior of the
+# neighbor-pad buffer, and neighbor pad then fills only halos, borders and front frames (no interior copy).
+_NP_NORM = os.environ.get("WAN_VAE_NP_NORM", "1") != "0"
 # Mid-block attention: devices holding the same frame no longer all compute every query of it. With the frames
 # split over the W axis, each H device computes only its own H rows (queries partitioned over the H axis, keys and
 # values whole), so the output is already H-sharded (no H re-partition, a 4x smaller W gather); a single frame
@@ -467,6 +470,51 @@ class WanCausalConv3d(Module):
             t_front_pad=CACHE_T,
             front_tensor=padded_cache_BTHWC,
         )
+        return self._conv_padded(padded)
+
+    def forward_np_cache_norm(
+        self,
+        x_BTHWC: ttnn.Tensor,
+        norm,
+        norm_compute_kernel_config,
+        logical_h: int,
+        padded_cache_BTHWC: ttnn.Tensor | None,
+        logical_w: int = 0,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """norm(x) followed by forward_np_cache, the row-major norm output written straight into the interior of
+        the padded neighbor-pad buffer (see _NP_NORM)."""
+        hf = self.parallel_config.height_parallel.factor
+        wf = self.parallel_config.width_parallel.factor
+        assert x_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT
+        assert x_BTHWC.shape[2] * hf <= logical_h, "padded cache path has no row mask"
+        assert logical_w == 0 or x_BTHWC.shape[3] * wf <= logical_w, "padded cache path has no column mask"
+        h_axis = self.parallel_config.height_parallel.mesh_axis
+        w_axis = self.parallel_config.width_parallel.mesh_axis
+        ph, pw = self.external_padding[1], self.external_padding[2]
+        buf = self.ccl_manager.get_np_ping_pong_buffer(
+            x_BTHWC.shape, [2, 3], [ph, pw], [ph, pw], dtype=x_BTHWC.get_dtype(), t_front_pad=CACHE_T
+        )
+        norm(x_BTHWC, compute_kernel_config=norm_compute_kernel_config, output_tensor=buf, output_pad=(CACHE_T, ph, pw))
+        padded = self.ccl_manager.neighbor_pad_in_place(
+            buf,
+            dims=[2, 3],
+            pad_left=[ph, pw],
+            pad_right=[ph, pw],
+            axes=[h_axis, w_axis],
+            neighbor_sems=[
+                self.ccl_manager.get_np_ping_pong_semaphore(h_axis),
+                self.ccl_manager.get_np_ping_pong_semaphore(w_axis),
+            ],
+            num_links=[
+                get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 2, h_axis),
+                get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 3, w_axis),
+            ],
+            t_front_pad=CACHE_T,
+            front_tensor=padded_cache_BTHWC,
+        )
+        return self._conv_padded(padded)
+
+    def _conv_padded(self, padded: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         next_cache_BTHWC = padded[:, -CACHE_T:, :, :, :]
         out_BTHWC = ttnn.experimental.conv3d(
             input_tensor=padded,
@@ -736,11 +784,21 @@ class WanResidualBlock(Module):
             if self.conv_shortcut is not None
             else x_BTHWC
         )
-        x_norm_silu_tile_BTHWC = self.norm1(x_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
-        x_BTHWC = x_norm_silu_tile_BTHWC if row_major else ttnn.to_layout(x_norm_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+        fuse_norm1 = _NP_NORM and row_major and feat_cache is not None and self.conv1.np_cache
+        if not fuse_norm1:
+            x_norm_silu_tile_BTHWC = self.norm1(x_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
+            x_BTHWC = (
+                x_norm_silu_tile_BTHWC if row_major else ttnn.to_layout(x_norm_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+            )
 
         # Cached conv
-        if feat_cache is not None and self.conv1.np_cache:
+        if fuse_norm1:
+            idx = feat_idx[0]
+            x_conv_BTHWC, feat_cache[idx] = self.conv1.forward_np_cache_norm(
+                x_BTHWC, self.norm1, self.norm_compute_kernel_config, logical_h, feat_cache[idx], logical_w=logical_w
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None and self.conv1.np_cache:
             idx = feat_idx[0]
             x_conv_BTHWC, feat_cache[idx] = self.conv1.forward_np_cache(
                 x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w
@@ -762,10 +820,23 @@ class WanResidualBlock(Module):
         else:
             x_conv_BTHWC = self.conv1(x_BTHWC, logical_h, logical_w=logical_w)
 
-        x_BTHWC = self.norm2(x_conv_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
+        fuse_norm2 = _NP_NORM and feat_cache is not None and self.conv2.np_cache
+        if not fuse_norm2:
+            x_BTHWC = self.norm2(x_conv_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
 
         # Cached conv
-        if feat_cache is not None and self.conv2.np_cache:
+        if fuse_norm2:
+            idx = feat_idx[0]
+            x_conv_BTHWC, feat_cache[idx] = self.conv2.forward_np_cache_norm(
+                x_conv_BTHWC,
+                self.norm2,
+                self.norm_compute_kernel_config,
+                logical_h,
+                feat_cache[idx],
+                logical_w=logical_w,
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None and self.conv2.np_cache:
             idx = feat_idx[0]
             x_conv_BTHWC, feat_cache[idx] = self.conv2.forward_np_cache(
                 x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w
@@ -1532,12 +1603,22 @@ class WanDecoder3d(Module):
             x_BTHWC, logical_h, logical_w = up_block(x_BTHWC, logical_h, feat_cache, feat_idx, logical_w=logical_w)
 
         ## head
-        x_norm_tile_BTHWC = self.norm_out(x_BTHWC)
-        if x_norm_tile_BTHWC.layout != ttnn.ROW_MAJOR_LAYOUT:
-            x_norm_tile_BTHWC = ttnn.to_layout(x_norm_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
-        x_BTHWC = x_norm_tile_BTHWC
+        fuse_norm_out = (
+            _NP_NORM and feat_cache is not None and self.conv_out.np_cache and x_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT
+        )
+        if not fuse_norm_out:
+            x_norm_tile_BTHWC = self.norm_out(x_BTHWC)
+            if x_norm_tile_BTHWC.layout != ttnn.ROW_MAJOR_LAYOUT:
+                x_norm_tile_BTHWC = ttnn.to_layout(x_norm_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+            x_BTHWC = x_norm_tile_BTHWC
 
-        if feat_cache is not None and self.conv_out.np_cache:
+        if fuse_norm_out:
+            idx = feat_idx[0]
+            x_BTHWC, feat_cache[idx] = self.conv_out.forward_np_cache_norm(
+                x_BTHWC, self.norm_out, None, logical_h, feat_cache[idx], logical_w=logical_w
+            )
+            feat_idx[0] += 1
+        elif feat_cache is not None and self.conv_out.np_cache:
             idx = feat_idx[0]
             x_BTHWC, feat_cache[idx] = self.conv_out.forward_np_cache(
                 x_BTHWC, logical_h, feat_cache[idx], logical_w=logical_w

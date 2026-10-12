@@ -367,6 +367,19 @@ struct WorkerToFabricEdmSenderBase {
         post_send_payload_increment_pointers(noc);
     }
 
+    // Writes one payload chunk at payload_offset_bytes of the current slot; does not advance the slot.
+    // Follow with send_payload_flush_non_blocking_from_address(header) to publish the packet.
+    template <bool posted = false>
+    FORCE_INLINE void send_payload_chunk_to_current_slot_non_blocking(
+        uint32_t source_address,
+        size_t size_bytes,
+        uint32_t payload_offset_bytes,
+        uint8_t noc = get_fabric_worker_noc()) {
+        const uint64_t buffer_address = this->compute_dest_buffer_slot_noc_addr(noc);
+        send_chunk_from_address<EDM_IO_BLOCKING_MODE::NON_BLOCKING, posted>(
+            source_address, 1, size_bytes, buffer_address + sizeof(PACKET_HEADER_TYPE) + payload_offset_bytes, noc);
+    }
+
     template <bool posted = false>
     FORCE_INLINE void setup_stateful_send_cmd_bufs(uint8_t noc = get_fabric_worker_noc()) const {
         // In DM_DYNAMIC_NOC, write and write_reg traffic on a worker RISC alias to the same physical cmd buf.

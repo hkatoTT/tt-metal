@@ -27,6 +27,7 @@ ttnn::Tensor neighbor_pad_async(
     const std::optional<ttnn::Tensor>& persistent_output_buffer = std::nullopt,
     uint32_t logical_h = 0,
     uint32_t t_front_pad = 0,
-    const std::optional<ttnn::Tensor>& front_tensor = std::nullopt);
+    const std::optional<ttnn::Tensor>& front_tensor = std::nullopt,
+    bool interior_in_place = false);
 
 }  // namespace ttnn::experimental

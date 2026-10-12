@@ -19,7 +19,14 @@ ttnn::Tensor dit_rms_norm_unary_fused(
     const std::optional<MemoryConfig>& memory_config,
     const std::optional<const ttnn::prim::LayerNormProgramConfig>& program_config,
     std::optional<const ttnn::DeviceComputeKernelConfig> compute_kernel_config,
-    const std::optional<ttnn::operations::unary::UnaryWithParam>& activation) {
+    const std::optional<ttnn::operations::unary::UnaryWithParam>& activation,
+    const std::optional<ttnn::Tensor>& output_tensor,
+    const std::optional<std::vector<uint32_t>>& output_pad) {
+    std::array<uint32_t, 3> pad = {0, 0, 0};
+    if (output_pad.has_value()) {
+        TT_FATAL(output_pad->size() == 3, "output_pad must be (t_front, h, w)");
+        pad = {(*output_pad)[0], (*output_pad)[1], (*output_pad)[2]};
+    }
     auto output_memory_config = memory_config.value_or(input_tensor.memory_config());
 
     auto rank = input_tensor.logical_shape().size();
@@ -57,7 +64,9 @@ ttnn::Tensor dit_rms_norm_unary_fused(
         ttnn::prim::DistributedLayerNormStage::NOT_DISTRIBUTED,
         std::nullopt,  // stats
         std::nullopt,  // recip_tensor
-        activation);
+        activation,
+        output_tensor,
+        pad);
 }
 
 }  // namespace ttnn::experimental

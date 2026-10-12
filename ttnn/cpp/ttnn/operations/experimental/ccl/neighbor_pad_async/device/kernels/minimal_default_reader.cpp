@@ -8,6 +8,7 @@
 #include "api/dataflow/noc_semaphore.h"
 #include <cstdint>
 #include "api/tensor/noc_traits.h"
+#include "hk_rd_batch.hpp"
 
 using address_t = uint32_t;
 
@@ -21,12 +22,6 @@ constexpr uint32_t ct_after_src = src_ct_args.next_compile_time_args_offset();
 // L1 intermediate config
 constexpr bool use_l1_intermediate = get_compile_time_arg_val(ct_after_src);
 constexpr uint32_t recv_cb_id = get_compile_time_arg_val(ct_after_src + 1);
-
-template <uint32_t stick_size_bytes>
-inline void zeroPad(Noc& noc, CircularBuffer& cb_output) {
-    noc.async_write_zeros(cb_output, stick_size_bytes);
-    noc.write_zeros_l1_barrier();
-}
 
 void kernel_main() {
     ///////////////////////////////////////////////////
@@ -52,6 +47,10 @@ void kernel_main() {
     const bool is_first_chip = get_arg_val<uint32_t>(arg_idx++);
     const bool is_last_chip = get_arg_val<uint32_t>(arg_idx++);
     const bool direction = get_arg_val<uint32_t>(arg_idx++);
+    // Input stick addressing (the plain input, or the interior of the padded output when in place).
+    const uint32_t in_row_stride = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t in_t_stride = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t in_offset_start = get_arg_val<uint32_t>(arg_idx++);
 
     uint32_t read_size = stick_size;
     const auto src_accessor = TensorAccessor(src_ct_args, input_tensor_address);
@@ -59,34 +58,29 @@ void kernel_main() {
     Noc noc_obj;
     CircularBuffer cb_output(cb_output_id);
     CircularBuffer cb_recv(recv_cb_id);
+    HkRdBatch rb{cb_output_id};
 
-    uint32_t outer_dim_offset = outer_dim_offset_start_id;
+    (void)outer_dim_offset_start_id;
+    uint32_t outer_dim_offset = in_offset_start;
     for (uint32_t outer_dim = 0; outer_dim < outer_dim_size; outer_dim++) {
         if (is_first_chip) {
             if (!is_padding_zeros) {
                 // Replicate a slice of 1 from input to output
                 uint32_t src_stick_id = 0;
                 if (direction) {
-                    src_stick_id = num_sticks_per_halo_dim * (input_halo_dim_size - 1) + stick_start_id;
+                    src_stick_id = in_row_stride * (input_halo_dim_size - 1) + stick_start_id;
                 } else {
                     src_stick_id = stick_start_id;
                 }
                 src_stick_id += outer_dim_offset;
                 for (uint32_t iter = 0; iter < num_sticks_to_read; ++iter) {
-                    cb_output.reserve_back(1);
-
-                    noc_obj.async_read(src_accessor, cb_output, read_size, {.page_id = src_stick_id}, {});
-
+                    noc_async_read(src_accessor.get_noc_addr(src_stick_id), rb.next(), read_size);
                     src_stick_id++;
-
-                    noc_obj.async_read_barrier();
-                    cb_output.push_back(1);
+                    rb.done_one();
                 }
             } else {
-                cb_output.reserve_back(1);
-                zeroPad<stick_size>(noc_obj, cb_output);
-                noc_obj.async_read_barrier();
-                cb_output.push_back(1);
+                hk_zero_stick<stick_size>(noc_obj, rb.next());
+                rb.done_one();
             }
         }
 
@@ -95,28 +89,25 @@ void kernel_main() {
             for (uint32_t pad_id = padding; pad_id > 0; pad_id--) {
                 uint32_t src_stick_id = 0;
                 if (direction) {
-                    src_stick_id = (padding - pad_id) * num_sticks_per_halo_dim + stick_start_id;
+                    src_stick_id = (padding - pad_id) * in_row_stride + stick_start_id;
                 } else {
-                    src_stick_id = (input_halo_dim_size - pad_id) * num_sticks_per_halo_dim + stick_start_id;
+                    src_stick_id = (input_halo_dim_size - pad_id) * in_row_stride + stick_start_id;
                 }
                 src_stick_id += outer_dim_offset;
                 for (uint32_t iter = 0; iter < num_sticks_to_read; ++iter) {
-                    cb_output.reserve_back(1);
-
-                    noc_obj.async_read(src_accessor, cb_output, read_size, {.page_id = src_stick_id}, {});
-
+                    noc_async_read(src_accessor.get_noc_addr(src_stick_id), rb.next(), read_size);
                     src_stick_id++;
-
-                    noc_obj.async_read_barrier();
-                    cb_output.push_back(1);
+                    rb.done_one();
                 }
             }
         }
 
         // No local interior copy in this kernel. Dedicated local-copy kernels handle that work.
 
-        outer_dim_offset += (num_sticks_per_halo_dim * input_halo_dim_size);
+        outer_dim_offset += in_t_stride;
     }
+
+    rb.flush();
 
     // Incoming H halo data from neighbor
     if (!is_first_chip) {

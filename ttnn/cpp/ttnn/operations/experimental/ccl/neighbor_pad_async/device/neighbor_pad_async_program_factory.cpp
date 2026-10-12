@@ -162,7 +162,15 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
     Program program{};
 
     // Tensor Info
-    const auto& input_tensor_shape = tensor_args.input_tensor.padded_shape();
+    // In-place interior: the input is the padded output itself; the work is sized by the interior dims.
+    ttnn::Shape input_tensor_shape = tensor_args.input_tensor.padded_shape();
+    if (operation_attributes.interior_in_place) {
+        input_tensor_shape[operation_attributes.dim] -=
+            operation_attributes.padding_left + operation_attributes.padding_right;
+        input_tensor_shape[operation_attributes.pad_dim2.value()] -=
+            operation_attributes.pad2_left + operation_attributes.pad2_right;
+        input_tensor_shape[operation_attributes.dim - 1] -= operation_attributes.t_front_pad;
+    }
     const auto& output_tensor_shape = tensor_return_value.padded_shape();
     Buffer* input_buffer = tensor_args.input_tensor.buffer();
     Buffer* output_buffer = tensor_return_value.buffer();
@@ -245,6 +253,16 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
     const uint32_t t_front_pad = operation_attributes.t_front_pad;
     // Offset (in sticks) added to all output write addresses so input data lands at T>=t_front_pad
     const uint32_t t_front_pad_stick_offset = t_front_pad * output_halo_dim_size * output_num_sticks_per_halo_dim;
+    // Input stick (t, h, w) = in_base + t * in_t_stride + h * in_row_stride + w: the plain input, or the interior of
+    // the padded output (interior_in_place).
+    const bool in_place = operation_attributes.interior_in_place;
+    const uint32_t in_row_stride = in_place ? output_num_sticks_per_halo_dim : num_sticks_per_halo_dim;
+    const uint32_t in_t_stride = in_place ? output_halo_dim_size * output_num_sticks_per_halo_dim
+                                          : input_halo_dim_size * num_sticks_per_halo_dim;
+    const uint32_t in_base = in_place ? t_front_pad_stick_offset +
+                                            operation_attributes.padding_left * output_num_sticks_per_halo_dim +
+                                            operation_attributes.pad2_left
+                                      : 0u;
 
     // Get worker cores
     constexpr uint32_t MAX_PAD2_NUM_LINKS = 4;  // kernel arrays sized for pad2_num_links * 2 = 8 targets
@@ -313,7 +331,24 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
     CircularBufferConfig cb_sender_config =
         CircularBufferConfig(cb_num_pages * l1_scratch_cb_page_size_bytes, {{sender_cb_index, df}})
             .set_page_size(sender_cb_index, l1_scratch_cb_page_size_bytes);
-    CreateCircularBuffer(program, worker_core_ranges, cb_sender_config);
+    // EXPERIMENT (hkato): TT_NP_RD_BATCH=<B> -> the H/W fabric readers stage up to B sticks per NoC read
+    // barrier; their sender CB holds 2*B sticks.
+    uint32_t hk_rd_batch = 8;
+    if (const char* e = std::getenv("TT_NP_RD_BATCH"); e != nullptr) {
+        hk_rd_batch = static_cast<uint32_t>(std::max(1, std::atoi(e)));
+    }
+    // EXPERIMENT (hkato): TT_NP_SCATTER=<K> -> the H/W fabric writers pack up to K sticks per fabric packet and hold
+    // CB pages until the packet is out.
+    uint32_t hk_np_scatter = 4;
+    if (const char* e = std::getenv("TT_NP_SCATTER"); e != nullptr) {
+        hk_np_scatter = std::atoi(e) > 1 ? static_cast<uint32_t>(std::atoi(e)) : 0u;
+    }
+    const uint32_t hk_fabric_cb_pages =
+        std::max({cb_num_pages, 2 * hk_rd_batch, hk_np_scatter > 0 ? 2 * hk_rd_batch + 4 * hk_np_scatter + 2 : 0u});
+    CircularBufferConfig cb_fabric_sender_config =
+        CircularBufferConfig(hk_fabric_cb_pages * l1_scratch_cb_page_size_bytes, {{sender_cb_index, df}})
+            .set_page_size(sender_cb_index, l1_scratch_cb_page_size_bytes);
+    CreateCircularBuffer(program, worker_core_ranges, cb_fabric_sender_config);
 
     // L1 receive buffer for 2D padding: fabric-delivered H halo corner sticks arrive here.
     // Corners-only optimization: only W-boundary sticks (pad2_left + pad2_right per row) go
@@ -406,7 +441,15 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
         // This simplifies per-row type detection in kernels (no partial-T-batch edge cases).
 
         // CB and recv buffer on W fabric cores
-        CreateCircularBuffer(program, w_fabric_core_range, cb_sender_config);
+        CreateCircularBuffer(program, w_fabric_core_range, cb_fabric_sender_config);
+        if (hk_np_scatter > 0) {
+            // private zero stick for the W writer's tensor-edge pad (EXPERIMENT, hkato)
+            CreateCircularBuffer(
+                program,
+                w_fabric_core_range,
+                CircularBufferConfig(l1_scratch_cb_page_size_bytes, {{tt::CB::c_in2, df}})
+                    .set_page_size(tt::CB::c_in2, l1_scratch_cb_page_size_bytes));
+        }
 
         // W recv: no L1 recv buffer needed. The W writer sends padding sticks directly to
         // the neighbor's output DRAM (same pattern as 1D H). The W reader just waits for
@@ -444,6 +487,7 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
     TensorAccessorArgs(*input_buffer).append_to(h_reader_kernel_config.compile_args);
     h_reader_kernel_config.compile_args.push_back(is_2d ? 1 : 0);              // use_l1_intermediate
     h_reader_kernel_config.compile_args.push_back(is_2d ? recv_cb_index : 0);  // recv_cb_id
+    h_reader_kernel_config.defines["HK_NP_RD_BATCH"] = std::to_string(hk_rd_batch);
     auto h_reader_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
@@ -467,6 +511,13 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
     h_writer_kernel_config.compile_args.push_back(is_2d ? 1 : 0);                   // handle_incoming_writes
     h_writer_kernel_config.compile_args.push_back(0);                               // is_w_fabric_writer (false for H)
     h_writer_kernel_config.compile_args.push_back(operation_attributes.ring_size);  // ring_size
+    if (hk_np_scatter > 0) {
+        h_writer_kernel_config.defines["HK_NP_SCATTER"] = std::to_string(hk_np_scatter);
+    }
+    const bool hk_np_zones = std::getenv("TT_NP_ZONES") != nullptr;  // TIMING ONLY (hkato)
+    if (hk_np_zones) {
+        h_writer_kernel_config.defines["HK_NP_ZONES"] = "1";
+    }
     auto h_writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
@@ -514,6 +565,13 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
             reader_rt_args.push_back(direction ? is_last_device : is_first_device);  // is_first_chip
             reader_rt_args.push_back(direction ? is_first_device : is_last_device);  // is_last_chip
             reader_rt_args.push_back(direction);                                     // direction
+            // Input addressing: row stride, T stride, offset of this link's first T frame.
+            reader_rt_args.push_back(operation_attributes.dim > 0 ? in_row_stride : num_sticks_per_halo_dim);
+            reader_rt_args.push_back(
+                operation_attributes.dim > 0 ? in_t_stride : num_sticks_per_halo_dim * input_halo_dim_size);
+            reader_rt_args.push_back(
+                operation_attributes.dim > 0 ? in_base + (link_offset_start_id / num_sticks_per_halo_dim) * in_t_stride
+                                             : outer_dim_size - 1);
             SetRuntimeArgs(program, h_reader_kernel_id, {core}, reader_rt_args);
 
             // For 2D case, H fabric writer uses output row width and W offset
@@ -689,8 +747,10 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
             // Distribute work evenly across local-copy cores and set per-core runtime args
             std::vector<CoreCoord> local_cores = corerange_to_cores(local_copy_cores, std::nullopt, /*row_wise=*/true);
             const uint32_t num_local_cores = local_cores.size();
-            const uint32_t total_units =
-                (operation_attributes.dim > 0) ? (outer_dim_size * input_halo_dim_size) : input_halo_dim_size;
+            // In-place interior: nothing to copy (the front frames of Phase A still are).
+            const uint32_t total_units = operation_attributes.interior_in_place ? 0u
+                                         : (operation_attributes.dim > 0)       ? (outer_dim_size * input_halo_dim_size)
+                                                                                : input_halo_dim_size;
             const uint32_t base = (num_local_cores == 0) ? 0 : (total_units / num_local_cores);
             const uint32_t rem = (num_local_cores == 0) ? 0 : (total_units % num_local_cores);
 
@@ -777,6 +837,14 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
             page_size};        // stick_size
         TensorAccessorArgs(*output_buffer).append_to(w_reader_kernel_config.compile_args);
         TensorAccessorArgs(*input_buffer).append_to(w_reader_kernel_config.compile_args);
+        w_reader_kernel_config.defines["HK_NP_RD_BATCH"] = std::to_string(hk_rd_batch);
+        if (hk_np_scatter > 0) {
+            w_reader_kernel_config.defines["HK_NP_ZERO_LOCAL"] = "1";
+            w_reader_kernel_config.defines["HK_NP_ZERO_CB"] = std::to_string(static_cast<uint32_t>(tt::CB::c_in2));
+        }
+        if (std::getenv("TT_NP_ZONES") != nullptr) {
+            w_reader_kernel_config.defines["HK_NP_ZONES"] = "1";
+        }
         w_reader_kernel_id = CreateKernel(
             program,
             "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
@@ -805,6 +873,13 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
         w_writer_kernel_config.compile_args.push_back(w_ring_size);  // ring_size
         if (const char* e = std::getenv("TT_NP_W_FAST"); e != nullptr && std::string(e) == "1") {
             w_writer_kernel_config.defines["HK_W_FAST"] = "1";  // EXPERIMENT (hkato)
+        }
+        if (hk_np_scatter > 0) {
+            w_writer_kernel_config.defines["HK_NP_SCATTER"] = std::to_string(hk_np_scatter);
+            w_writer_kernel_config.defines["HK_NP_ZERO_CB"] = std::to_string(static_cast<uint32_t>(tt::CB::c_in2));
+        }
+        if (hk_np_zones) {
+            w_writer_kernel_config.defines["HK_NP_ZONES"] = "1";
         }
         w_writer_kernel_id = CreateKernel(
             program,
@@ -863,7 +938,10 @@ NeighborPadAsyncMeshWorkloadFactory::cached_program_t NeighborPadAsyncMeshWorklo
                     operation_attributes.padding_right,                  // h_pad_bot
                     t_front_pad,                                         // t_front_pad
                     operation_attributes.logical_h,                      // logical_h (0 = no masking)
-                    w_reader_device_h_offset};                           // device_h_offset = device_index * h_in
+                    w_reader_device_h_offset,                            // device_h_offset = device_index * h_in
+                    in_row_stride,                                       // input row stride
+                    in_t_stride,                                         // input T stride
+                    in_base};                                            // input interior offset
                 SetRuntimeArgs(program, w_reader_kernel_id, {w_core}, w_reader_rt_args);
 
                 // W writer runtime args (addresses in CRTAs, not here)

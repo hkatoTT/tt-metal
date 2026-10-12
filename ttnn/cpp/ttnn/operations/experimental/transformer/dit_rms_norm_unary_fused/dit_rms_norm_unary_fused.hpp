@@ -4,6 +4,7 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/types.hpp"
@@ -26,6 +27,8 @@ ttnn::Tensor dit_rms_norm_unary_fused(
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     const std::optional<const ttnn::prim::LayerNormProgramConfig>& program_config = std::nullopt,
     std::optional<const ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
-    const std::optional<ttnn::operations::unary::UnaryWithParam>& activation = std::nullopt);
+    const std::optional<ttnn::operations::unary::UnaryWithParam>& activation = std::nullopt,
+    const std::optional<ttnn::Tensor>& output_tensor = std::nullopt,
+    const std::optional<std::vector<uint32_t>>& output_pad = std::nullopt);
 
 }  // namespace ttnn::experimental

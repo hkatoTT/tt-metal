@@ -49,6 +49,12 @@ if TYPE_CHECKING:
 CACHE_T = 2
 
 
+# Keep the residual stream of the residual blocks without a 1x1 shortcut row major (RMSNorm and the residual add
+# read row major directly, bit-identical): drops the untilize after norm1 and the tilize before the residual add of
+# every such block, and the layout round trip after the upsamplers. WAN_VAE_RM_RESID=0 restores the tiled stream.
+_RM_RESID = os.environ.get("WAN_VAE_RM_RESID", "1") == "1"
+
+
 def _get_w_mask(cache, x_BTHWC, logical_w, parallel_config, mesh_device, dtype):
     """
     Return a cached mask that zeros width-padding columns beyond logical_w.
@@ -614,14 +620,20 @@ class WanResidualBlock(Module):
         feat_idx: list[int] = [0],
         logical_w: int = 0,
     ) -> ttnn.Tensor:
-        assert x_BTHWC.layout == ttnn.TILE_LAYOUT, f"WanResidualBlock expects TILE input, got {x_BTHWC.layout}"
+        row_major = x_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT
+        if row_major and self.conv_shortcut is not None:
+            x_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
+            row_major = False
+        assert (
+            row_major or x_BTHWC.layout == ttnn.TILE_LAYOUT
+        ), f"WanResidualBlock expects TILE or ROW_MAJOR input, got {x_BTHWC.layout}"
         h_tile_BTHWC = (
             self.conv_shortcut(x_BTHWC, compute_kernel_config=self.matmul_compute_kernel_config)
             if self.conv_shortcut is not None
             else x_BTHWC
         )
         x_norm_silu_tile_BTHWC = self.norm1(x_BTHWC, compute_kernel_config=self.norm_compute_kernel_config)
-        x_BTHWC = ttnn.to_layout(x_norm_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+        x_BTHWC = x_norm_silu_tile_BTHWC if row_major else ttnn.to_layout(x_norm_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
 
         # Cached conv
         if feat_cache is not None:
@@ -660,6 +672,8 @@ class WanResidualBlock(Module):
             x_conv_BTHWC = self.conv2(x_BTHWC, logical_h, logical_w=logical_w)
 
         # Add residual
+        if row_major:
+            return ttnn.add(h_tile_BTHWC, x_conv_BTHWC)
         x_tile_BTHWC = ttnn.to_layout(x_conv_BTHWC, ttnn.TILE_LAYOUT)
         x_tile_BTHWC = ttnn.add(h_tile_BTHWC, x_tile_BTHWC)
         return x_tile_BTHWC
@@ -1206,7 +1220,8 @@ class WanUpBlock(Module):
             x_res_BTHWC = resnet(x_BTHWC, logical_h, feat_cache, feat_idx, logical_w=logical_w)
             x_BTHWC = x_res_BTHWC
         if self.upsamplers is not None:
-            x_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+            if x_BTHWC.layout != ttnn.ROW_MAJOR_LAYOUT:
+                x_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
             x_upsampled_BTHWC, logical_h, logical_w = self.upsamplers(
                 x_BTHWC,
                 logical_h,
@@ -1214,7 +1229,7 @@ class WanUpBlock(Module):
                 feat_idx,
                 logical_w=logical_w,
             )
-            x_BTHWC = ttnn.to_layout(x_upsampled_BTHWC, ttnn.TILE_LAYOUT)
+            x_BTHWC = x_upsampled_BTHWC if _RM_RESID else ttnn.to_layout(x_upsampled_BTHWC, ttnn.TILE_LAYOUT)
         return x_BTHWC, logical_h, logical_w
 
 
@@ -1396,7 +1411,9 @@ class WanDecoder3d(Module):
 
         ## head
         x_norm_tile_BTHWC = self.norm_out(x_BTHWC)
-        x_BTHWC = ttnn.to_layout(x_norm_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+        if x_norm_tile_BTHWC.layout != ttnn.ROW_MAJOR_LAYOUT:
+            x_norm_tile_BTHWC = ttnn.to_layout(x_norm_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
+        x_BTHWC = x_norm_tile_BTHWC
 
         if feat_cache is not None:
             idx = feat_idx[0]

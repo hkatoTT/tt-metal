@@ -5,6 +5,7 @@
 import collections
 import hashlib
 import math
+import os
 from itertools import repeat
 from typing import NamedTuple
 
@@ -506,6 +507,19 @@ _BLOCKINGS = {
     (4, 8, 192, 192, (3, 3, 3), 22, 60, 52): (96, 96, 5, 8, 4),  # up2_res — 2721us
     (4, 8, 96, 3, (3, 3, 3), 22, 120, 104): (96, 32, 3, 4, 8),  # conv_out — 3847 -> 2405us
 }
+
+# WH Galaxy 4x8, 480p, cached t_chunk_size=5: re-swept 2026-10-12 on the eth-dispatch 8x10 grid (single device, trace
+# timed). Same C_in blocks (K order), so the same values. up1_spatial's winner (384, 96, 1, 16, 2: 2339 -> 1473us)
+# deadlocked one conv3d core of a chip in the VAE stress test and is left out. WAN_C3D_RESWEEP=0 keeps the old rows.
+_BLOCKINGS_8X10_RESWEEP = {
+    (4, 8, 96, 3, (3, 3, 3), 22, 120, 104): (96, 32, 4, 8, 4),  # conv_out — 2408 -> 2067us
+    (4, 8, 192, 192, (3, 3, 3), 22, 60, 52): (96, 96, 5, 4, 8),  # up2_res — 2722 -> 2600us
+    (4, 8, 384, 384, (3, 3, 3), 12, 30, 26): (96, 96, 1, 16, 2),  # up1_res — 1701 -> 1608us
+    (4, 8, 96, 96, (3, 3, 3), 22, 120, 104): (96, 96, 4, 8, 4),  # up3_res — fallback 2178 -> 2110us
+    (4, 8, 192, 96, (1, 3, 3), 20, 120, 104): (192, 96, 1, 16, 2),  # up2_spatial — fallback 1525 -> 1501us
+}
+if os.environ.get("WAN_C3D_RESWEEP", "1") != "0":
+    _BLOCKINGS.update(_BLOCKINGS_8X10_RESWEEP)
 
 # Fallback table: (C_in, C_out, kernel) -> blocking.
 # Used when no exact (mesh, spatial) match exists.

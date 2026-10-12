@@ -58,6 +58,12 @@ _RM_RESID = os.environ.get("WAN_VAE_RM_RESID", "1") == "1"
 # Drops the cache concat (a copy of every chunk input) and the unpadded cache slices. WAN_VAE_NP_CACHE=0 restores
 # the concat path.
 _NP_CACHE = os.environ.get("WAN_VAE_NP_CACHE", "1") == "1"
+# Mid-block attention: devices holding the same frame no longer all compute every query of it. With the frames
+# split over the W axis, each H device computes only its own H rows (queries partitioned over the H axis, keys and
+# values whole), so the output is already H-sharded (no H re-partition, a 4x smaller W gather); a single frame
+# (no T split) is computed by each device for its own H x W shard only. Bit-identical. WAN_VAE_ATTN_QSPLIT=0
+# restores the replicated queries.
+_ATTN_QSPLIT = os.environ.get("WAN_VAE_ATTN_QSPLIT", "1") == "1"
 
 
 def _get_w_mask(cache, x_BTHWC, logical_w, parallel_config, mesh_device, dtype):
@@ -239,6 +245,19 @@ class WanAttentionBlock(Module):
             else:
                 x_TNC = ttnn.mesh_partition(x_TNC, dim=0)
 
+        no_spatial_pad = padded_h == H and not (logical_w > 0 and padded_w > logical_w)
+        qsplit = _ATTN_QSPLIT and split_t and w_only and h_devices > 1 and no_spatial_pad and H % h_devices == 0
+        # Without a T split (one frame) every device held the whole frame and computed all its queries: each now
+        # computes only the queries of its own H x W shard, so the output is already the local shard.
+        qlocal = (
+            _ATTN_QSPLIT
+            and not split_t
+            and (h_devices > 1 or w_devices > 1)
+            and no_spatial_pad
+            and H % h_devices == 0
+            and W % w_devices == 0
+        )
+
         x_TNC = ttnn.to_layout(x_TNC, ttnn.TILE_LAYOUT)
         x_TNC = self.norm(x_TNC, compute_kernel_config=self.hifi4_compute_kernel_config)
         default_block_size = (2, 2, 2) if x_TNC.dtype == ttnn.float32 else (8, 8, 8)
@@ -248,6 +267,21 @@ class WanAttentionBlock(Module):
         q_THNC, k_THNC, v_THNC = ttnn.transformer.split_query_key_value_and_split_heads(
             x_TND, num_heads=1, transpose_key=False
         )
+        if qsplit:
+            # rows [h * H / h_devices, (h + 1) * H / h_devices) of the frame, all W columns (row-major split: the
+            # per-device token count H * W / h_devices need not be a tile multiple)
+            q_rm = ttnn.to_layout(q_THNC, ttnn.ROW_MAJOR_LAYOUT)
+            q_rm = ttnn.mesh_partition(q_rm, dim=2, cluster_axis=h_axis)
+            q_THNC = ttnn.to_layout(q_rm, ttnn.TILE_LAYOUT)
+        elif qlocal:
+            q_rm = ttnn.reshape(ttnn.to_layout(q_THNC, ttnn.ROW_MAJOR_LAYOUT), (BT, H, W, C))
+            if h_devices > 1:
+                q_rm = ttnn.mesh_partition(q_rm, dim=1, cluster_axis=h_axis)
+            if w_devices > 1:
+                q_rm = ttnn.mesh_partition(q_rm, dim=2, cluster_axis=w_axis)
+            q_THNC = ttnn.to_layout(
+                ttnn.reshape(q_rm, (BT, 1, (H // h_devices) * (W // w_devices), C)), ttnn.TILE_LAYOUT
+            )
         out_THNC = ttnn.transformer.scaled_dot_product_attention(
             ttnn.typecast(q_THNC, ttnn.bfloat16) if q_THNC.dtype != ttnn.bfloat16 else q_THNC,
             ttnn.typecast(k_THNC, ttnn.bfloat16) if k_THNC.dtype != ttnn.bfloat16 else k_THNC,
@@ -271,6 +305,13 @@ class WanAttentionBlock(Module):
                 out_TND = out_TND[:BT, :, :]
 
         out_TND = ttnn.to_layout(out_TND, ttnn.ROW_MAJOR_LAYOUT)
+
+        if qsplit or qlocal:
+            out_BTHWC = ttnn.reshape(out_TND, (B, T, H // h_devices, W if qsplit else W // w_devices, C))
+            if qsplit and self.parallel_config.width_parallel.factor > 1:
+                out_BTHWC = ttnn.mesh_partition(out_BTHWC, dim=3, cluster_axis=w_axis)
+            out_BTHWC = ttnn.to_layout(out_BTHWC, ttnn.TILE_LAYOUT)
+            return ttnn.add(out_BTHWC, residual_BTHWC)
 
         needs_h_repad = padded_h > logical_h
         needs_w_repad = logical_w > 0 and padded_w > logical_w

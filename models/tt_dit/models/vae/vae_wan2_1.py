@@ -74,6 +74,13 @@ def _c3d_up() -> bool:
     return os.environ.get("WAN_VAE_C3D_UP", "1") == "1"
 
 
+# EXPERIMENT (hkato): keep the latent-resolution residual stream (mid block, first up block) row major as well:
+# the residual blocks there get the fused norm / neighbor pad / residual paths, and the a2a attention adds its
+# residual row major. WAN_VAE_RM_MID=0 restores the tiled stream at that level.
+def _rm_mid() -> bool:
+    return os.environ.get("WAN_VAE_RM_MID", "1") == "1"
+
+
 # Also the conv2 with several C_in blocks (fp32 partials, rounded to bf16 before the add).
 def _c3d_resid_all() -> bool:
     return os.environ.get("WAN_VAE_C3D_RESID_ALL", "1") == "1"
@@ -289,6 +296,8 @@ class WanAttentionBlock(Module):
         if wf > BT:
             o = o[:BT, :, :, :]
         o = ttnn.reshape(ttnn.to_layout(o, ttnn.ROW_MAJOR_LAYOUT), (B, T, h, w, C))
+        if residual_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT:  # row-major stream (_rm_mid)
+            return ttnn.add(o, residual_BTHWC)
         return ttnn.add(ttnn.to_layout(o, ttnn.TILE_LAYOUT), residual_BTHWC)
 
     def forward(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int = 0) -> ttnn.Tensor:
@@ -298,12 +307,14 @@ class WanAttentionBlock(Module):
         returns: (B, T, H, W, C) fractured on H and W, TILE layout
         """
         assert len(x_BTHWC.shape) == 5
-        assert x_BTHWC.layout == ttnn.TILE_LAYOUT
-        residual_BTHWC = x_BTHWC
         if _ATTN_A2A:
             out_a2a = self._forward_a2a(x_BTHWC, logical_h, logical_w)
             if out_a2a is not None:
                 return out_a2a
+        if x_BTHWC.layout != ttnn.TILE_LAYOUT:  # row-major stream (_rm_mid): this path works on tiles
+            x_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
+        assert x_BTHWC.layout == ttnn.TILE_LAYOUT
+        residual_BTHWC = x_BTHWC
 
         # Gather height and width for replicated attention
         if self.parallel_config.height_parallel.factor > 1:
@@ -1051,7 +1062,7 @@ class WanMidBlock(Module):
         feat_idx: list[int] = [0],
         logical_w: int = 0,
     ) -> ttnn.Tensor:
-        assert x_BTHWC.layout == ttnn.TILE_LAYOUT, f"WanMidBlock expects TILE input, got {x_BTHWC.layout}"
+        assert x_BTHWC.layout == ttnn.TILE_LAYOUT or _rm_mid(), f"WanMidBlock expects TILE input, got {x_BTHWC.layout}"
         x_res_BTHWC = self.resnets[0](x_BTHWC, logical_h, feat_cache, feat_idx, logical_w=logical_w)
         x_BTHWC = x_res_BTHWC
         for i in range(len(self.attentions)):
@@ -1735,7 +1746,8 @@ class WanDecoder3d(Module):
         else:
             x_BTHWC = self.conv_in(x_BTHWC, logical_h, logical_w=logical_w)
 
-        x_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
+        if not (_rm_mid() and feat_cache is not None):
+            x_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
 
         ## middle
         x_BTHWC = self.mid_block(x_BTHWC, logical_h, feat_cache, feat_idx, logical_w=logical_w)

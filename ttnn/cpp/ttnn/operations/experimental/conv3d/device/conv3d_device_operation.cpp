@@ -214,6 +214,18 @@ void Conv3dDeviceOperation::validate_on_program_cache_miss(
             "weight_lo_tensor is only read with enable_fp32_operand_split=True.");
     }
 
+    if (args.input_upsample != 1) {
+        const auto& s = input_tensor_a.logical_shape();
+        const std::array<uint32_t, 3> hk_zero{0, 0, 0};
+        const std::array<uint32_t, 3> hk_one{1, 1, 1};
+        const bool hk_ok = args.input_upsample == 2 && args.padding == hk_zero && args.stride == hk_one &&
+                           args.dilation == hk_one && s[0] == 1 && s[2] >= 3 && s[3] >= 3 &&
+                           !tensor_args.halo_buffer.has_value() && args.logical_h_mask == 0 && args.logical_w_mask == 0;
+        TT_FATAL(
+            hk_ok,
+            "input_upsample=2 needs a 1-padded N=1 input, no conv padding / stride / dilation, no halo or mask mode");
+    }
+
     if (tensor_args.residual_tensor.has_value()) {
         const auto& residual = tensor_args.residual_tensor.value();
         TT_FATAL(
@@ -335,6 +347,10 @@ tt::tt_metal::TensorSpec Conv3dDeviceOperation::compute_output_specs(
     uint32_t T_in = input_tensor_a_shape[1];
     uint32_t H_in = input_tensor_a_shape[2];
     uint32_t W_in = input_tensor_a_shape[3];
+    if (args.input_upsample == 2) {  // the 1-padded upsampled tensor the conv reads (see Conv3dParams)
+        H_in = 2 * H_in - 2;
+        W_in = 2 * W_in - 2;
+    }
     uint32_t C_out = args.output_channels;
     uint32_t padded_C_out = tt::round_up(C_out, tt::constants::TILE_WIDTH);
 
@@ -445,7 +461,8 @@ ttnn::experimental::prim::Conv3dDeviceOperation::tensor_return_value_t conv3d(
     uint32_t output_pad_h,
     uint32_t output_pad_w,
     const std::optional<Tensor>& weight_lo_tensor,
-    const std::optional<Tensor>& residual_tensor) {
+    const std::optional<Tensor>& residual_tensor,
+    uint32_t input_upsample) {
     using OperationType = ttnn::experimental::prim::Conv3dDeviceOperation;
 
     auto kernel_config_val = init_device_compute_kernel_config(
@@ -469,7 +486,8 @@ ttnn::experimental::prim::Conv3dDeviceOperation::tensor_return_value_t conv3d(
         .logical_h_mask = logical_h_mask,
         .logical_w_mask = logical_w_mask,
         .output_pad_h = output_pad_h,
-        .output_pad_w = output_pad_w};
+        .output_pad_w = output_pad_w,
+        .input_upsample = input_upsample};
     TT_FATAL(
         config.dilation == default_dilation || dilation_ == default_dilation || config.dilation == dilation_,
         "dilation in Conv3dConfig and op args must match when both are set. config=({}, {}, {}), args=({}, {}, {})",

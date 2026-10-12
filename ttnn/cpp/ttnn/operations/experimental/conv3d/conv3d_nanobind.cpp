@@ -71,7 +71,8 @@ void bind_conv3d(nb::module_& mod) {
         nb::arg("output_pad_h") = 0u,
         nb::arg("output_pad_w") = 0u,
         nb::arg("weight_lo_tensor") = nb::none(),
-        nb::arg("residual_tensor") = nb::none());
+        nb::arg("residual_tensor") = nb::none(),
+        nb::arg("input_upsample") = 1u);
 
     // Register to ttnn.experimental namespace
     ttnn::bind_function<"prepare_conv3d_weights", "ttnn.experimental.">(

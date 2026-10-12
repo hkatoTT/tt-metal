@@ -15,6 +15,18 @@ uint32_t g_mask_h_start = 0;
 uint32_t g_mask_w_start = 0;
 }  // namespace
 
+// Input page of position (t, h, w) of the (padded) conv input.
+#ifdef HK_C3D_UPSAMPLE
+// EXPERIMENT (hkato): input_upsample=2 -- the input tensor is the 1-padded low-res tensor of a nearest 2x upsample and
+// (t, h, w) index the 1-padded upsampled tensor, whose padded row/column Y is low-res padded row/column (Y + 1) / 2.
+#define HK_IN_PAGE(base, t, h, w)                                        \
+    ((base) + static_cast<uint32_t>(t) * (HK_C3D_UP_HR * HK_C3D_UP_WR) + \
+     ((static_cast<uint32_t>(h) + 1) >> 1) * HK_C3D_UP_WR + ((static_cast<uint32_t>(w) + 1) >> 1))
+#else
+#define HK_IN_PAGE(base, t, h, w) \
+    ((base) + static_cast<uint32_t>(t) * H_in_W_in + static_cast<uint32_t>(h) * W_in + static_cast<uint32_t>(w))
+#endif
+
 // Pre-zero CB pages so tile-alignment padding is zero.
 template <uint32_t padded_page_bytes, typename Dst>
 FORCE_INLINE void pre_zero_pages(Noc noc, const Dst& dst, uint32_t offset, uint32_t num_pages) {
@@ -479,9 +491,7 @@ void gather_rows_to_shard(
                             zeroPad<C_in_block_bytes>(noc, shard_cb, shard_offset);
                         } else {
                             const int32_t w_clamped = clampIndex(w_in, 0, static_cast<int32_t>(W_in) - 1);
-                            const uint32_t page_idx = batch_page_base + static_cast<uint32_t>(t_clamped) * H_in_W_in +
-                                                      static_cast<uint32_t>(h_clamped) * W_in +
-                                                      static_cast<uint32_t>(w_clamped);
+                            const uint32_t page_idx = HK_IN_PAGE(batch_page_base, t_clamped, h_clamped, w_clamped);
                             read_input_row_maybe_staged<EnableDramReadStaging, dram_read_alignment>(
                                 noc,
                                 in_reader,
@@ -494,8 +504,7 @@ void gather_rows_to_shard(
                                 dram_read_scratch_cb);
                         }
                     } else {
-                        const uint32_t page_idx = batch_page_base + static_cast<uint32_t>(t_in) * H_in_W_in +
-                                                  static_cast<uint32_t>(h_in) * W_in + static_cast<uint32_t>(w_in);
+                        const uint32_t page_idx = HK_IN_PAGE(batch_page_base, t_in, h_in, w_in);
                         read_input_row_maybe_staged<EnableDramReadStaging, dram_read_alignment>(
                             noc,
                             in_reader,
@@ -525,8 +534,7 @@ void gather_rows_to_shard(
                     if (logical_masked) {
                         zeroPad<C_in_block_bytes>(noc, shard_cb, shard_offset);
                     } else {
-                        const uint32_t page_idx = batch_page_base + static_cast<uint32_t>(t_in) * H_in_W_in +
-                                                  static_cast<uint32_t>(h_in) * W_in + static_cast<uint32_t>(w_in);
+                        const uint32_t page_idx = HK_IN_PAGE(batch_page_base, t_in, h_in, w_in);
                         read_input_row_maybe_staged<EnableDramReadStaging, dram_read_alignment>(
                             noc,
                             in_reader,
@@ -1197,9 +1205,7 @@ void kernel_main() {
                                                         }
 
                                                         const uint32_t page_idx =
-                                                            batch_page_base + static_cast<uint32_t>(t_idx) * H_in_W_in +
-                                                            static_cast<uint32_t>(h_idx) * W_in +
-                                                            static_cast<uint32_t>(w_idx);
+                                                            HK_IN_PAGE(batch_page_base, t_idx, h_idx, w_idx);
                                                         read_input_row_maybe_staged<
                                                             enable_dram_read_staging,
                                                             dram_read_alignment>(

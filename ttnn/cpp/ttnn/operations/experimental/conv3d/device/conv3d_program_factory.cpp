@@ -65,6 +65,15 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
     uint32_t H_in = input_tensor_shape[2];
     uint32_t W_in = input_tensor_shape[3];
     uint32_t C_in = input_tensor_shape[4];
+    // EXPERIMENT (hkato): input_upsample=2 -- everything below sees the 1-padded upsampled geometry; only the reader's
+    // input page index uses the real (low-res) dims.
+    const uint32_t hk_up = operation_attributes.input_upsample;
+    const uint32_t H_in_real = H_in;
+    const uint32_t W_in_real = W_in;
+    if (hk_up == 2) {
+        H_in = 2 * H_in - 2;
+        W_in = 2 * W_in - 2;
+    }
     auto [T_out, H_out, W_out] = detail::compute_output_dims(
         T_in,
         H_in,
@@ -511,7 +520,7 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
     // Coalescing pays for a scratch L1 reorder pass; require enough columns to give each
     // DRAM bank multiple pages so the larger bank-local bursts amortize the extra L1 traffic.
     const uint32_t coalesced_min_w_shard = 2 * device_num_dram_banks;
-    const bool coalesced_shard_reads_candidate = input_is_dram_interleaved && C_in_num_blocks == 1 &&
+    const bool coalesced_shard_reads_candidate = hk_up == 1 && input_is_dram_interleaved && C_in_num_blocks == 1 &&
                                                  C_in_block_bytes == in_row_size_bytes &&
                                                  W_shard_full_for_coalesce >= coalesced_min_w_shard;
 
@@ -867,6 +876,11 @@ tt::tt_metal::ProgramDescriptor Conv3dProgramFactory::create_descriptor(
     reader_desc.core_ranges = CoreRangeSet(core_grid);
     reader_desc.compile_time_args = std::move(reader_compile_time_args);
     reader_desc.config = ReaderConfigDescriptor{};
+    if (hk_up == 2) {
+        reader_desc.defines.emplace_back("HK_C3D_UPSAMPLE", "1");
+        reader_desc.defines.emplace_back("HK_C3D_UP_HR", std::to_string(H_in_real));
+        reader_desc.defines.emplace_back("HK_C3D_UP_WR", std::to_string(W_in_real));
+    }
 
     // Matmul parameters (out_subblock_h, out_subblock_w, dst_size computed earlier for CB sizing)
     const uint32_t in0_block_w = matmul_K_t;

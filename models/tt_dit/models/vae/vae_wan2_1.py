@@ -68,6 +68,12 @@ def _c3d_resid() -> bool:
     return os.environ.get("WAN_VAE_C3D_RESID", "1") == "1"
 
 
+# EXPERIMENT (hkato): the spatial conv after a nearest 2x upsample reads the low-res tensor (neighbor-padded at low
+# res) through conv3d input_upsample=2 instead of running ttnn.upsample and padding the upsampled tensor.
+def _c3d_up() -> bool:
+    return os.environ.get("WAN_VAE_C3D_UP", "1") == "1"
+
+
 # Also the conv2 with several C_in blocks (fp32 partials, rounded to bf16 before the add).
 def _c3d_resid_all() -> bool:
     return os.environ.get("WAN_VAE_C3D_RESID_ALL", "1") == "1"
@@ -1151,7 +1157,24 @@ class WanConv2d(Module):
         if "bias" in state:
             state["bias"] = state["bias"].reshape(1, -1)
 
-    def forward(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int = 0) -> ttnn.Tensor:
+    def can_read_upsampled(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int = 0) -> bool:
+        """conv3d input_upsample=2 applies: 1-padded H/W by neighbor pad on both axes, no masking at low res."""
+        hf = self.parallel_config.height_parallel.factor
+        wf = self.parallel_config.width_parallel.factor
+        return (
+            tuple(self.external_padding) == (0, 1, 1)
+            and tuple(self.internal_padding) == (0, 0, 0)
+            and tuple(self.stride) == (1, 1, 1)
+            and hf > 1
+            and wf > 1
+            and x_BTHWC.shape[0] == 1
+            and x_BTHWC.shape[2] * hf == logical_h
+            and (logical_w == 0 or x_BTHWC.shape[3] * wf == logical_w)
+        )
+
+    def forward(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int = 0, input_upsample: int = 1) -> ttnn.Tensor:
+        """input_upsample=2: x is the low-res tensor of a nearest 2x upsample (see can_read_upsampled); logical_h /
+        logical_w are low-res too."""
         assert x_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT, f"WanConv2d expects ROW_MAJOR input, got {x_BTHWC.layout}"
 
         # Halo exchange (height and/or width padding)
@@ -1231,6 +1254,7 @@ class WanConv2d(Module):
             padding_mode="zeros",
             dtype=self.dtype,
             compute_kernel_config=self.compute_kernel_config,
+            input_upsample=input_upsample,
         )
 
         return x_BTHWC
@@ -1393,7 +1417,12 @@ class WanResample(Module):
                     x_BTHWC = ttnn.concat([x_first, x_rest_doubled], dim=1)  # 1 + 2*(T-1) = 2*T-1 frames
                 # If T=1: x_BTHWC = x_first (unchanged), no temporal doubling, same as cached "Rep" path
 
-        if self.is_upsample:
+        if self.is_upsample and _c3d_up() and self.conv.can_read_upsampled(x_BTHWC, logical_h, logical_w):
+            x_conv_BTHWC = self.conv(x_BTHWC, logical_h, logical_w=logical_w, input_upsample=2)
+            logical_h *= 2
+            if logical_w > 0:
+                logical_w *= 2
+        elif self.is_upsample:
             T2 = x_BTHWC.shape[1]
             x_NHWC = ttnn.reshape(x_BTHWC, (B * T2, H, W, C))
             x_upsamped_NHWC = ttnn.upsample(x_NHWC, scale_factor=2)

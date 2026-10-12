@@ -104,6 +104,9 @@ struct Conv3dParams {
     // 0 == compact output.
     uint32_t output_pad_h = 0;
     uint32_t output_pad_w = 0;
+    // EXPERIMENT (hkato): 2 = the input is the 1-padded (H and W) low-res tensor of a nearest 2x spatial upsample; the
+    // conv runs on the 1-padded upsampled tensor (2H-2 x 2W-2) and the reader maps padded row/column Y -> (Y + 1) / 2.
+    uint32_t input_upsample = 1;
 };
 
 struct Conv3dInputs {

@@ -37,6 +37,7 @@ ttnn::Tensor conv3d(
     uint32_t output_pad_h = 0,
     uint32_t output_pad_w = 0,
     const std::optional<ttnn::Tensor>& weight_lo_tensor = std::nullopt,
-    const std::optional<ttnn::Tensor>& residual_tensor = std::nullopt);
+    const std::optional<ttnn::Tensor>& residual_tensor = std::nullopt,
+    uint32_t input_upsample = 1);
 
 }  // namespace ttnn::experimental

@@ -16,6 +16,120 @@ Values we computed ourselves are marked "(computed)".
 
 ---
 
+<!-- toc -->
+## Contents
+
+- [0. Summary in 3 lines](#0-summary-in-3-lines)
+- [1. Glossary (terms used in this chapter)](#1-glossary-terms-used-in-this-chapter)
+- [2. Does Wan 2.2 already support the WH Galaxy?](#2-does-wan-22-already-support-the-wh-galaxy)
+- [3. Details of PR #56886 "Enable MiniMax-H3 on Wormhole Galaxy"](#3-details-of-pr-56886-enable-minimax-h3-on-wormhole-galaxy)
+  - [3.1 Mesh configuration per arch (① does not start)](#31-mesh-configuration-per-arch--does-not-start)
+  - [3.2 Memory: FSDP and the "not coresident" setting (② does not fit in memory)](#32-memory-fsdp-and-the-not-coresident-setting--does-not-fit-in-memory)
+  - [3.3 Matching the AGMM core placement to the link count (③ crashes midway, part 1)](#33-matching-the-agmm-core-placement-to-the-link-count--crashes-midway-part-1)
+  - [3.4 Keeping the Ring K-block condition (③ crashes midway, part 2)](#34-keeping-the-ring-k-block-condition--crashes-midway-part-2)
+  - [3.5 Making the fused MM+RS check include the core grid (③ hang + ④ silent slowdown) — the core of this PR](#35-making-the-fused-mmrs-check-include-the-core-grid--hang---silent-slowdown--the-core-of-this-pr)
+  - [3.6 Keying the tuning tables on "the row count that actually flows" (④ silent slowdown)](#36-keying-the-tuning-tables-on-the-row-count-that-actually-flows--silent-slowdown)
+  - [3.7 Blocking search for WH and its numerical check (④)](#37-blocking-search-for-wh-and-its-numerical-check-)
+  - [3.8 Getting the weights (⑤)](#38-getting-the-weights-)
+  - [3.9 Read-back verification of the weight cache (⑤)](#39-read-back-verification-of-the-weight-cache-)
+  - [3.10 Bring-up lessons (taken from this PR)](#310-bring-up-lessons-taken-from-this-pr)
+- [4. Performance: Blackhole vs Wormhole](#4-performance-blackhole-vs-wormhole)
+  - [4.1 Hardware differences (1 Galaxy = 32 chips)](#41-hardware-differences-1-galaxy--32-chips)
+  - [4.2 End-to-end comparison (H3, 768P 16:9, 50 steps = 49 forwards, warm)](#42-end-to-end-comparison-h3-768p-169-50-steps--49-forwards-warm)
+  - [4.3 Per-block breakdown (15 s, per chip, Tracy)](#43-per-block-breakdown-15-s-per-chip-tracy)
+  - [4.4 The WH roofline — how fast can it get?](#44-the-wh-roofline--how-fast-can-it-get)
+  - [4.5 All WH conditions (#57941 README, with FSDP, 2026-09-17)](#45-all-wh-conditions-57941-readme-with-fsdp-2026-09-17)
+  - [4.6 Progress in the unmerged PR #57941 "MiniMax-H3: Wormhole Galaxy optimizations"](#46-progress-in-the-unmerged-pr-57941-minimax-h3-wormhole-galaxy-optimizations)
+  - [4.7 Comparing parallel layouts (WH, 15 s, 10 steps)](#47-comparing-parallel-layouts-wh-15-s-10-steps)
+  - [4.8 Quality](#48-quality)
+- [5. Implications for our work](#5-implications-for-our-work)
+- [6. Operational notes (hangs and board recovery)](#6-operational-notes-hangs-and-board-recovery)
+- [7. Model comparison: Wan 2.2 and MiniMax-H3](#7-model-comparison-wan-22-and-minimax-h3)
+  - [7.1 Release timing and positioning](#71-release-timing-and-positioning)
+  - [7.2 Strengths of each](#72-strengths-of-each)
+  - [7.3 Official Wan 2.2 benchmarks](#73-official-wan-22-benchmarks)
+- [8. Measured on our setup: Wan 2.2 T2V 480p on WH Galaxy 4×8](#8-measured-on-our-setup-wan-22-t2v-480p-on-wh-galaxy-48)
+  - [8.1 Measurement conditions](#81-measurement-conditions)
+  - [8.2 Results](#82-results)
+  - [8.3 Comparison with benchmarks (480p, T2V-A14B, total time per video)](#83-comparison-with-benchmarks-480p-t2v-a14b-total-time-per-video)
+  - [8.4 Problems hit before the first run](#84-problems-hit-before-the-first-run)
+- [9. Inside Wan 2.2: module structure and per-block breakdown](#9-inside-wan-22-module-structure-and-per-block-breakdown)
+  - [9.1 Module structure (T2V-A14B)](#91-module-structure-t2v-a14b)
+  - [9.2 Per-block breakdown (Tracy measurement, 480p, per chip, average over 32 chips, 2026-09-30)](#92-per-block-breakdown-tracy-measurement-480p-per-chip-average-over-32-chips-2026-09-30)
+  - [9.3 Takeaways (improvement candidates)](#93-takeaways-improvement-candidates)
+  - [9.4 What the fused path is (terminology)](#94-what-the-fused-path-is-terminology)
+  - [9.5 Current breakdown and theoretical values (as of #15d, 2026-10-02)](#95-current-breakdown-and-theoretical-values-as-of-15d-2026-10-02)
+  - [9.6 Current breakdown and theoretical values (as of #30, 2026-10-05)](#96-current-breakdown-and-theoretical-values-as-of-30-2026-10-05)
+  - [9.7 Current (#77) vs. baseline (2026-10-07)](#97-current-77-vs-baseline-2026-10-07)
+  - [9.8 Current (#107) breakdown and theoretical values (2026-10-08)](#98-current-107-breakdown-and-theoretical-values-2026-10-08)
+- [10. Optimization history (Wan 2.2 T2V 480p, WH Galaxy 4×8)](#10-optimization-history-wan-22-t2v-480p-wh-galaxy-48)
+  - [#1 details: FFN2 unfused](#1-details-ffn2-unfused)
+  - [#2 details: Matmul blocking for WH, and retuning the fused MM+RS](#2-details-matmul-blocking-for-wh-and-retuning-the-fused-mmrs)
+  - [#3 details: ring SDPA chunk size](#3-details-ring-sdpa-chunk-size)
+  - [#4 details: Automatically deciding whether to use the fused MM+RS](#4-details-automatically-deciding-whether-to-use-the-fused-mmrs)
+  - [#5a details: FSDP weight prefetch (no effect)](#5a-details-fsdp-weight-prefetch-no-effect)
+  - [#5b preparation: Free device memory, and the steps each of the two models handles (2026-10-01)](#5b-preparation-free-device-memory-and-the-steps-each-of-the-two-models-handles-2026-10-01)
+  - [#5b details: Keeping the FFN weights resident (`transformer` side)](#5b-details-keeping-the-ffn-weights-resident-transformer-side)
+  - [#6 details: Dropping fp32 accumulation in the FFN (C)](#6-details-dropping-fp32-accumulation-in-the-ffn-c)
+  - [#6b details: No fp32 accumulation for the attention projections either (optional, default off)](#6b-details-no-fp32-accumulation-for-the-attention-projections-either-optional-default-off)
+  - [#21 details: LoFi for the ring SDPA matmuls only (2026-10-05)](#21-details-lofi-for-the-ring-sdpa-matmuls-only-2026-10-05)
+  - [#23 details: LoFi matmuls (rejected, 2026-10-05)](#23-details-lofi-matmuls-rejected-2026-10-05)
+  - [#7 details: Building the softmax row sums inside DEST (failed)](#7-details-building-the-softmax-row-sums-inside-dest-failed)
+  - [#10 details: Caching the cross-attention K/V](#10-details-caching-the-cross-attention-kv)
+  - [#11 details: trace (no effect)](#11-details-trace-no-effect)
+  - [#13 details: Time per section of one forward](#13-details-time-per-section-of-one-forward)
+  - [Speeding up experiments: comparing with fewer steps (2026-10-01)](#speeding-up-experiments-comparing-with-fewer-steps-2026-10-01)
+  - [#15 details: CFG batching (merging the conditional and unconditional forwards)](#15-details-cfg-batching-merging-the-conditional-and-unconditional-forwards)
+  - [#16 (in progress, 2026-10-01 18:00 onward): SDPA precision settings, and folding the CFG-batched self-attention into heads](#16-in-progress-2026-10-01-1800-onward-sdpa-precision-settings-and-folding-the-cfg-batched-self-attention-into-heads)
+  - [Check at 720p (D, 2026-10-01)](#check-at-720p-d-2026-10-01)
+  - [Time per zone inside the SDPA kernel (2026-10-01)](#time-per-zone-inside-the-sdpa-kernel-2026-10-01)
+  - [Experiment and measurement methods (summary, 2026-10-02)](#experiment-and-measurement-methods-summary-2026-10-02)
+  - [Zones inside the SDPA kernel (after LoFi, 2026-10-05, #26)](#zones-inside-the-sdpa-kernel-after-lofi-2026-10-05-26)
+  - [Confirming the Phase 1 bottleneck, and the outlook for a kernel rewrite (2026-10-05, #27, #28)](#confirming-the-phase-1-bottleneck-and-the-outlook-for-a-kernel-rewrite-2026-10-05-27-28)
+  - [Considering fundamental speedups (2026-10-05, after #29)](#considering-fundamental-speedups-2026-10-05-after-29)
+  - [#30 details: Faster GELU_TANH in FFN1 (2026-10-05)](#30-details-faster-gelu_tanh-in-ffn1-2026-10-05)
+  - [SDPA rewrite design: Freezing the max at the first chunk (2026-10-05, started)](#sdpa-rewrite-design-freezing-the-max-at-the-first-chunk-2026-10-05-started)
+  - [#32 details: Prototype that removes the row max (2026-10-05)](#32-details-prototype-that-removes-the-row-max-2026-10-05)
+  - [#33 details: Re-analyzing why ring SDPA is slow (2026-10-05)](#33-details-re-analyzing-why-ring-sdpa-is-slow-2026-10-05)
+  - [#34 details: Re-measuring the no-max upper bound with LoFi, and per-core analysis (2026-10-06)](#34-details-re-measuring-the-no-max-upper-bound-with-lofi-and-per-core-analysis-2026-10-06)
+  - [#35 details: "The matmul gets slower" was a measurement artifact (2026-10-06)](#35-details-the-matmul-gets-slower-was-a-measurement-artifact-2026-10-06)
+  - [#36 details: Folding the two CFG passes into heads, and dealing SDPA evenly over 64 cores (2026-10-06)](#36-details-folding-the-two-cfg-passes-into-heads-and-dealing-sdpa-evenly-over-64-cores-2026-10-06)
+  - [Explainer: the K/V relay (chain) and how uneven work makes cores wait (2026-10-06)](#explainer-the-kv-relay-chain-and-how-uneven-work-makes-cores-wait-2026-10-06)
+  - [#37 details: the "no max" upper bound in the real ring SDPA (2026-10-06)](#37-details-the-no-max-upper-bound-in-the-real-ring-sdpa-2026-10-06)
+  - [#38 details: isolating why K/V arrive late (2026-10-06)](#38-details-isolating-why-kv-arrive-late-2026-10-06)
+  - [#39 details: overlapping the K and V reads on the chain-head core (2026-10-06, rejected)](#39-details-overlapping-the-k-and-v-reads-on-the-chain-head-core-2026-10-06-rejected)
+  - [#40 details: all cores read either K or V from DRAM (2026-10-06, rejected)](#40-details-all-cores-read-either-k-or-v-from-dram-2026-10-06-rejected)
+  - [#41 details: trying the experimental ring SDPA op on WH 4×8 (2026-10-06, did not work)](#41-details-trying-the-experimental-ring-sdpa-op-on-wh-48-2026-10-06-did-not-work)
+  - [#42-#45 details: Q interleave to reduce K/V DRAM reads (2026-10-06)](#42-45-details-q-interleave-to-reduce-kv-dram-reads-2026-10-06)
+  - [#46 details: bounded exp mode, subtracting a per-row upper bound (2026-10-06, rejected)](#46-details-bounded-exp-mode-subtracting-a-per-row-upper-bound-2026-10-06-rejected)
+  - [#47 details: the matmul (AGMM) is bound by data supply, not compute (2026-10-06)](#47-details-the-matmul-agmm-is-bound-by-data-supply-not-compute-2026-10-06)
+  - [#48-#49 details: BFP8 weights and activations (2026-10-06)](#48-49-details-bfp8-weights-and-activations-2026-10-06)
+  - [#50-#52 details: fully resident weights and splitting the text encoder (2026-10-06)](#50-52-details-fully-resident-weights-and-splitting-the-text-encoder-2026-10-06)
+  - [#53-#58 details: analyzing what bounds AGMM (fused matmul and all-gather) (2026-10-06)](#53-58-details-analyzing-what-bounds-agmm-fused-matmul-and-all-gather-2026-10-06)
+  - [#59-#61 details: BFP8 activations, and fixing bugs in BFP8 SDPA (2026-10-06)](#59-61-details-bfp8-activations-and-fixing-bugs-in-bfp8-sdpa-2026-10-06)
+  - [#66-#68 details: fixing how the experimental switches are applied (2026-10-06)](#66-68-details-fixing-how-the-experimental-switches-are-applied-2026-10-06)
+  - [#83-#85 details: the GELU epilogue of FFN1 (2026-10-07)](#83-85-details-the-gelu-epilogue-of-ffn1-2026-10-07)
+  - [#86-#89 details: confirming what bounds FFN2, ring SDPA and the matmuls (2026-10-07)](#86-89-details-confirming-what-bounds-ffn2-ring-sdpa-and-the-matmuls-2026-10-07)
+  - [#90 details: assessing a ring SDPA rewrite in advance (2026-10-08)](#90-details-assessing-a-ring-sdpa-rewrite-in-advance-2026-10-08)
+  - [#92 details: improving the VAE decode (2026-10-08)](#92-details-improving-the-vae-decode-2026-10-08)
+  - [#150 details: relaying ring SDPA K/V between chips (2026-10-10, parked)](#150-details-relaying-ring-sdpa-kv-between-chips-2026-10-10-parked)
+  - [#154 details: an 8×10 compute grid with Ethernet dispatch (2026-10-10, optional)](#154-details-an-810-compute-grid-with-ethernet-dispatch-2026-10-10-optional)
+  - [How the experiments were run (making the experiments themselves fast and reliable, 2026-10-07)](#how-the-experiments-were-run-making-the-experiments-themselves-fast-and-reliable-2026-10-07)
+- [11. Q&A notes (2026-09-30)](#11-qa-notes-2026-09-30)
+  - [11.1 Is video generation bound by compute or communication?](#111-is-video-generation-bound-by-compute-or-communication)
+  - [11.2 The K/V ring needs data from distant chips; is that a problem?](#112-the-kv-ring-needs-data-from-distant-chips-is-that-a-problem)
+  - [11.3 Does splitting the sequence (SP) break the dependencies between frames?](#113-does-splitting-the-sequence-sp-break-the-dependencies-between-frames)
+  - [11.4 Where are SDPA's intermediate results kept?](#114-where-are-sdpas-intermediate-results-kept)
+  - [11.5 What is the fused path?](#115-what-is-the-fused-path)
+  - [11.6 Idle cores in SDPA, and other bottlenecks](#116-idle-cores-in-sdpa-and-other-bottlenecks)
+  - [11.7 How complex can processing on a Tensix core be?](#117-how-complex-can-processing-on-a-tensix-core-be)
+  - [11.8 What limits experiment turnaround](#118-what-limits-experiment-turnaround)
+- [12. Operational lessons](#12-operational-lessons)
+- [13. MiniMax-H3](#13-minimax-h3)
+- [Sources](#sources)
+
+<!-- /toc -->
+
 ## 0. Summary in 3 lines
 
 1. **Wan 2.2 already supports the WH Galaxy** (there is `_PRESETS_WH` and a CI performance target). It does not need bring-up work like the H3 PR,
@@ -44,6 +158,8 @@ Values we computed ourselves are marked "(computed)".
    and a little over 30% is matmul (bound by the per-tile hand-off between unpack and math).
 
 ---
+
+[↑ Back to contents](#contents)
 
 ## 1. Glossary (terms used in this chapter)
 
@@ -82,6 +198,8 @@ Values we computed ourselves are marked "(computed)".
 
 ---
 
+[↑ Back to contents](#contents)
+
 ## 2. Does Wan 2.2 already support the WH Galaxy?
 
 **Yes.** It does not need extra work like the H3 PR.
@@ -109,6 +227,8 @@ CI performance targets (`tests/models/wan2_2/test_performance_wan.py`, 81 frames
 Here too, **on 4×8, WH takes about 2x the time of BH**. This is almost the same as the H3 gap described later (2.0-2.4x).
 
 ---
+
+[↑ Back to contents](#contents)
 
 ## 3. Details of PR #56886 "Enable MiniMax-H3 on Wormhole Galaxy"
 
@@ -342,6 +462,8 @@ It looked like a model bug and caused a long detour.
 
 ---
 
+[↑ Back to contents](#contents)
+
 ## 4. Performance: Blackhole vs Wormhole
 
 ### 4.1 Hardware differences (1 Galaxy = 32 chips)
@@ -479,6 +601,8 @@ With 56 heads, TP=16 is not possible. In practice there are only 3 options:
 
 ---
 
+[↑ Back to contents](#contents)
+
 ## 5. Implications for our work
 
 - **Direction (decided 2026-09-29): the optimization target is Wan 2.2.**
@@ -486,6 +610,8 @@ With 56 heads, TP=16 is not possible. In practice there are only 3 options:
 - H3 has 144 GB of weights, and building the cache reads files on the order of 62 GB (1054 s the first time). Estimate disk space and time first.
 - The main battlefield for performance is **SDPA on WH** (70% of the block, utilization 48%). The SDPA chunk tuning we did for Wan2.1 on the P150 is already exhausted for H3.
 - When comparing, use the same host and the same commit, and measure the variation (a few % on WH) first. What we learned on the P150 is written there as-is.
+
+[↑ Back to contents](#contents)
 
 ## 6. Operational notes (hangs and board recovery)
 
@@ -503,6 +629,8 @@ The README records several cases that **do not recover without resetting the boa
 7. The README has a step to check "whether any process has the device open" before the recovery procedure (look for tenstorrent in `/proc/*/fd`).
 
 ---
+
+[↑ Back to contents](#contents)
 
 ## 7. Model comparison: Wan 2.2 and MiniMax-H3
 
@@ -583,6 +711,8 @@ The README records several cases that **do not recover without resetting the boa
 - 1st in 4 of the 6 items (Seedance is ahead on fidelity, KLING on object accuracy). It is **self-reported on the team's own benchmark**, so take it with a grain of salt.
 - Hailuo 02 in the comparison is MiniMax's previous-generation commercial model. The H3 model card does not seem to have comparisons like this with other companies (the only H3 quality metrics we have are the CLIP / VBench pass checks on the tt-metal side).
 
+[↑ Back to contents](#contents)
+
 ## 8. Measured on our setup: Wan 2.2 T2V 480p on WH Galaxy 4×8
 
 Results of running the performance test that ships with tt-metal, as is, on another WH Galaxy on 2026-09-29.
@@ -654,6 +784,8 @@ How to read this:
 
 None of these problems involve the device.
 As staged checks beforehand, an add on the 32-chip mesh (no communication) and an all_gather on the Ring fabric (4 links, correct values on 32/32 chips) also passed.
+
+[↑ Back to contents](#contents)
 
 ## 9. Inside Wan 2.2: module structure and per-block breakdown
 
@@ -875,7 +1007,6 @@ Re-measured the current best (#30: CFG batching + LoFi for the SDPA matmuls + po
 
 40 steps: denoise 52.4 s (theoretical estimate about 22.6 s), VAE 0.95 s, text encode 0.08 s, total 53.47 s.
 
-
 The comparison is for one block of one step (both the conditional and the unconditional CFG pass). The baseline predates CFG batching (one forward pass at a time), so the section 9.2 measurements are doubled. Current values come from the raw logs of the block test with the #77 configuration (excluding the FSDP gather that exists only in the block test). Theoretical values assume HiFi2 and BF16 for the baseline and LoFi and BFP8 for the current version (8×8 cores per chip, 1 GHz, 16 cycles per matmul tile, DRAM 288 GB/s).
 
 | Module | Baseline (ms) | Current (ms) | Reduction | Theoretical baseline → current (ms) |
@@ -1001,6 +1132,8 @@ Recorded a full 40-step run with the device profiler (`WAN_PROF_FLUSH_EVERY=5`) 
 **Residual stream at latent resolution (#195) and neighbor pad breakdown, 2026-10-13:** the decoder converted to tiles before the mid block, so only in the layers at 15×13 per chip with 384 channels (the 5 residual blocks of the mid block and the first up block) was the residual stream tiled, and the fusions of #177, #189 and #190 did not apply there. Passing it in row-major and having the a2a attention also add the residual in row-major cut the ops per 5-frame chunk from 212 → 193 and the device time from 73.15 → 72.68 ms. Looking at the zones of the top-level in-place neighbor pad (498 µs): the W-direction sends (set by the number of packets) take about 485 µs, and the H direction takes about 305–343 µs in parallel. Grouping the W sends in the receiver's L1 would make H the floor and save only about 150 µs per call, so it was not pursued.
 
 **Gaps between ops (0.12 ms per block):** most are 0.6 µs, but the gap from cross-attn SDPA → the output projection AGMM is 32 µs, from the q/k norm → ring SDPA 22 µs, and the 3 gaps before norms are 5–7 µs. In the 32 µs gap, the 72 cores of the AGMM all start at the same time (within 0.4 µs), so it is a dispatch wait, not a kernel wait. The Tensix kernel config region (a ring buffer that holds kernel binaries and runtime args) is 69 KB by default on WH, and the kernel binaries are about 60 KB for ring SDPA, about 50 KB for cross-attn SDPA, about 29 KB for norms and about 18 KB for AGMM. When an op and the previous op together exceed 69 KB, the next op's binaries are written only after the previous op finishes. → #109 in section 10.
+
+[↑ Back to contents](#contents)
 
 ## 10. Optimization history (Wan 2.2 T2V 480p, WH Galaxy 4×8)
 
@@ -1406,30 +1539,21 @@ Changes are stacked on the tt-metal branch `hkato/wan-wh-opt` (base `a1146e45eef
 
 ![#249 (left) and #154 (right, Ethernet dispatch, default config)](img/wan22_154_eth_dispatch_cmp.jpg)
 
-
 ![#128 (top) and #130 (bottom, rejected, hazy)](img/wan22_130_exp_fast_cmp.jpg)
-
 
 ![#126 (top) and #128 (bottom)](img/wan22_128_qk_sb18_cmp.jpg)
 
-
 ![#123 (top) and #126 (bottom)](img/wan22_126_ln_post_fuse_hifi2_cmp.jpg)
-
 
 ![#123 (top) and #125 (bottom)](img/wan22_125_ln_post_fuse_cmp.jpg)
 
-
 ![#120 (left) and #123 (right)](img/wan22_123_ln_fpu_pre_cmp.jpg)
-
 
 ![#114 (left) and #117 (right)](img/wan22_117_sdpa_final_bf8_cmp.jpg)
 
-
 ![#112 (left) and #114 (right)](img/wan22_114_temb_fold_cmp.jpg)
 
-
 ![#109 (left) and #111 (right)](img/wan22_111_projout_tp_cmp.jpg)
-
 
 ### #1 details: FFN2 unfused
 
@@ -1462,7 +1586,6 @@ Whole pipeline (480p):
 
 **Next options:** Like the H3 follow-up PR (#57941), searching for a fused MM+RS config for the WH 8×9 grid and adding it back could be even faster than unfused (in H3, the whole ff2 went from 10.27 → 8.24 ms).
 
-
 ### #2 details: Matmul blocking for WH, and retuning the fused MM+RS
 
 - **Motivation:** Item 4 of section 9.3. All main DiT matmuls (M=4096) ran with the generic config (8,8,8). The FFN2 fused MM+RS had no WH config (#1 worked around it by going unfused).
@@ -1485,7 +1608,6 @@ Whole pipeline (480p):
 - The remaining generic-config warnings are only for small matmuls: M=32 (timestep embedding), M=512 (text side), and M=6240 (VAE, etc.).
 
 ![Frame comparison at 3 s (left: #0 baseline, middle: #2a, right: #2b)](img/wan22_02_cmp3s.jpg)
-
 
 ### #3 details: ring SDPA chunk size
 
@@ -1524,7 +1646,6 @@ Whole pipeline (480p):
 - **Check:** 480p (M=4,096) gives True (tuned fused path), 720p (M=9,472) gives False (unfused). With no environment variable, 480p takes 97.38 s (same as #3) and 720p takes 311.22 s (same as the unfused (c), 311.33 s). Both show 0 warnings about the fused MM+RS default config.
 - On BH the rule engine returns a config, so it stays fused as before (not verified, because no BH environment was available).
 
-
 ### #5a details: FSDP weight prefetch (no effect)
 
 - **Goal:** Finish the FSDP weight gather (about 2.9 ms per layer, running at the bandwidth limit) during SDPA (about 13 ms), so that the matmuls do not wait for weights.
@@ -1539,7 +1660,6 @@ With prefetch:  … weight gather 3.502 → 3.855 | SDPA 3.872 → 16.930 | out 
 - The output projection no longer waits for weights and shrank from 1.62 → 1.21 ms, but **SDPA did not start until the weight gather finished**, so the order just swapped and the gain cancelled out (block 29.46 → 29.55 ms). A matmul can start while it partly overlaps the preceding weight gather, but SDPA does not overlap.
 - **Conclusion:** With the current setup ("one sub-device over all cores"), the weight gather cannot be hidden behind SDPA. Hiding it needs splitting the cores into sub-devices (`tech_reports/SubDevices/`) and managing synchronization by hand, which is close to rebuilding the CCL management. The switch stays in the code (default off).
 - **Alternative:** If memory allows, stop FSDP for some weights only (for example, the FFN) and keep them resident, which removes that part of the weight gather.
-
 
 ### #5b preparation: Free device memory, and the steps each of the two models handles (2026-10-01)
 
@@ -1564,8 +1684,6 @@ With prefetch:  … weight gather 3.502 → 3.855 | SDPA 3.872 → 16.930 | out 
 - **Not yet checked:** At 720p the activations are larger, so it is unclear whether it fits in memory. It is not the default; it is enabled through an environment variable.
 
 ![At 3 s (left: #3, right: #5b)](img/wan22_05b_cmp3s.jpg)
-
-
 
 ### #6 details: Dropping fp32 accumulation in the FFN (C)
 
@@ -1594,8 +1712,6 @@ With prefetch:  … weight gather 3.502 → 3.855 | SDPA 3.872 → 16.930 | out 
 
 ![#6 video at 0.5 s / 3 s / 4.9 s](img/wan22_06_seq.jpg)
 
-
-
 ### #6b details: No fp32 accumulation for the attention projections either (optional, default off)
 
 - **Search** (no fp32 accumulation, subblocks up to 8 tiles):
@@ -1612,7 +1728,6 @@ With prefetch:  … weight gather 3.502 → 3.855 | SDPA 3.872 → 16.930 | out 
 - **Decision:** The extra speed is small for how much the picture changes, and it has not been checked with quality metrics (CLIP / VBench) either, so it **stays as an optional switch, default off** (2026-10-01).
 
 ![At 3 s (left: #5b, middle: #6, right: #6b)](img/wan22_06b_cmp3s.jpg)
-
 
 ### #21 details: LoFi for the ring SDPA matmuls only (2026-10-05)
 
@@ -2395,6 +2510,8 @@ How much an optimization effort achieves depends on how many ideas can be tried,
 - Recovery steps: kill leftover processes → `tt-smi -glx_reset` → check with `tt-smi -s` that all 32 chips are idle (about 500 MHz, about 17 W) → confirm operation with a short e2e. If DRAM retraining fails, reset again.
 - After an abnormal exit, the clocks can stay high (1,000 MHz). A pre-run gate (power, clock) detects this and stops the run.
 
+[↑ Back to contents](#contents)
+
 ## 11. Q&A notes (2026-09-30)
 
 Answers to questions that came up during the work, collected for later reference. Numbers come from the same measurements as sections 9 and 10.
@@ -2457,6 +2574,8 @@ See section 9.4. It combines "matmul → communication → epilogue" in one kern
 - Result: one e2e run (2 steps) that builds 2 caches went from **about 45 minutes to 4 minutes 50 seconds**.
 - An incremental C++ rebuild takes 0.5-1.5 minutes (the earlier "5-10 minutes" was an overestimate).
 
+[↑ Back to contents](#contents)
+
 ## 12. Operational lessons
 
 - **Wrap pytest (`python -m tracy -r -p -v -m pytest …`) with `TT_METAL_OPERATION_TIMEOUT_SECONDS` and the shell's `timeout`.**
@@ -2465,9 +2584,13 @@ See section 9.4. It combines "matmul → communication → epilogue" in one kern
 - **Matmul blocking sweeps need `MM_SWEEP_PROFILER_DUMP_EVERY=100000`** (on WH Galaxy, running with the default stalls and needs a reset; noted in the H3 README). Errors for combinations that do not fit in L1 (`beyond max L1`, `clash with L1`) are expected, and the sweep continues.
 - **Measure block performance in a warm state.** A single run has host-side waits between ops, which hides the overlap of communication and compute (a conclusion about FSDP had to be corrected because of this).
 
+[↑ Back to contents](#contents)
+
 ## 13. MiniMax-H3
 
 MiniMax-H3 speed-up work is tracked separately.
+
+[↑ Back to contents](#contents)
 
 ## Sources
 

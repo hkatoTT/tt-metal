@@ -4,6 +4,72 @@
 
 This document explains, theme by theme in order of impact, the optimizations that brought Wan 2.2 T2V-A14B (480p, 81 frames, 40 steps) on a WH Galaxy 4×8 from 110.4 s down to about 40.7 s (39.9 s with the optional fast exp). Section 10 of the detailed notes ([NOTES.md](NOTES.md)) has a detailed record of each item. Here, "#number" is the serial number of that experiment.
 
+<!-- toc -->
+## Contents
+
+- [0. How to read this document](#0-how-to-read-this-document)
+  - [0.1 Themes and contributions](#01-themes-and-contributions)
+  - [0.2 Background: what happens in one step](#02-background-what-happens-in-one-step)
+  - [0.3 Glossary](#03-glossary)
+- [1a. Lower precision (BFP8, LoFi, dropping fp32 DEST)](#1a-lower-precision-bfp8-lofi-dropping-fp32-dest)
+  - [(1) Data format from BF16 to BFP8 (about half the bytes moved)](#1-data-format-from-bf16-to-bfp8-about-half-the-bytes-moved)
+  - [(2) Multiplication fidelity to LoFi (fewer multiplication passes)](#2-multiplication-fidelity-to-lofi-fewer-multiplication-passes)
+  - [(3) Accumulation from fp32 to BF16 (twice as many tiles in DEST)](#3-accumulation-from-fp32-to-bf16-twice-as-many-tiles-in-dest)
+  - [What was the bottleneck](#what-was-the-bottleneck) · [What was done](#what-was-done) · [Effect](#effect) · [Did picture quality drop?](#did-picture-quality-drop) · [Costs and pitfalls](#costs-and-pitfalls) · [How to enable](#how-to-enable) · [What did not work](#what-did-not-work)
+- [1b. Resident weights (no more FSDP weight re-gathering)](#1b-resident-weights-no-more-fsdp-weight-re-gathering)
+  - [What was the bottleneck](#what-was-the-bottleneck-1) · [What was done](#what-was-done-1) · [Effect](#effect-1) · [Did the output change?](#did-the-output-change) · [Costs and pitfalls](#costs-and-pitfalls-1) · [How to enable](#how-to-enable-1) · [What did not work](#what-did-not-work-1)
+- [2. ring SDPA (faster attention)](#2-ring-sdpa-faster-attention)
+  - [(1) Compute bigger chunks at a time (#3, #69)](#1-compute-bigger-chunks-at-a-time-3-69)
+  - [(2) Read K and V from DRAM fewer times (#45, #78)](#2-read-k-and-v-from-dram-fewer-times-45-78)
+  - [(3) Less work for the pack thread (#118, #119, #120, #167)](#3-less-work-for-the-pack-thread-118-119-120-167)
+  - [(4) Others (#128, #117)](#4-others-128-117)
+  - [How ring SDPA works](#how-ring-sdpa-works) · [What was the bottleneck](#what-was-the-bottleneck-2) · [What was done](#what-was-done-2) · [Effect](#effect-2) · [Did the output change?](#did-the-output-change-1) · [Costs and pitfalls](#costs-and-pitfalls-2) · [How to enable](#how-to-enable-2) · [What did not work](#what-did-not-work-2)
+- [3. Matmuls (FFN2 path, AGMM data flow, ring MM+RS)](#3-matmuls-ffn2-path-agmm-data-flow-ring-mmrs)
+  - [(1) Leave the slow FFN2 path (#1, #2b, #4)](#1-leave-the-slow-ffn2-path-1-2b-4)
+  - [(2) Search the AGMM blocking again (#68)](#2-search-the-agmm-blocking-again-68)
+  - [(3) Fix the AGMM data flow (#80, #132, #133)](#3-fix-the-agmm-data-flow-80-132-133)
+  - [(4) A new program for FFN2 (#142, #143)](#4-a-new-program-for-ffn2-142-143)
+  - [How matmuls work](#how-matmuls-work) · [What was the bottleneck](#what-was-the-bottleneck-3) · [What was done](#what-was-done-3) · [Effect](#effect-3) · [Did the output change?](#did-the-output-change-2) · [Costs and pitfalls](#costs-and-pitfalls-3) · [How to enable](#how-to-enable-3) · [What did not work](#what-did-not-work-3)
+- [4. CFG, cross-attention, text (batch the work and stop repeating it)](#4-cfg-cross-attention-text-batch-the-work-and-stop-repeating-it)
+  - [(1) Cache the cross-attention K and V (#10)](#1-cache-the-cross-attention-k-and-v-10)
+  - [(2) Merge the two CFG passes (#15, #36)](#2-merge-the-two-cfg-passes-15-36)
+  - [(3) Rework cross-attention (#101, #106, #164)](#3-rework-cross-attention-101-106-164)
+  - [How it works](#how-it-works) · [What was wasted](#what-was-wasted) · [What was done](#what-was-done-4) · [Effect](#effect-4) · [Did the output change?](#did-the-output-change-3) · [Costs and pitfalls](#costs-and-pitfalls-4) · [How to enable](#how-to-enable-4) · [What did not work](#what-did-not-work-4)
+- [5. Dispatch and runtime (8×10 cores, 3 SP links, kernel config region)](#5-dispatch-and-runtime-810-cores-3-sp-links-kernel-config-region)
+  - [(1) Enlarge the kernel config region (#109, #157, #165)](#1-enlarge-the-kernel-config-region-109-157-165)
+  - [(2) Dispatch on Ethernet cores and compute on 80 cores (#154, #155)](#2-dispatch-on-ethernet-cores-and-compute-on-80-cores-154-155)
+  - [(3) Fix the exposed races (#156, #162)](#3-fix-the-exposed-races-156-162)
+  - [How it works](#how-it-works-1) · [What was the bottleneck or waste](#what-was-the-bottleneck-or-waste) · [What was done](#what-was-done-5) · [Effect](#effect-5) · [Did the output change?](#did-the-output-change-4) · [Costs and pitfalls](#costs-and-pitfalls-5) · [How to enable](#how-to-enable-5) · [What did not work](#what-did-not-work-5)
+- [6. Normalization, activation and head ops (speed up or remove small ops)](#6-normalization-activation-and-head-ops-speed-up-or-remove-small-ops)
+  - [(1) Faster GELU (#30, #84)](#1-faster-gelu-30-84)
+  - [(2) Remove head reordering ops (#102, #104, #105, #77)](#2-remove-head-reordering-ops-102-104-105-77)
+  - [(3) Faster normalization (#103, #123, #125, #126)](#3-faster-normalization-103-123-125-126)
+  - [How it works](#how-it-works-2) · [What was the bottleneck or waste](#what-was-the-bottleneck-or-waste-1) · [What was done](#what-was-done-6) · [Effect](#effect-6) · [Did the output change?](#did-the-output-change-5) · [Costs and pitfalls](#costs-and-pitfalls-6) · [How to enable](#how-to-enable-6) · [What did not work](#what-did-not-work-6)
+- [7. VAE (decoding latents back into video)](#7-vae-decoding-latents-back-into-video)
+  - [(1) Bigger chunks and a search for convolution configs (#75, #92, #94, #185)](#1-bigger-chunks-and-a-search-for-convolution-configs-75-92-94-185)
+  - [(2) Less data movement (#93, #95-#99, #174-#178, #189-#195)](#2-less-data-movement-93-95-99-174-178-189-195)
+  - [(3) Less host-side jitter and waiting (#100, #180, #184)](#3-less-host-side-jitter-and-waiting-100-180-184)
+  - [How it works](#how-it-works-3) · [What was the bottleneck or waste](#what-was-the-bottleneck-or-waste-2) · [What was done](#what-was-done-7) · [Effect](#effect-7) · [Did the output change?](#did-the-output-change-6) · [Costs and pitfalls](#costs-and-pitfalls-7) · [How to enable](#how-to-enable-7) · [What did not work](#what-did-not-work-7)
+- [8. Outside the blocks, host side, measurement conditions](#8-outside-the-blocks-host-side-measurement-conditions)
+  - [How it works](#how-it-works-4) · [What was wasted](#what-was-wasted-1) · [What was done](#what-was-done-8) · [Effect](#effect-8) · [Costs and pitfalls](#costs-and-pitfalls-8) · [How to enable](#how-to-enable-8)
+- [9. Running experiments efficiently](#9-running-experiments-efficiently)
+  - [9.1 Narrow down with cheap measurements, confirm with expensive ones](#91-narrow-down-with-cheap-measurements-confirm-with-expensive-ones)
+  - [9.2 Faster experiment setup (weight cache)](#92-faster-experiment-setup-weight-cache)
+  - [9.3 Deciding what to try](#93-deciding-what-to-try)
+  - [9.4 Measuring correctly](#94-measuring-correctly)
+  - [9.5 Checking output changes](#95-checking-output-changes)
+- [10. Dealing with hangs](#10-dealing-with-hangs)
+  - [10.1 What a hang is](#101-what-a-hang-is)
+  - [10.2 Steps when a hang happens](#102-steps-when-a-hang-happens)
+  - [10.3 Things to watch after a reset](#103-things-to-watch-after-a-reset)
+  - [10.4 Finding the cause](#104-finding-the-cause)
+  - [10.5 Counting hangs](#105-counting-hangs)
+  - [10.6 Running experiments that hang less](#106-running-experiments-that-hang-less)
+  - [10.7 Remaining hangs](#107-remaining-hangs)
+- [Appendix. Environment variables of the best configuration](#appendix-environment-variables-of-the-best-configuration)
+
+<!-- /toc -->
+
 ## 0. How to read this document
 
 ### 0.1 Themes and contributions
@@ -59,6 +125,8 @@ The −69.7 s from 110.39 s to 40.7 s is split across themes by stacking the ado
 | **The composition changes** | Small numeric differences accumulate over 40 steps, and the same seed gives a different picture (the kind or position of the butterfly, etc.). This is a separate matter from picture quality degradation |
 | **Changes slightly** | Something like the order of additions changes, and details (such as the angle of the wings) shift slightly. The composition is the same |
 | **Output unchanged (bit-identical)** | The output values do not change by a single bit after the speedup. The video is exactly the same as before the change |
+
+[↑ Back to contents](#contents)
 
 ## 1a. Lower precision (BFP8, LoFi, dropping fp32 DEST)
 
@@ -160,6 +228,7 @@ Only #21 (LoFi for the ring SDPA matmuls) is enabled by default in the code. The
 - All SDPA inputs in BFP4 (a 4-bit format, half again) (#116): ring SDPA −2%, but the block PCC dropped to 99.51%.
 - Skipping the type conversion before the output projection and feeding BF16 to the AGMM (#88): the all-gather volume doubled, and it got slower.
 
+[↑ Back to contents](#contents)
 
 ## 1b. Resident weights (no more FSDP weight re-gathering)
 
@@ -247,6 +316,8 @@ Off by default in the code; enabled with environment variables (see section 0.2 
 
 - **Weight prefetch (#5a):** The idea was to start gathering the output projection weights before ring SDPA and hide the gather behind SDPA. SDPA then had to wait for the same communication resources, so there was no gain (+0.3%).
 - **Making the low-noise FFN resident first (#24):** As shown in the table above, there was not enough memory. It fit only after the text encoder was split (#51).
+
+[↑ Back to contents](#contents)
 
 ## 2. ring SDPA (faster attention)
 
@@ -384,6 +455,8 @@ The (256, 512) of #3 is the code default. The rest are enabled with environment 
 - **A separate ring SDPA op meant for BH (#41):** It did not fit in L1 on WH 4×8 and did not run.
 - **Reordering the processing (#168, #171):** Grouping the work to reduce engine configuration switches cut the time during which the three threads can run at once, and it got slower.
 
+[↑ Back to contents](#contents)
+
 ## 3. Matmuls (FFN2 path, AGMM data flow, ring MM+RS)
 
 **Contribution:** −10.8 s (16% of the total).
@@ -506,6 +579,8 @@ Most items either do not change the output or shift details slightly because of 
 - **Batching the GELU post-processing (#121):** The same trick as #120 in chapter 2, but in FFN1 that work was already hidden, so nothing changed.
 - **Sharing the weight reads in the ring FFN2 (#145):** The synchronization overhead was heavy, and it got slower (1.97 → 2.84 ms).
 
+[↑ Back to contents](#contents)
+
 ## 4. CFG, cross-attention, text (batch the work and stop repeating it)
 
 **Contribution:** −9.7 s (14% of the total).
@@ -596,6 +671,8 @@ When comparing with older videos or checking reproducibility, `WAN_CFG_BATCH=0` 
 - **Q chunk 128 to remove the imbalance (considered for #36):** The imbalance goes away, but chunk 128 itself was about 1.5x slower for the same number of rows.
 - **A 1×8 subblock for the cross-attention SDPA matmul (#129):** The same trick as #128 in chapter 2, but nothing changed.
 - **Less compute in the cross-attention SDPA (#131):** Measured with a timing-only variant, compute was only about 0.06 ms of the 0.37 ms op, so there was nothing to cut.
+
+[↑ Back to contents](#contents)
 
 ## 5. Dispatch and runtime (8×10 cores, 3 SP links, kernel config region)
 
@@ -691,6 +768,8 @@ The #156 fix is the code default and is always on.
 - **Relaying the ring SDPA K and V without all-gather workers (#150, parked):** The ring SDPA writer relays K and V one chip at a time. ring SDPA got faster (15.39 → 13.89 ms) and so did e2e (45.00 → 43.48 s), but in the chained block test about 30% of the runs gave a different result (cause not identified), so it is parked.
 - **FFN2 on 8×10 too:** The ring FFN2 (#142 in chapter 3) did not get faster on 80 cores (1.95 → 1.98-2.02 ms).
 
+[↑ Back to contents](#contents)
+
 ## 6. Normalization, activation and head ops (speed up or remove small ops)
 
 **Contribution:** −2.9 s (4% of the total).
@@ -781,6 +860,8 @@ The GELU polynomials of #30 and #84 are the code default (they apply when DEST i
 
 ![Reference: an experiment with Wan 2.1 (1.3B) on a P150. Top: the tanh approximation of GELU (gelu_tanh, the same as in training). Bottom: the piecewise-linear approximation (gelu_fast). The bottom one has a flat green background and has lost its texture](img/gelu_full.jpg)
 
+[↑ Back to contents](#contents)
+
 ## 7. VAE (decoding latents back into video)
 
 **Contribution:** −1.2 s (2% of the total). The VAE time itself fell to a quarter (1.36 → 0.34 s), but it was only about 1% of the total to begin with, so its contribution is small.
@@ -863,6 +944,8 @@ The convolution config table from #92 on and the #174-#197 changes are the code 
 - **Skipping the convolution input assembly (#187):** Even skipping it entirely gave only 3-6%, so it was judged not worth a rewrite.
 - **Receiving the halo inside the convolution (halo mode):** It hung in the launch synchronization on WH 4×8, so it is parked.
 
+[↑ Back to contents](#contents)
+
 ## 8. Outside the blocks, host side, measurement conditions
 
 **Contribution:** −0.6 s (1% of the total).
@@ -911,6 +994,8 @@ The convolution config table from #92 on and the #174-#197 changes are the code 
 | `WAN_TEMB_BATCH=1` | #166 |
 
 The measurement sync is turned on with `WAN_STEP_TIMING=1`. The current default time (40.7 s) was measured with `WAN_STEP_TIMING=0` (no sync).
+
+[↑ Back to contents](#contents)
 
 ## 9. Running experiments efficiently
 
@@ -975,6 +1060,8 @@ Other setup times:
 - **Look at the video, not just the PCC:** Even when the PCC of one forward is almost the same, picture quality can collapse after 40 steps (the gelu_fast example in chapter 6). For a change that alters the output, always line up the frames and look at them.
 - **Compare latents:** If the video differs, compare the final latent (saved with `WAN_DUMP_LATENTS=<file>`) with the baseline to tell whether the difference comes from denoising or from the VAE. Per-step hashes (`WAN_STEP_HASH=1`) show the step at which the runs diverged.
 - **A matching e2e does not prove that there is no race:** e2e has regular timing, so rare races seldom show up. A change that touches inter-chip or inter-core synchronization is adopted only after the chained block test has run 6-10 times and the hashes have been compared (the #143 race was found by the chained test, although e2e had matched about 10 times).
+
+[↑ Back to contents](#contents)
 
 ## 10. Dealing with hangs
 
@@ -1041,6 +1128,8 @@ With rare hangs, a small number of runs tells you nothing.
   - In these hangs, the hand-off of engine inputs (SrcA, SrcB) is out of step. `TT_RING_SDPA_SFPU_GO` from #167 fixed one pattern, but other patterns remain.
   - The hangs concentrated on a few specific chips out of the 32. A different kind of hang, in the matmul output writes, also appeared on the same chips. A hardware-specific cause is possible, so the investigation was stopped (2026-10-12). Running the same configuration on another Galaxy would tell the two apart.
 - **VAE hangs:** The 10th-row convolution hangs no longer appear after #197 (convolutions on 8×9).
+
+[↑ Back to contents](#contents)
 
 ## Appendix. Environment variables of the best configuration
 

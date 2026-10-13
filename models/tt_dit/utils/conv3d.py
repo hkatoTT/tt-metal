@@ -518,6 +518,10 @@ _BLOCKINGS_8X10_RESWEEP = {
     (4, 8, 96, 96, (3, 3, 3), 22, 120, 104): (96, 96, 4, 8, 4),  # up3_res — fallback 2178 -> 2110us
     (4, 8, 192, 96, (1, 3, 3), 20, 120, 104): (192, 96, 1, 16, 2),  # up2_spatial — fallback 1525 -> 1501us
 }
+# The rows before the re-sweep stay in use on grids with fewer than 10 rows (Tensix dispatch, or the WH Galaxy VAE
+# conv3d default of 9 rows): there they are faster (VAE decode on 8x9: 410 ms with the re-swept rows, 354 ms without,
+# 2026-10-13). Same C_in blocks either way, so the same values.
+_BLOCKINGS_PRE_RESWEEP = dict(_BLOCKINGS)
 if os.environ.get("WAN_C3D_RESWEEP", "1") != "0":
     _BLOCKINGS.update(_BLOCKINGS_8X10_RESWEEP)
 
@@ -698,7 +702,7 @@ def get_conv3d_config(
     blocking_key = (h_factor, w_factor, in_channels, out_channels, kernel_size, T, H, W)
     channel_key = (in_channels, out_channels, kernel_size)
 
-    exact = _BLOCKINGS.get(blocking_key)
+    exact = (_BLOCKINGS if grid_size.y >= 10 else _BLOCKINGS_PRE_RESWEEP).get(blocking_key)
     if exact is not None:
         C_in_block, C_out_block, T_out_block, H_out_block, W_out_block = exact
     else:

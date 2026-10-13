@@ -60,6 +60,22 @@ _RM_RESID = os.environ.get("WAN_VAE_RM_RESID", "1") == "1"
 _NP_CACHE = os.environ.get("WAN_VAE_NP_CACHE", "1") == "1"
 
 
+def _c3d_grid(mesh_device):
+    # conv3d core grid. On the WH Galaxy with ethernet dispatch (8x10 grid, #154) one conv3d core of logical row 9 of
+    # one chip deadlocks now and then (VAE hang bisect 2026-10-13: conv3d on 8x10 8 hangs in 630 decodes, on 8x9 0 in
+    # 1,876), so there conv3d stays on the first 9 rows by default (same blockings and K order, so the same values;
+    # VAE ~+78 ms). Other systems keep the full grid. WAN_VAE_C3D_GRID_Y=0 uses the full device grid, another value
+    # caps the rows there.
+    g = mesh_device.compute_with_storage_grid_size()
+    v = os.environ.get("WAN_VAE_C3D_GRID_Y")
+    if v is None:
+        wh_galaxy = ttnn.cluster.get_cluster_type() in (ttnn.cluster.ClusterType.GALAXY, ttnn.cluster.ClusterType.TG)
+        y = 9 if wh_galaxy else 0
+    else:
+        y = int(v)
+    return ttnn.CoreCoord(g.x, min(g.y, y)) if y > 0 else g
+
+
 # The residual add of the row-major residual blocks is done inside conv2 (conv3d residual_tensor: the writer reads
 # the residual rows, compute adds them to the bf16 conv result before the untilize; bit-identical). Only for conv2
 # configs with one C_in block and full-block output (see WanCausalConv3d.can_fuse_residual). WAN_VAE_C3D_RESID=0
@@ -513,7 +529,7 @@ class WanCausalConv3d(Module):
             self.out_channels,
             self.kernel_size,
             dtype,
-            grid_size=self.mesh_device.compute_with_storage_grid_size(),
+            grid_size=_c3d_grid(self.mesh_device),
             h_factor=self.parallel_config.height_parallel.factor,
             w_factor=self.parallel_config.width_parallel.factor,
             T=conv_dims.T,
@@ -1123,7 +1139,7 @@ class WanConv2d(Module):
             self.out_channels,
             self.kernel_size,
             dtype,
-            grid_size=self.mesh_device.compute_with_storage_grid_size(),
+            grid_size=_c3d_grid(self.mesh_device),
             h_factor=self.parallel_config.height_parallel.factor,
             w_factor=self.parallel_config.width_parallel.factor,
             T=conv_dims.T,

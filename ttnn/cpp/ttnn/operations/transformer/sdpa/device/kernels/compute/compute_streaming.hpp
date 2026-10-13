@@ -115,6 +115,8 @@ constexpr uint32_t sliding_q_plan_max_source_ranges =
 constexpr bool sliding_local_first = SLIDING_LOCAL_FIRST;
 #else
 constexpr bool sliding_local_first = false;
+#endif
+
 #ifdef HK_PV_SUM
 // EXPERIMENT (hkato): softmax row sums from the P.V matmul. A fifth SrcA tile per K row, the ones column
 // (1 in column 0, V's format, made by the writer), turns P[r,k] x ones into the row sum of P[r,k] in column 0 of

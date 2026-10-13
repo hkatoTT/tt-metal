@@ -36,7 +36,8 @@ void SDPAOperation::validate_on_program_cache_miss(const SDPAParams& attrs, cons
         TT_FATAL(
             !tensors.page_table.has_value() && !attrs.chunk_start_idx.has_value() &&
                 !tensors.chunk_start_idx_tensor.has_value() && !tensors.attn_mask.has_value() && !attrs.is_causal &&
-                !tensors.attention_sink.has_value() && !attrs.is_windowed,
+                !tensors.attention_sink.has_value() && attrs.windowed_mode == WindowedMode::None &&
+                !attrs.sliding_window_size.has_value(),
             "sum_col_weight is supported for the plain non-causal SDPA without mask / sink only");
     }
 

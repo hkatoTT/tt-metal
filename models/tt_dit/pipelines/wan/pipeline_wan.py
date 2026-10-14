@@ -70,6 +70,7 @@ _PRESETS_WH: dict[tuple[int, ...], dict] = {
         "topology": ttnn.Topology.Ring,
         "is_fsdp": True,
         "cfg_batch": True,
+        "cross_kv_cache": True,
     },
 }
 
@@ -162,6 +163,7 @@ class WanPipelineConfig:
     cache_config: WanDBCacheConfig | None = None
 
     cfg_batch: bool = False
+    cross_kv_cache: bool = False
 
     @classmethod
     def default(
@@ -191,6 +193,7 @@ class WanPipelineConfig:
         checkpoint_name: str = _DEFAULT_CHECKPOINT,
         cache_config: WanDBCacheConfig | DBCacheConfig | None = _UNSET,
         cfg_batch: bool | None = None,
+        cross_kv_cache: bool | None = None,
     ) -> WanPipelineConfig:
         """The preset for ``mesh_shape``.
 
@@ -276,6 +279,7 @@ class WanPipelineConfig:
             checkpoint_name=checkpoint_name,
             cache_config=WanDBCacheConfig.coerce(cache_config) if cache_config is not None else None,
             cfg_batch=cfg_batch if cfg_batch is not None else preset.get("cfg_batch", False),
+            cross_kv_cache=cross_kv_cache if cross_kv_cache is not None else preset.get("cross_kv_cache", False),
         )
 
 
@@ -334,6 +338,10 @@ class WanPipeline(PipelineAPIMixin):
             twice the rows. Faster, but needs memory for twice the activations; the output is not bit-identical
             to two forwards (other matmul shapes, so another accumulation order). On in the WH Galaxy 4x8 preset.
             Calls that run with DBCache step caching run the two passes separately.
+        cross_kv_cache (`bool`, *optional*, defaults to `False`):
+            Whether to compute the cross-attention K/V of each prompt once per generation instead of in every
+            denoising step. Costs the DRAM of the cached K/V; off while tracing and in calls with DBCache step
+            caching. On in the WH Galaxy 4x8 preset.
     """
 
     @classmethod
@@ -435,6 +443,7 @@ class WanPipeline(PipelineAPIMixin):
         self.checkpoint_name = config.checkpoint_name
         self.model_type = config.model_type
         self._cfg_enabled = config.cfg_enabled
+        self._cross_kv_cache = config.cross_kv_cache
         self._resolutions = config.resolutions
         self._spatial_buckets_per_frame = sorted(set(config.spatial_buckets_per_frame))
         self._num_frames = config.num_frames
@@ -1024,6 +1033,12 @@ class WanPipeline(PipelineAPIMixin):
         on_event(SectionEnd("prepare_latents"))
 
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+
+        # A trace captured on a cross-attention K/V cache hit has no K/V ops, so the cache stays off under trace.
+        # It stays off with DBCache too: the cache runners stage the cond and uncond prompts in one shared input
+        # tensor, and the K/V cache is keyed by the prompt tensor, so the uncond pass would get the cond K/V.
+        for model in (self.transformer, self.transformer_2):
+            model.set_cross_kv_cache_enabled(self._cross_kv_cache and not traced and cache_runners is None)
 
         # 6. Denoising loop
         if effective_boundary_ratio is not None:

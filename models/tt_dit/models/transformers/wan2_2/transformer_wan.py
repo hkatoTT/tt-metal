@@ -48,6 +48,7 @@ class WanTransformerBlock(Module):
         ccl_manager: CCLManager | None = None,
         parallel_config: DiTParallelConfig,
         is_fsdp: bool = False,
+        ffn_fsdp: bool = True,
         sdpa_chunk_size_overrides: dict | None = None,
         lora_enabled: bool = False,
     ) -> None:
@@ -122,7 +123,8 @@ class WanTransformerBlock(Module):
             mesh_device=mesh_device,
             mesh_axis=parallel_config.tensor_parallel.mesh_axis,
             ccl_manager=ccl_manager,
-            fsdp_mesh_axis=fsdp_mesh_axis,
+            # ffn_fsdp=False keeps the FFN weights resident (TP-sharded only), without the per-block gathers of FSDP
+            fsdp_mesh_axis=fsdp_mesh_axis if ffn_fsdp else None,
             lora_enabled=lora_enabled,
         )
 
@@ -299,6 +301,7 @@ class WanTransformer3DModel(Module):
         output_dtype: ttnn.DataType = ttnn.float32,
         lora_enabled: bool = False,
         cfg_batch: bool = False,
+        ffn_fsdp: bool = True,
     ) -> None:
         super().__init__()
 
@@ -306,6 +309,8 @@ class WanTransformer3DModel(Module):
         self.ccl_manager = ccl_manager
         self.parallel_config = parallel_config
         self.is_fsdp = is_fsdp
+        # With is_fsdp, ffn_fsdp=False keeps only the FFN weights resident (the rest stays FSDP)
+        self.ffn_fsdp = ffn_fsdp
         self.lora_enabled = lora_enabled
         # Run the cond and uncond passes of classifier-free guidance as one forward (see inner_step_cfg)
         self.cfg_batch = cfg_batch
@@ -361,6 +366,7 @@ class WanTransformer3DModel(Module):
                 ccl_manager=ccl_manager,
                 parallel_config=parallel_config,
                 is_fsdp=is_fsdp,
+                ffn_fsdp=ffn_fsdp,
                 lora_enabled=lora_enabled,
             )
             for i in range(num_layers)
@@ -843,10 +849,12 @@ class WanCheckpoint:
         model_type: str,
         lora_enabled: bool = False,
         cfg_batch: bool = False,
+        ffn_resident: bool = False,
     ) -> WanTransformer3DModel:
         """Construct a ``WanTransformer3DModel`` for this checkpoint (weights NOT loaded).
 
         Loading is deferred so the caller can manage the lifecycle (deallocate / reload).
+        With ``is_fsdp``, ``ffn_resident`` keeps the FFN weights resident instead of FSDP-gathered.
         """
         c = self._config
         return WanTransformer3DModel(
@@ -868,6 +876,7 @@ class WanCheckpoint:
             model_type=model_type,
             lora_enabled=lora_enabled,
             cfg_batch=cfg_batch,
+            ffn_fsdp=not ffn_resident,
         )
 
     def load(
@@ -879,11 +888,14 @@ class WanCheckpoint:
         is_fsdp: bool,
     ) -> None:
         """Load (or reload) weights for a previously-built transformer."""
+        # Resident FFN weights are stored with another sharding, so they get their own cache entry. Read off the
+        # model, so the key cannot drift from what was built.
+        resident_ffn = is_fsdp and not model.ffn_fsdp
         cache.load_model(
             tt_model=model,
             get_torch_state_dict=lambda: self._state_dict,
             model_name=os.path.basename(self._name),
-            subfolder=self._subfolder,
+            subfolder=f"{self._subfolder}_resident_ffn" if resident_ffn else self._subfolder,
             parallel_config=parallel_config,
             mesh_shape=tuple(mesh_device.shape),
             mesh_device=mesh_device,

@@ -41,7 +41,7 @@
 
   With the cross-attention fused add that was dropped from the series (section 6), the two branches took 82.97–83.29 s and 64.78–64.88 s at 480p (4 runs each). Before the rebase (main `e7c94bbed8b`, with that add): 110.8 / 83.0 / 64.0–64.2 s at 480p and 347.0 / 316.3 / 273.5 s at 720p; on the new main the preset is about 0.7 s slower at 480p and 3.4 s at 720p, the other rows are unchanged.
 - **Other meshes are unchanged by default.** Every new setting is a `WanPipelineConfig` field that only the WH 4×8 preset turns on, a table row that only matches WH 4×8 shapes, or the opt-in preset. The one rule that applies everywhere (2.2) keeps the fused FFN2 path wherever a fused config resolves, which includes the Blackhole Galaxy grid.
-- **Quality.** Both branches pass the CI quality test (`test_pipeline_wan.py`, 720p). Over the 6 perf-test prompts × 7 seeds, the bf8 preset lowers VBench `imaging_quality` by about 2 % at 480p and 720p and leaves CLIP, consistency and motion unchanged (section 5).
+- **Quality.** With the prompt and settings of the CI quality test (`test_pipeline_wan.py`) over seeds 42–46, the perf branch matches main, and seed 42 (what CI runs) passes the floors for all configurations. The bf8 preset lowers VBench `imaging_quality` by 2.7 % (720p) and 5.2 % (480p) on that prompt, and by about 2 % over the 6 perf-test prompts × 7 seeds; CLIP, consistency and motion change little (section 5).
 
 ## 1. The commits at a glance
 
@@ -159,7 +159,7 @@ What the preset sets:
 
 ## 5. Output and quality
 
-The measurements in this section were taken before the cross-attention fused add was dropped from the series (section 6). Without it the add is rounded once more, so the videos differ slightly from the ones measured here.
+Section 5.2 was measured on the final branches. Sections 5.1, 5.3 and 5.4 were measured before the cross-attention fused add was dropped from the series (section 6); without it the add is rounded once more, so the videos differ slightly from the ones measured there.
 
 ### 5.1 Run-to-run
 
@@ -175,22 +175,32 @@ The measurements in this section were taken before the cross-attention fused add
   Since some runs still reproduce the pre-rebase videos bit for bit, the results are not computed differently; they are no longer repeatable. The scenes stay the same. One more main run hung (1 of 4 main runs at 480p); none of the 10 runs of the PR branches on this main did.
 - **720p.** Already on main `e7c94bbed8b`, repeated runs differed slightly (3 of 3 differ, mean absolute difference 2.4–3.0). The branches behaved the same way. Compare 720p against a spread of repeats, not one run.
 
-### 5.2 CI quality test
+### 5.2 CI quality test, seed 42 and five seeds
 
-`test_pipeline_wan.py` with the WH Galaxy CI selection (`4x8sp1tp0nl4_ring_is_fsdp1`): one video (seed 42), CLIP over 8 frames and 5 VBench dimensions against fixed floors.
+The prompt and settings of `test_pipeline_wan.py` with the WH Galaxy CI selection (`4x8sp1tp0nl4_ring_is_fsdp1`; boxing cats, 81 frames, 40 steps), scored with its CLIP (8 frames) and VBench code, on main `3d5782d0f4c`. Seed 42 is what CI runs; the means are over seeds 42–46. The floors are the current ones (after #60488).
 
-| 720p | Floor (old / after #60488) | main | `wan22-wh-galaxy-perf` (2 runs) | + bf8 preset |
-|---|---|---|---|---|
-| CLIP mean | 36.0 | 37.87 | 39.19 / 39.22 | 36.94 |
-| subject_consistency | 0.91 / 0.8 | 0.9271 | 0.9258 / 0.9270 | 0.9229 |
-| background_consistency | 0.92 / 0.8 | 0.9258 | 0.9381 / 0.9437 | 0.9355 |
-| motion_smoothness | 0.955 / 0.9 | 0.9722 | 0.9670 / 0.9668 | 0.9730 |
-| dynamic_degree | 1.0 | 1.0 | 1.0 / 1.0 | 1.0 |
-| imaging_quality | 0.62 / 0.5 | 0.6555 | 0.6455 / 0.6463 | 0.6301 |
+| 720p | Floor | main, seed 42 | perf, seed 42 | + preset, seed 42 | main, mean of 5 | perf, mean of 5 | + preset, mean of 5 |
+|---|---|---|---|---|---|---|---|
+| CLIP | 36.0 | 37.82 | 38.54 | 36.68 | 37.78 | 38.29 | 36.79 |
+| subject_consistency | 0.8 | 0.9262 | 0.9280 | 0.9120 | 0.9308 | 0.9390 | 0.9257 |
+| background_consistency | 0.8 | 0.9275 | 0.9275 | 0.9354 | 0.9519 | 0.9503 | 0.9510 |
+| motion_smoothness | 0.9 | 0.9722 | 0.9676 | 0.9734 | 0.9726 | 0.9726 | 0.9755 |
+| dynamic_degree | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 |
+| imaging_quality | 0.5 | 0.6577 | 0.6495 | 0.5970 | 0.6416 | 0.6371 | 0.6198 |
 
-- All pass. These were measured before the rebase, against the old floors.
-- The test has no quant option; for the preset column the preset was applied to the pipeline with `set_quant_config` before the run, outside the test.
-- At 480p (not in CI), one bf8-preset video scored imaging_quality 0.5195, below the old floor 0.545 and above the current 0.45. Section 5.3 shows that one video's score is within the seed-to-seed spread.
+| 480p | Floor | main, seed 42 | perf, seed 42 | + preset, seed 42 | main, mean of 5 | perf, mean of 5 | + preset, mean of 5 |
+|---|---|---|---|---|---|---|---|
+| CLIP | 36.0 | 36.71 | 36.80 | 36.67 | 37.30 | 37.05 | 37.76 |
+| subject_consistency | 0.8 | 0.9523 | 0.9531 | 0.9433 | 0.9475 | 0.9497 | 0.9398 |
+| background_consistency | 0.8 | 0.9749 | 0.9748 | 0.9723 | 0.9575 | 0.9629 | 0.9519 |
+| motion_smoothness | 0.9 | 0.9793 | 0.9789 | 0.9809 | 0.9722 | 0.9728 | 0.9788 |
+| dynamic_degree | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 |
+| imaging_quality | 0.45 | 0.5650 | 0.5634 | 0.5273 | 0.6462 | 0.6487 | 0.6147 |
+
+- **perf vs main:** no difference beyond the seed-to-seed spread (imaging_quality −0.7 % at 720p, +0.4 % at 480p; it varies by about 0.04–0.05 across seeds).
+- **preset vs perf (paired by seed):** imaging_quality −0.017 (−2.7 %, 3 of 5 seeds lower) at 720p and −0.034 (−5.2 %, 3 of 5) at 480p, where one seed (45) accounts for most of it (−0.136). subject_consistency −0.013 / −0.010. CLIP −1.50 at 720p, +0.71 at 480p.
+- **Floors:** seed 42 passes for all three configurations at both resolutions. Of the 30 videos, one fails a floor: the preset at 720p, seed 44, CLIP 34.31 < 36.0.
+- The test has no quant option; for the preset the preset was applied to the pipeline with `set_quant_config` before generating, outside the test.
 
 ### 5.3 Six prompts × seven seeds
 

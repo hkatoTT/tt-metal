@@ -22,11 +22,11 @@
   <text x="16" y="202" font-size="13" fill="#555">(this PR, WH 4×8 preset)</text>
   <rect x="190" y="160" width="400" height="28" fill="#2b7bd6"/>
   <rect x="190" y="190" width="400" height="28" fill="#ec6a36"/>
-  <rect x="236" y="176" width="308" height="26" rx="4" fill="#000" fill-opacity="0.28"/>
+  <rect x="236" y="176" width="308" height="26" rx="4" fill="#000" fill-opacity="0.5"/>
   <text x="390" y="194" font-size="14" fill="#fff" text-anchor="middle">Matmuls, norms, FFN (8,192 rows, once)</text>
   <rect x="596" y="160" width="160" height="28" fill="#2b7bd6"/>
   <rect x="596" y="190" width="160" height="28" fill="#ec6a36"/>
-  <rect x="602" y="176" width="148" height="26" rx="4" fill="#000" fill-opacity="0.28"/>
+  <rect x="602" y="176" width="148" height="26" rx="4" fill="#000" fill-opacity="0.5"/>
   <text x="676" y="194" font-size="14" fill="#fff" text-anchor="middle">ring SDPA 20 heads</text>
   <text x="776" y="176" font-size="14" fill="#444">Rows stacked: one op launch and one FSDP</text>
   <text x="776" y="195" font-size="14" fill="#444">weight gather instead of two. Attention folds</text>

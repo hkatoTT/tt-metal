@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="330" viewBox="0 0 1120 330" font-family="Helvetica, Arial, sans-serif">
+  <rect width="1120" height="330" fill="#fcfbf9"/>
+  <!-- row 1: two forwards -->
+  <text x="16" y="62" font-size="17" font-weight="bold" fill="#222">Two forwards</text>
+  <text x="16" y="82" font-size="13" fill="#555">(main)</text>
+  <rect x="190" y="40" width="200" height="56" rx="4" fill="#2b7bd6"/>
+  <text x="290" y="64" font-size="14" fill="#fff" text-anchor="middle">Matmuls, norms, FFN</text>
+  <text x="290" y="83" font-size="14" fill="#fff" text-anchor="middle">(4,096 rows)</text>
+  <rect x="396" y="40" width="112" height="56" rx="4" fill="#2b7bd6"/>
+  <text x="452" y="64" font-size="14" fill="#fff" text-anchor="middle">ring SDPA</text>
+  <text x="452" y="83" font-size="14" fill="#fff" text-anchor="middle">10 heads</text>
+  <rect x="524" y="40" width="200" height="56" rx="4" fill="#ec6a36"/>
+  <text x="624" y="64" font-size="14" fill="#fff" text-anchor="middle">Matmuls, norms, FFN</text>
+  <text x="624" y="83" font-size="14" fill="#fff" text-anchor="middle">(4,096 rows)</text>
+  <rect x="730" y="40" width="112" height="56" rx="4" fill="#ec6a36"/>
+  <text x="786" y="64" font-size="14" fill="#fff" text-anchor="middle">ring SDPA</text>
+  <text x="786" y="83" font-size="14" fill="#fff" text-anchor="middle">10 heads</text>
+  <text x="862" y="64" font-size="14" fill="#444">Every block runs twice per step;</text>
+  <text x="862" y="83" font-size="14" fill="#444">only the text differs.</text>
+  <!-- row 2: cfg_batch -->
+  <text x="16" y="182" font-size="17" font-weight="bold" fill="#222">cfg_batch</text>
+  <text x="16" y="202" font-size="13" fill="#555">(this PR, WH 4×8 preset)</text>
+  <rect x="190" y="160" width="400" height="28" fill="#2b7bd6"/>
+  <rect x="190" y="190" width="400" height="28" fill="#ec6a36"/>
+  <rect x="236" y="176" width="308" height="26" rx="4" fill="#000" fill-opacity="0.28"/>
+  <text x="390" y="194" font-size="14" fill="#fff" text-anchor="middle">Matmuls, norms, FFN (8,192 rows, once)</text>
+  <rect x="596" y="160" width="160" height="28" fill="#2b7bd6"/>
+  <rect x="596" y="190" width="160" height="28" fill="#ec6a36"/>
+  <rect x="602" y="176" width="148" height="26" rx="4" fill="#000" fill-opacity="0.28"/>
+  <text x="676" y="194" font-size="14" fill="#fff" text-anchor="middle">ring SDPA 20 heads</text>
+  <text x="776" y="176" font-size="14" fill="#444">Rows stacked: one op launch and one FSDP</text>
+  <text x="776" y="195" font-size="14" fill="#444">weight gather instead of two. Attention folds</text>
+  <text x="776" y="214" font-size="14" fill="#444">the two passes into the head axis (exact).</text>
+  <!-- legend -->
+  <rect x="190" y="268" width="24" height="18" rx="3" fill="#2b7bd6"/>
+  <text x="222" y="282" font-size="14" fill="#444">Prompt (cond)</text>
+  <rect x="360" y="268" width="24" height="18" rx="3" fill="#ec6a36"/>
+  <text x="392" y="282" font-size="14" fill="#444">Negative prompt (uncond)</text>
+  <text x="590" y="282" font-size="13" fill="#666">Rows per device at 480p on WH 4×8 (SP = 8). Lengths are schematic.</text>
+</svg>

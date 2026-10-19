@@ -69,6 +69,7 @@ _PRESETS_WH: dict[tuple[int, ...], dict] = {
         "dynamic_load": False,
         "topology": ttnn.Topology.Ring,
         "is_fsdp": True,
+        "cfg_batch": True,
     },
 }
 
@@ -160,6 +161,8 @@ class WanPipelineConfig:
     # uncached; pass ``cache_config`` there explicitly to override either way.
     cache_config: WanDBCacheConfig | None = None
 
+    cfg_batch: bool = False
+
     @classmethod
     def default(
         cls,
@@ -187,6 +190,7 @@ class WanPipelineConfig:
         max_sequence_length: int = 512,
         checkpoint_name: str = _DEFAULT_CHECKPOINT,
         cache_config: WanDBCacheConfig | DBCacheConfig | None = _UNSET,
+        cfg_batch: bool | None = None,
     ) -> WanPipelineConfig:
         """The preset for ``mesh_shape``.
 
@@ -271,6 +275,7 @@ class WanPipelineConfig:
             max_sequence_length=max_sequence_length,
             checkpoint_name=checkpoint_name,
             cache_config=WanDBCacheConfig.coerce(cache_config) if cache_config is not None else None,
+            cfg_batch=cfg_batch if cfg_batch is not None else preset.get("cfg_batch", False),
         )
 
 
@@ -324,6 +329,11 @@ class WanPipeline(PipelineAPIMixin):
             Whether to cache VAE convolution programs across calls.
         sdpa_t_fracture_w_only (`bool`, *optional*, defaults to `False`):
             Whether to fracture SDPA only along the width dimension for temporal attention.
+        cfg_batch (`bool`, *optional*, defaults to `False`):
+            Whether to run the cond and uncond passes of classifier-free guidance as one transformer forward on
+            twice the rows. Faster, but needs memory for twice the activations; the output is not bit-identical
+            to two forwards (other matmul shapes, so another accumulation order). On in the WH Galaxy 4x8 preset.
+            Calls that run with DBCache step caching run the two passes separately.
     """
 
     @classmethod
@@ -474,6 +484,7 @@ class WanPipeline(PipelineAPIMixin):
             is_fsdp=self.is_fsdp,
             model_type=self.model_type,
             lora_enabled=lora_enabled,
+            cfg_batch=config.cfg_batch,
         )
 
         self.transformer_2 = self._checkpoint_2.build(
@@ -482,6 +493,7 @@ class WanPipeline(PipelineAPIMixin):
             is_fsdp=self.is_fsdp,
             model_type=self.model_type,
             lora_enabled=lora_enabled,
+            cfg_batch=config.cfg_batch,
         )
 
         # The decoder picks its conv3d blockings by size, so each size gets one, but sizes with

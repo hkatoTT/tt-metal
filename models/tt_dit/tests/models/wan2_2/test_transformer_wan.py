@@ -10,7 +10,6 @@ from diffusers import WanTransformer3DModel as TorchWanTransformer3DModel
 from loguru import logger
 
 import ttnn
-from models.common.utility_functions import is_blackhole
 
 from ....models.transformers.wan2_2.transformer_wan import WanTransformer3DModel, WanTransformerBlock
 from ....parallel.config import DiTParallelConfig, ParallelFactor
@@ -115,9 +114,6 @@ def _make_wan_transformer(*, mesh_device, ccl_manager, parallel_config, is_fsdp,
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-# CFG batching (the 14b-480p-b2 block case) is enabled only in the WH Galaxy 4x8 pipeline preset
-_CFG_BATCH_WH_ONLY = pytest.mark.skipif(is_blackhole(), reason="CFG batching is enabled only on WH Galaxy 4x8")
-
 COMMON_MESH_PARAMS = [
     pytest.param(
         (2, 2), 0, 1, 2, line_params_req_exact_devices, ttnn.Topology.Linear, False, id="2x2sp0tp1nl2_line_is_fsdp0"
@@ -165,7 +161,7 @@ COMMON_MESH_PARAMS = [
         pytest.param(1, 31, 40, 80, 512, id="5b-720p"),
         pytest.param(1, 21, 60, 104, 512, id="14b-480p"),
         # CFG batching: the cond and uncond passes in one forward (B = 2 in the reference)
-        pytest.param(2, 21, 60, 104, 512, id="14b-480p-b2", marks=_CFG_BATCH_WH_ONLY),
+        pytest.param(2, 21, 60, 104, 512, id="14b-480p-b2"),
         pytest.param(1, 21, 90, 160, 512, id="14b-720p"),
     ],
 )

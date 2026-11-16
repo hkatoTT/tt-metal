@@ -115,7 +115,12 @@ std::array<Tensor, 3> mhc_split_sinkhorn(
     if (const char* mc = std::getenv("MHC_MAX_CORES"); mc != nullptr) {
         max_cores = static_cast<uint32_t>(std::atoi(mc));
     }
-    auto operation_attributes = OperationType::operation_attributes_t{n, sinkhorn_iters, eps, max_cores};
+    // MHC_SINKHORN_FUSED=0 runs the earlier form (every matmul / SFPU step packed to a CB), the fused form's A/B.
+    uint32_t fused = 1;
+    if (const char* f = std::getenv("MHC_SINKHORN_FUSED"); f != nullptr) {
+        fused = static_cast<uint32_t>(std::atoi(f));
+    }
+    auto operation_attributes = OperationType::operation_attributes_t{n, sinkhorn_iters, eps, max_cores, fused};
     auto tensor_args = OperationType::tensor_args_t{mixes, consts};
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }

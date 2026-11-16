@@ -66,7 +66,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> qkv_causal_conv1d_silu(
     const std::optional<ttnn::MemoryConfig>& memory_config,
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
     uint32_t sequence_parallel_axis,
-    uint32_t input_column_offset) {
+    uint32_t input_column_offset,
+    const std::optional<ttnn::Tensor>& real) {
     auto params = make_params(
         input,
         q_width,
@@ -87,7 +88,8 @@ std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> qkv_causal_conv1d_silu(
             .tap2 = tap2,
             .tap3 = tap3,
             .actual_start = actual_start,
-            .predecessor_carry = predecessor_carry});
+            .predecessor_carry = predecessor_carry,
+            .real = real});
     return {outputs[0], outputs[1], outputs[2]};
 }
 

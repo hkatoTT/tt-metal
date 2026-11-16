@@ -76,6 +76,9 @@ void bind_qkv_causal_conv1d_silu(nb::module_& mod) {
             ``T``, ``Q``, ``K``, and ``V`` must be positive and tile-aligned.
             All inputs must be allocated on the same device. Inputs, including
             ``history``, are not modified; the caller owns history updates.
+            ``real`` (optional, ``[1,T,1]`` TILE BFLOAT16 of 1 and 0): the
+            rows of ``k`` and ``v`` where it is 0 come out times 0 (the sign
+            kept), as ``k * real``; ``q`` is not masked.
         )doc",
         &ttnn::experimental::kda::qkv_causal_conv1d_silu,
         nb::arg("input").noconvert(),
@@ -95,7 +98,8 @@ void bind_qkv_causal_conv1d_silu(nb::module_& mod) {
         nb::arg("memory_config") = nb::none(),
         nb::arg("compute_kernel_config") = nb::none(),
         nb::arg("sequence_parallel_axis") = 0,
-        nb::arg("input_column_offset") = 0);
+        nb::arg("input_column_offset") = 0,
+        nb::arg("real") = nb::none());
 
     mod.def(
         "qkv_causal_conv1d_silu_exchange_core",

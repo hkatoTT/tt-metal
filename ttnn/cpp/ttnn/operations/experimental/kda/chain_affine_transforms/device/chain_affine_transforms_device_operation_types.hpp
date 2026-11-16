@@ -25,6 +25,10 @@ struct ChainAffineTransformsInputs {
     Tensor transforms;
     Tensor initial_state;
     Tensor actual_start;
+    // Optional, together: per device, rank_mask[r] (UINT32 row-major, one word per rank) 0 makes rank r's step read
+    // `identity` ([1, 1, K, K + V] BF16 tile: [I | 0]) instead of its transition.
+    std::optional<Tensor> rank_mask;
+    std::optional<Tensor> identity;
 };
 
 }  // namespace ttnn::experimental::prim

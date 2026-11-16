@@ -30,13 +30,16 @@ FORCE_INLINE void issue_value_slice_read(
 }
 
 // One worker owns one value block of one head's state: it streams each chronological step's A and its own B
-// columns to compute and writes its columns of the entry state and final carry that compute publishes.
+// columns to compute and writes its columns of the entry state and final carry that compute publishes.  With a rank
+// mask (has_rank_mask), a rank whose word is 0 streams the identity transition [I | 0] instead of its own (the same
+// values the caller's mask-and-fill used to put into `transforms`).
 template <
     uint32_t Kt,
     uint32_t Vt,
     uint32_t Vt_full,
     uint32_t BH,
     uint32_t mcast_shared,
+    uint32_t has_rank_mask,
     uint32_t sp_rank,
     uint32_t sp_size,
     uint32_t local_rows>
@@ -91,9 +94,22 @@ TT_KERNEL void dataflow(
     initial.reserve_back(state_tiles);
     issue_value_slice_read<Kt, Vt>(noc, initial_state_accessor, initial, state_page, Vt_full);
     kda_chronology::Topology topology{};
+    // The ranks whose transitions this device applies (bit r): all, or with a rank mask those whose word is not 0 (the
+    // words read through the chronology slot first: 32 bytes, as actual_start's read, to the same aligned address).
+    uint32_t own_ranks = 0xFFFFFFFFu;
     {
         DataflowBuffer chronology(dfb::chronology_compute);
         chronology.reserve_back(1);
+        if constexpr (has_rank_mask) {
+            const auto mask = TensorAccessor(*tensor::get_token_if_present<"rank_mask">());
+            noc.async_read(mask, chronology, 4 * sp_size, {.page_id = 0}, {});
+            noc.async_read_barrier();
+            auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(chronology.get_write_ptr());
+            own_ranks = 0;
+            for (uint32_t r = 0; r < sp_size; ++r) {
+                own_ranks |= (words[r] != 0 ? 1u : 0u) << r;
+            }
+        }
         const auto actual_start = TensorAccessor(tensor::actual_start);
         noc.async_read(actual_start, chronology, sizeof(uint32_t), {.page_id = 0}, {});
         noc.async_read_barrier();
@@ -114,15 +130,34 @@ TT_KERNEL void dataflow(
 
     for (uint32_t step = 0; step < sp_size; ++step) {
         const uint32_t rank = (topology.first_rank + step) % sp_size;
-        const uint32_t transform_row = (rank * BH + head) * Kt;
+        const bool own = (own_ranks >> rank) & 1u;
+        const uint32_t transform_row = own ? (rank * BH + head) * Kt : 0;
         // B: this block's columns of the B half of the step's [A | B] rows.
         b.reserve_back(state_tiles);
-        issue_value_slice_read<Kt, Vt>(
-            noc, transforms_accessor, b, transform_row * row_tiles + Kt + value_block * Vt, row_tiles);
+        if (own) {
+            issue_value_slice_read<Kt, Vt>(
+                noc, transforms_accessor, b, transform_row * row_tiles + Kt + value_block * Vt, row_tiles);
+        } else if constexpr (has_rank_mask) {
+            issue_value_slice_read<Kt, Vt>(
+                noc,
+                TensorAccessor(*tensor::get_token_if_present<"identity">()),
+                b,
+                transform_row * row_tiles + Kt + value_block * Vt,
+                row_tiles);
+        }
         // A: every value block needs the whole A half.
         const auto stage_a = [&]() {
             a.reserve_back(a_tiles);
-            issue_value_slice_read<Kt, Kt>(noc, transforms_accessor, a, transform_row * row_tiles, row_tiles);
+            if (own) {
+                issue_value_slice_read<Kt, Kt>(noc, transforms_accessor, a, transform_row * row_tiles, row_tiles);
+            } else if constexpr (has_rank_mask) {
+                issue_value_slice_read<Kt, Kt>(
+                    noc,
+                    TensorAccessor(*tensor::get_token_if_present<"identity">()),
+                    a,
+                    transform_row * row_tiles,
+                    row_tiles);
+            }
             return a.get_write_ptr();
         };
         if constexpr (!mcast_shared) {

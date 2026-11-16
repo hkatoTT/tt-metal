@@ -265,6 +265,7 @@ ttnn::device_operation::MeshWorkloadArtifacts QkvCausalConv1dSiluProgramFactory:
 
     const tt::tt_metal::experimental::ScratchpadSpecName act_window_name{"act_window"};
     const tt::tt_metal::experimental::ScratchpadSpecName staging_name{"staging"};
+    const tt::tt_metal::experimental::ScratchpadSpecName real_rows_name{"real_rows"};
     const tt::tt_metal::experimental::DFBSpecName act_tile_dfb_name{"act_tile"};
     const tt::tt_metal::experimental::DFBSpecName taps_dfb_name{"taps"};
     const tt::tt_metal::experimental::DFBSpecName eye_dfb_name{"eye"};
@@ -361,7 +362,7 @@ ttnn::device_operation::MeshWorkloadArtifacts QkvCausalConv1dSiluProgramFactory:
         .dfb_bindings = {tt::tt_metal::experimental::DFBBinding{
             output_dfb_name, "output", tt::tt_metal::experimental::DFBEndpointType::CONSUMER}},
         .semaphore_bindings = {tt::tt_metal::experimental::SemaphoreBinding{staged_semaphore, "staged"}},
-        .scratchpad_bindings = {{staging_name, "staging"}},
+        .scratchpad_bindings = {{staging_name, "staging"}, {real_rows_name, "real_rows"}},
         .tensor_bindings =
             {
                 tt::tt_metal::experimental::TensorBinding{q_tensor_name, "q"},
@@ -474,7 +475,8 @@ ttnn::device_operation::MeshWorkloadArtifacts QkvCausalConv1dSiluProgramFactory:
             },
         .scratchpads =
             {{.unique_id = act_window_name, .size_per_node = window_bytes},
-             {.unique_id = staging_name, .size_per_node = qkv_conv::StagingScratch{max_staged_ct}.bytes()}},
+             {.unique_id = staging_name, .size_per_node = qkv_conv::StagingScratch{max_staged_ct}.bytes()},
+             {.unique_id = real_rows_name, .size_per_node = qkv_conv::real_rows_bytes}},
         .tensor_parameters = std::move(tensor_parameters),
         .work_units =
             {
@@ -506,6 +508,15 @@ ttnn::device_operation::MeshWorkloadArtifacts QkvCausalConv1dSiluProgramFactory:
     run_args.tensor_args.emplace(actual_start_name, in.actual_start.mesh_tensor());
     run_args.tensor_args.emplace(predecessor_name, predecessor);
     kda_factory_detail::bind_actual_end(spec, run_args, in.actual_end, writer);
+    // The padded tokens' mask on k and v (left unbound when absent; the writer resolves it with get_token_if_present)
+    writer.compile_time_args.insert({"has_real", uint32_t(in.real.has_value())});
+    if (in.real.has_value()) {
+        const tt::tt_metal::experimental::TensorParamName real_name{"real"};
+        const auto& real = in.real->mesh_tensor();
+        spec.tensor_parameters.push_back({.unique_id = real_name, .spec = real.tensor_spec()});
+        run_args.tensor_args.emplace(real_name, real);
+        writer.tensor_bindings.push_back({real_name, "real"});
+    }
     spec.kernels = {std::move(reader), std::move(writer), std::move(compute)};
 
     auto workload = kda_factory_detail::chronology_workload(

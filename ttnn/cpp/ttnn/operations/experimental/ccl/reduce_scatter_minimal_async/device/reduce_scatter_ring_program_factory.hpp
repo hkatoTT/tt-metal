@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "reduce_scatter_minimal_async_op_device_operation_types.hpp"
 #include "ttnn/device_operation.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
@@ -90,6 +92,33 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
     std::optional<uint32_t> num_buffers_per_channel,
     CoreCoord core_grid_offset,
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config);
+
+// (for col_row_reduce_scatter) the ring descriptor with one traversal per batch also without a fused
+// producer (force_per_batch), and a consumer in the same program told when each traversal's outputs are final:
+// consumer_signal {NoC x, NoC y, semaphore id}, one increment per writer and traversal after its local output writes.
+// The tiled (input-shaped) intermediate, persistent buffers, no sub-device.
+ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program_descriptor_ext(
+    tt::tt_metal::ProgramDescriptor& desc,
+    const Tensor& input_tensor,
+    const Tensor& intermediate_tensor,
+    const MeshCoordinate& sender_device_coord,
+    const std::optional<MeshCoordinate>& forward_coord,
+    const std::optional<MeshCoordinate>& backward_coord,
+    Tensor& output_tensor,
+    uint32_t dim,
+    uint32_t num_links,
+    uint32_t ring_size,
+    uint32_t ring_index,
+    ttnn::ccl::Topology topology,
+    const std::vector<GlobalSemaphore>& semaphore,
+    const std::optional<GlobalSemaphore>& barrier_semaphore,
+    std::optional<ttnn::experimental::ccl::ReduceScatterFusedOpSignaler>& fused_op_signaler,
+    std::optional<uint32_t> chunks_per_sync,
+    std::optional<uint32_t> num_workers_per_direction_opt,
+    CoreCoord core_grid_offset,
+    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
+    bool force_per_batch,
+    std::optional<std::array<uint32_t, 3>> consumer_signal);
 
 void build_ring_reduce_scatter_minimal_async_program_artifacts(
     tt::tt_metal::ProgramDescriptor& program,

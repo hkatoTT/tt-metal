@@ -34,6 +34,14 @@ constexpr ccl_routing_utils::line_multicast_route_info_t forward_multicast_route
     ccl_routing_utils::get_line_multicast_route_info_from_args<8>();
 constexpr ccl_routing_utils::line_multicast_route_info_t backward_multicast_route_info =
     ccl_routing_utils::get_line_multicast_route_info_from_args<8 + ccl_routing_utils::num_line_multicast_args>();
+// mcast_split: the odd output cores (core_id) take the other split of the distances (routes b), so that every link
+// carries the same bytes (the values land where they land today)
+constexpr uint32_t split_arg_idx = 8 + 2 * ccl_routing_utils::num_line_multicast_args;
+constexpr bool mcast_split = get_compile_time_arg_val(split_arg_idx) != 0;
+constexpr ccl_routing_utils::line_multicast_route_info_t forward_multicast_route_info_b =
+    ccl_routing_utils::get_line_multicast_route_info_from_args<split_arg_idx + 1>();
+constexpr ccl_routing_utils::line_multicast_route_info_t backward_multicast_route_info_b =
+    ccl_routing_utils::get_line_multicast_route_info_from_args<split_arg_idx + 1 + ccl_routing_utils::num_line_multicast_args>();
 
 void kernel_main() {
     ///////////////////////////////////////////////////
@@ -97,6 +105,12 @@ void kernel_main() {
     auto packet_header_buffer_addr_backward = cb_packet_header.get_write_ptr();
     cb_packet_header.push_back(1);
     cb_packet_header.reserve_back(1);
+    auto packet_header_buffer_addr_forward_b = cb_packet_header.get_write_ptr();
+    cb_packet_header.push_back(1);
+    cb_packet_header.reserve_back(1);
+    auto packet_header_buffer_addr_backward_b = cb_packet_header.get_write_ptr();
+    cb_packet_header.push_back(1);
+    cb_packet_header.reserve_back(1);
 
     // pre-populate packet headers
     volatile PACKET_HEADER_TYPE* pkt_hdr_forward =
@@ -105,6 +119,14 @@ void kernel_main() {
         reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_backward);
     ccl_routing_utils::fabric_set_line_multicast_route(pkt_hdr_forward, forward_multicast_route_info);
     ccl_routing_utils::fabric_set_line_multicast_route(pkt_hdr_backward, backward_multicast_route_info);
+    volatile PACKET_HEADER_TYPE* pkt_hdr_forward_b =
+        reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_forward_b);
+    volatile PACKET_HEADER_TYPE* pkt_hdr_backward_b =
+        reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_backward_b);
+    if constexpr (mcast_split) {
+        ccl_routing_utils::fabric_set_line_multicast_route(pkt_hdr_forward_b, forward_multicast_route_info_b);
+        ccl_routing_utils::fabric_set_line_multicast_route(pkt_hdr_backward_b, backward_multicast_route_info_b);
+    }
 
     if (fabric_connection.is_logically_connected()) {
         fabric_connection.open_finish();
@@ -130,13 +152,18 @@ void kernel_main() {
         // Within-shard offset
         noc0_dest_noc_addr += shard_tile_id * tensor0_page_size;
 
+        // the routes of this output core (mcast_split: the odd ones the other way round)
+        const bool other = mcast_split && (core_id & 1);
+        volatile PACKET_HEADER_TYPE* hdr_forward = other ? pkt_hdr_forward_b : pkt_hdr_forward;
+        volatile PACKET_HEADER_TYPE* hdr_backward = other ? pkt_hdr_backward_b : pkt_hdr_backward;
+
         // This issues a flush barrier
         if (shard_tile_id + num_tiles_to_read_this_core >= num_tiles_per_core ||
             tiles_read + num_tiles_to_read_this_core >= num_tiles_to_read) {
             fused_write_atomic_and_advance_local_read_address_for_fabric_write(
                 noc0_dest_noc_addr,
-                pkt_hdr_forward,
-                pkt_hdr_backward,
+                hdr_forward,
+                hdr_backward,
                 fabric_connection,
                 l1_read_addr,
                 num_tiles_to_read_this_core * tensor0_page_size,
@@ -147,8 +174,8 @@ void kernel_main() {
         } else {
             write_and_advance_local_read_address_for_fabric_write(
                 noc0_dest_noc_addr,
-                pkt_hdr_forward,
-                pkt_hdr_backward,
+                hdr_forward,
+                hdr_backward,
                 fabric_connection,
                 l1_read_addr,
                 num_tiles_to_read_this_core * tensor0_page_size);

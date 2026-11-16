@@ -198,6 +198,19 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
         ttnn::ccl::get_forward_backward_line_mcast_distance(ring_size, device_index, topology, true);
     auto [forward_args, backward_args] = ttnn::ccl::get_forward_backward_line_mcast_configuration(
         coord, forward_coord, backward_coord, num_targets_forward, num_targets_backward, mesh_device);
+    // mcast_split: the odd output cores (of each link) take the other split of the distances, so that every link
+    // carries the same bytes (only where both splits reach every device: a ring of 3 or more, unequal distances)
+    const bool mcast_split = operation_attributes.mcast_split != 0 && topology == ttnn::ccl::Topology::Ring &&
+                             num_targets_forward >= 1 && num_targets_backward >= 1 &&
+                             num_targets_forward != num_targets_backward && forward_coord.has_value() &&
+                             backward_coord.has_value();
+    auto [forward_args_b, backward_args_b] = ttnn::ccl::get_forward_backward_line_mcast_configuration(
+        coord,
+        forward_coord,
+        backward_coord,
+        mcast_split ? num_targets_backward : num_targets_forward,
+        mcast_split ? num_targets_forward : num_targets_backward,
+        mesh_device);
 
     // Tensor Info
     [[maybe_unused]] const auto input_tensor_num_pages = input_tensor.buffer()->num_pages();
@@ -516,6 +529,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     };
     writer_compile_args.insert(writer_compile_args.end(), forward_args.begin(), forward_args.end());
     writer_compile_args.insert(writer_compile_args.end(), backward_args.begin(), backward_args.end());
+    writer_compile_args.push_back(static_cast<uint32_t>(mcast_split));  // mcast_split
+    writer_compile_args.insert(writer_compile_args.end(), forward_args_b.begin(), forward_args_b.end());
+    writer_compile_args.insert(writer_compile_args.end(), backward_args_b.begin(), backward_args_b.end());
     log_trace(tt::LogOp, "Writer Compile Args:");
     tt::tt_metal::KernelDescriptor worker_sender_writer_kernel_desc;
     worker_sender_writer_kernel_desc.kernel_source =

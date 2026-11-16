@@ -35,6 +35,11 @@ struct AllReduceAsyncParams {
     // preserves existing bf16 behavior; opted into per-call (e.g. the Llama LM-head all_reduce, whose
     // ring-order-dependent bf16 sum caused per-row logit non-determinism).
     bool fp32_dest_acc = false;
+    // On a ring of 3 or more devices with unequal multicast distances each way (e.g. 2 forward, 1 backward on 4),
+    // the output cores alternate between the two splits (even cores this device's, odd cores the other way round),
+    // so every link carries the same bytes: the busiest link 1.5 of a device's per-link share instead of 2 (4 devices).
+    // The values land in the same slots: the sums are the same.  Set from TT_AR_ASYNC_MCAST_SPLIT (1 on, 0 off).
+    uint32_t mcast_split = 0;
 
     AllReduceAsyncParams(
         uint32_t num_links,
@@ -65,7 +70,7 @@ struct AllReduceAsyncParams {
     // Add attributes method for reflection
     auto attributes() const {
         using ttsl::reflection::Attribute;
-        constexpr std::size_t kNumAttributes = 9;
+        constexpr std::size_t kNumAttributes = 10;
         std::vector<std::tuple<std::string, Attribute>> attrs;
         attrs.reserve(kNumAttributes);
 
@@ -79,6 +84,7 @@ struct AllReduceAsyncParams {
         attrs.emplace_back("use_optimal_ccl_for_llama", use_optimal_ccl_for_llama);
         attrs.emplace_back("cluster_axis", cluster_axis);
         attrs.emplace_back("fp32_dest_acc", fp32_dest_acc);
+        attrs.emplace_back("mcast_split", mcast_split);
         return attrs;
     }
 
@@ -96,7 +102,8 @@ struct AllReduceAsyncParams {
         "use_optimal_ccl_for_llama",
         "cluster_axis",
         "sub_device_id",
-        "fp32_dest_acc");
+        "fp32_dest_acc",
+        "mcast_split");
     auto attribute_values() const {
         return std::make_tuple(
             num_links,
@@ -108,7 +115,8 @@ struct AllReduceAsyncParams {
             use_optimal_ccl_for_llama,
             cluster_axis,
             sub_device_id,
-            fp32_dest_acc);
+            fp32_dest_acc,
+            mcast_split);
     }
 };
 

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <utility>
 #include "api/tensor/noc_traits.h"
+#include "api/debug/kernel_profiler.hpp"
 
 using address_t = uint32_t;
 using ttnn::ccl::Topology;
@@ -681,7 +682,7 @@ void kernel_main() {
     // Fused with a batched producer (fuse_op, B > 1): one ring traversal per batch, so the reduce-scatter
     // of batch b overlaps the matmul producing batch b+1, which is what the fused op batches for. In every
     // other case a single traversal carries all of the worker's units, one ring step at a time.
-    constexpr uint32_t num_traversals = (fuse_op && input_tensor_B > 1) ? input_tensor_B : 1;
+    constexpr uint32_t num_traversals = get_named_compile_time_arg_val("per_batch") ? input_tensor_B : 1;
     for (uint32_t t = 0; t < num_traversals; ++t) {
         // Units of this traversal: the worker's whole range, or its intersection with batch t.
         const uint32_t t_unit_start =
@@ -692,6 +693,9 @@ void kernel_main() {
         int slice_idx = my_chip_id + ring_size_by_2;  // start with slice belonging to device half-way across in ring
         uint32_t num_iters = ring_size_by_2 + 1;
         for (uint32_t i = 0; i < num_iters; ++i) {
+            if (i == ring_size_by_2) {  // (profiler zone: when a traversal's finals start)
+                DeviceZoneScopedN("RS_FIN_BEGIN");
+            }
             // State machine for control variables
             bool even_chunks, odd_chunks, reduce_even_chunks, reduce_odd_chunks, write_to_remote, write_to_interm,
                 separate_even_odd_sems;
@@ -834,7 +838,24 @@ void kernel_main() {
             // Next slice idx
             slice_idx = direction ? (slice_idx - 1) : (slice_idx + 1);
         }
+        {
+            DeviceZoneScopedN("RS_TRAV_END");  // (profiler zone: a traversal's finals issued)
+        }
+        // (for col_row_reduce_scatter) a consumer in the same program: this writer's outputs of the
+        // traversal written (acked), then one increment of the consumer's semaphore (common args after the standard
+        // ones: its NoC x, y and semaphore id)
+        if constexpr (get_named_compile_time_arg_val("signal_consumer") != 0) {
+            noc_async_write_barrier();
+            constexpr uint32_t base = ttnn::ccl::ReduceScatterCommonArgs::count;
+            const uint32_t cx = get_common_arg_val<uint32_t>(base);
+            const uint32_t cy = get_common_arg_val<uint32_t>(base + 1);
+            const uint32_t cs = get_common_arg_val<uint32_t>(base + 2);
+            noc_semaphore_inc(get_noc_addr(cx, cy, get_semaphore(cs)), 1);
+        }
     }  // for traversals
+    if constexpr (get_named_compile_time_arg_val("signal_consumer") != 0) {
+        noc_async_atomic_barrier();
+    }
 
     // batch_ready_sem is unused by this kernel: nothing separates batches any more. It stays in the
     // runtime args so the host-side semaphore layout is unchanged.

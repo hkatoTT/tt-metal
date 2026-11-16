@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "all_reduce_async_device_operation.hpp"
+
+#include <cstdlib>
 #include "all_reduce_async_device_operation_types.hpp"
 
 #include "ttnn/operations/math.hpp"
@@ -285,6 +287,10 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
         cluster_axis,
         &mesh_device,
         fp32_dest_acc);
+    // the multicast split by output core (AllReduceAsyncParams::mcast_split): read at each call, so a process can
+    // switch it (it is part of the program's cache key)
+    const char* split_env = std::getenv("TT_AR_ASYNC_MCAST_SPLIT");
+    operation_attributes.mcast_split = (split_env != nullptr && split_env[0] == '1') ? 1u : 0u;
     auto tensor_args = OperationType::tensor_args_t{.input_tensor = input_tensor, .buffer_tensor = buffer_tensor};
 
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);

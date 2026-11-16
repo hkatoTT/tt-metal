@@ -54,6 +54,9 @@ set(TTNN_OP_EXPERIMENTAL_CCL_SRCS
     matmul_reduce_scatter_async/matmul_reduce_scatter_async.cpp
     matmul_reduce_scatter_async/device/matmul_reduce_scatter_async_device_operation.cpp
     matmul_reduce_scatter_async/device/matmul_reduce_scatter_async_program_factory.cpp
+    col_row_reduce_scatter/col_row_reduce_scatter.cpp
+    col_row_reduce_scatter/device/col_row_reduce_scatter_device_operation.cpp
+    col_row_reduce_scatter/device/col_row_reduce_scatter_program_factory.cpp
     reduce_scatter_minimal_async/reduce_scatter_minimal_async.cpp
     reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation.cpp
     reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
@@ -164,6 +167,7 @@ set(TTNN_OP_EXPERIMENTAL_CCL_NANOBIND_SRCS
     strided_all_gather_minimal_matmul_async/strided_all_gather_minimal_matmul_async_nanobind.cpp
     all_gather_minimal_matmul_async/all_gather_minimal_matmul_async_nanobind.cpp
     matmul_reduce_scatter_async/matmul_reduce_scatter_async_nanobind.cpp
+    col_row_reduce_scatter/col_row_reduce_scatter_nanobind.cpp
     ring_attention_all_gather_async/ring_attention_all_gather_async_nanobind.cpp
     send_recv_async/send_async/send_async_nanobind.cpp
     send_recv_async/recv_async/recv_async_nanobind.cpp

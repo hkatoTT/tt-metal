@@ -106,7 +106,9 @@ ProgramDescriptor MhcSplitSinkhornProgramFactory::create_descriptor(
         reader.config = ReaderConfigDescriptor{};
 
         std::vector<uint32_t> compute_ct = {
-            operation_attributes.sinkhorn_iters, std::bit_cast<uint32_t>(operation_attributes.eps)};
+            operation_attributes.sinkhorn_iters,
+            std::bit_cast<uint32_t>(operation_attributes.eps),
+            operation_attributes.fused};
         KernelDescriptor compute;
         compute.kernel_source = kdir + "compute/mhc_split_sinkhorn_compute.cpp";
         compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
@@ -180,6 +182,7 @@ ProgramDescriptor MhcSplitSinkhornProgramFactory::create_descriptor(
     std::vector<uint32_t> compute_ct = {
         operation_attributes.sinkhorn_iters,
         std::bit_cast<uint32_t>(operation_attributes.eps),
+        operation_attributes.fused,
     };
     KernelDescriptor compute;
     compute.kernel_source =

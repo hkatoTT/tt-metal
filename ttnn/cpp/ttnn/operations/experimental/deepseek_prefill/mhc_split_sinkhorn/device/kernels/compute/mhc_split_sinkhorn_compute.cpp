@@ -9,6 +9,11 @@
 // SEL_* extract+left-align each group from the 24-wide mixes and fold in the scalar a; the
 // Sinkhorn normalizations are same-shape `m / (m @ K)` divides (K = RB row-sum / CB col-sum),
 // so the whole op is matmul + SFPU tiles. Validated bit-for-bit against the torch reference.
+//
+// The fused form (compile-time arg 2, the default) runs each step in one DST pass: the matmul, the
+// SFPU ops and the multiply by the CB tile (reuse-dest) without packing the intermediate tiles, so a
+// Sinkhorn normalization is one pack instead of three. The row/col sums stay fp32 in DST instead of
+// being rounded through the unpacker, so the result differs from the unfused form in the low bits.
 
 #include <cstdint>
 #include "api/compute/common.h"
@@ -157,6 +162,82 @@ FORCE_INLINE void normalize(uint32_t m_in, uint32_t k_tile, bool use_eps, uint32
     mul(m_in, CB_RECIP, m_out);                                           // m_out = m_in * RECIP
 }
 
+// ---- fused form: one DST pass per step ----
+
+// DST[0] <- a @ consts[b_tile].  Reads a[0]; pops nothing.  Within an acquired DST.
+FORCE_INLINE void mm_to_dst(uint32_t a, uint32_t b_tile) {
+    CircularBuffer cb_a(a);
+    cb_a.wait_front(1);
+    reconfig_data_format(a, CB_CONSTS);
+    matmul_init(a, CB_CONSTS);
+    matmul_tiles(a, CB_CONSTS, 0, b_tile, 0);
+}
+
+// DST[0] <- op(DST[0]) for the SFPU ops of `unary` (OP_COPY: nothing).
+FORCE_INLINE void sfpu_in_dst(uint32_t op, uint32_t scalar_bits) {
+    if (op == OP_EXP) {
+        unary_min_tile_init();
+        unary_min_tile(0, 0x42a00000u);  // min(x, 80.0f), as in `unary`
+        exp_tile_init();
+        exp_tile(0);
+    } else if (op == OP_SIGMOID) {
+        sigmoid_tile_init();
+        sigmoid_tile(0);
+    } else if (op == OP_RECIP) {
+        recip_tile_init();
+        recip_tile(0);
+    } else if (op == OP_RECIP_EPS) {
+        binop_with_scalar_tile_init();
+        add_unary_tile(0, scalar_bits);
+        recip_tile_init();
+        recip_tile(0);
+    } else if (op == OP_ADD_EPS) {
+        binop_with_scalar_tile_init();
+        add_unary_tile(0, scalar_bits);
+    } else if (op == OP_MUL2) {
+        binop_with_scalar_tile_init();
+        mul_unary_tile(0, scalar_bits);
+    }
+}
+
+// Pack DST[0] to out and release the DST.
+FORCE_INLINE void pack_dst(uint32_t out) {
+    CircularBuffer cb_out(out);
+    tile_regs_commit();
+    tile_regs_wait();
+    cb_out.reserve_back(1);
+    pack_tile(0, out);
+    cb_out.push_back(1);
+    tile_regs_release();
+}
+
+// out <- op2(op1(a @ consts[sel] + consts[base])).  Reads a[0]; pops nothing.
+FORCE_INLINE void project_fused(
+    uint32_t a, uint32_t sel, uint32_t base, uint32_t op1, uint32_t op2, uint32_t scalar_bits, uint32_t out) {
+    tile_regs_acquire();
+    mm_to_dst(a, sel);
+    add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(CB_CONSTS);
+    add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(CB_CONSTS, base, 0);
+    sfpu_in_dst(op1, scalar_bits);
+    sfpu_in_dst(op2, scalar_bits);
+    pack_dst(out);
+}
+
+// m_out <- m_in / (m_in @ K [+ eps]) [+ eps].  m_in is popped.
+FORCE_INLINE void normalize_fused(
+    uint32_t m_in, uint32_t k_tile, bool use_eps, bool add_eps_after, uint32_t eps_bits, uint32_t m_out) {
+    tile_regs_acquire();
+    mm_to_dst(m_in, k_tile);                                    // DST = m_in @ K
+    sfpu_in_dst(use_eps ? OP_RECIP_EPS : OP_RECIP, eps_bits);  // DST = 1/(DST[+eps])
+    mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCB>(m_in);
+    mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCB>(m_in, 0, 0);  // DST = m_in * DST
+    if (add_eps_after) {
+        sfpu_in_dst(OP_ADD_EPS, eps_bits);
+    }
+    pack_dst(m_out);
+    CircularBuffer(m_in).pop_front(1);
+}
+
 }  // namespace
 
 void kernel_main() {
@@ -164,12 +245,28 @@ void kernel_main() {
     const uint32_t num_token_tiles = get_arg_val<uint32_t>(0);
     constexpr uint32_t iters = get_compile_time_arg_val(0);
     constexpr uint32_t eps_bits = get_compile_time_arg_val(1);
+    constexpr bool fused = get_compile_time_arg_val(2) != 0;
 
     CircularBuffer cb_consts(CB_CONSTS), cb_mixes(CB_MIXES);
     cb_consts.wait_front(8);  // constants resident for the whole op
 
     for (uint32_t t = 0; t < num_token_tiles; ++t) {
         cb_mixes.wait_front(1);  // reused by comb/pre/post; popped at the end
+
+        if constexpr (fused) {
+            // comb: exp(logits), row softmax + eps, then column / row normalizations; the last one packs to COMB
+            project_fused(CB_MIXES, SEL_COMB, BASE_COMB, OP_EXP, OP_COPY, 0, CB_MA);
+            normalize_fused(CB_MA, RB, false, true, eps_bits, CB_MB);
+            normalize_fused(CB_MB, CB_COL, true, false, eps_bits, iters == 1 ? CB_COMB : CB_MA);
+            for (uint32_t i = 1; i < iters; ++i) {
+                normalize_fused(CB_MA, RB, true, false, eps_bits, CB_MB);
+                normalize_fused(CB_MB, CB_COL, true, false, eps_bits, i + 1 == iters ? CB_COMB : CB_MA);
+            }
+            project_fused(CB_MIXES, SEL_PRE, BASE_PRE, OP_SIGMOID, OP_ADD_EPS, eps_bits, CB_PRE);
+            project_fused(CB_MIXES, SEL_POST, BASE_POST, OP_SIGMOID, OP_MUL2, TWO_BITS, CB_POST);
+            cb_mixes.pop_front(1);
+            continue;
+        }
 
         // ---- comb = Sinkhorn(exp(mixes @ SEL_comb + base_comb)) ----
         mm(CB_MIXES, SEL_COMB, CB_TMP);

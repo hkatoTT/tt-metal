@@ -1,0 +1,15 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <nanobind/nanobind.h>
+
+namespace nb = nanobind;
+
+namespace ttnn::operations::experimental::deepseek_prefill::decode_matmul::detail {
+
+void bind_experimental_decode_matmul_operation(nb::module_& mod);
+
+}  // namespace ttnn::operations::experimental::deepseek_prefill::decode_matmul::detail

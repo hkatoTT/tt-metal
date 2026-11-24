@@ -13,6 +13,7 @@ struct MhcSplitSinkhornParams {
     uint32_t sinkhorn_iters;
     float eps;
     uint32_t max_cores;  // 0 = full grid; 1 pins single-core (benchmark A/B). Hashed for cache correctness.
+    uint32_t fused;      // 1 = each step in one DST pass (default); 0 = one packed tile per step (A/B). Hashed.
 };
 
 // mixes: fused-projection output [T, (2+n)*n].  consts: [8, 32, 32] host-prepared tiles

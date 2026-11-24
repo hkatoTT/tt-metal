@@ -145,6 +145,30 @@ void kernel_main() {
                 1u});  // increment 1
     }
 
+    // With the routes alternating (an even ring), the data packets to the antipode travel both ways round (the forward
+    // worker's 4-hop route, the backward worker's alternate 4-hop one): the completion semaphore goes on both routes, each
+    // after that route's data, so that every chip counts it twice per sender (2 (N - 1)) and the antipode's second one
+    // comes after the data that went the other way round.  (With the primary route only, the antipode could count the
+    // forward one and end before the backward route's data had landed: a stripe of the output read stale or written
+    // after the op ended, about 1 in 300 gathers over the 8 mesh rows of a Galaxy.)
+    uint8_t sem_route_id_alt = 0;
+    if constexpr (enable_fabric && load_balance_across_alt_routes) {
+        sem_route_id_alt = PacketHeaderPool::allocate_header_n(num_connections);
+        uint8_t starts_alt[1] = {1};
+
+        fabric_api::fabric_multicast_noc_unicast_atomic_inc_set_state<
+            UnicastAtomicIncUpdateMask::Val | UnicastAtomicIncUpdateMask::Flush>(
+            fabric_connection,
+            sem_route_id_alt,
+#ifndef FABRIC_2D
+            starts_alt,
+#endif
+            ranges_alt,
+            tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
+                0u,    // ignore
+                1u});  // increment 1
+    }
+
     // Initialization barrier:
     // In some cases we don't have a guarantee that the output tensor has been allocated
     // on remote devices (every device's command queue executes asynchronously). So we wait
@@ -312,9 +336,17 @@ void kernel_main() {
             fabric_connection,
             sem_route_id,
             tt::tt_fabric::NocUnicastAtomicIncCommandHeader{done_sem_noc_addr_in_pkt, 0});
+        if constexpr (load_balance_across_alt_routes) {  // (and on the alternate routes: see sem_route_id_alt)
+            fabric_api::fabric_multicast_noc_unicast_atomic_inc_with_state<UnicastAtomicIncUpdateMask::DstAddr>(
+                fabric_connection,
+                sem_route_id_alt,
+                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{done_sem_noc_addr_in_pkt, 0});
+        }
     }
-    noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(done_sem), barrier_wait_value);
-    noc_semaphore_inc(safe_get_noc_addr(sem_noc0_x, sem_noc0_y, done_sem), (uint32_t)(-(int32_t)barrier_wait_value));
+    const uint32_t done_wait_value =
+        (enable_fabric && load_balance_across_alt_routes) ? 2 * barrier_wait_value : barrier_wait_value;
+    noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(done_sem), done_wait_value);
+    noc_semaphore_inc(safe_get_noc_addr(sem_noc0_x, sem_noc0_y, done_sem), (uint32_t)(-(int32_t)done_wait_value));
     noc.async_atomic_barrier();
 
     if constexpr (enable_fabric) {

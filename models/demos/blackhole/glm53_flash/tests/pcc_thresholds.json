@@ -1,0 +1,8 @@
+{
+  "test_mlp_device": 0.999,
+  "test_mhc_device": 0.9999,
+  "test_head_device": 0.999,
+  "test_moe_device": 0.99,
+  "test_kda_device": 0.99,
+  "test_dsa_device": 0.99
+}

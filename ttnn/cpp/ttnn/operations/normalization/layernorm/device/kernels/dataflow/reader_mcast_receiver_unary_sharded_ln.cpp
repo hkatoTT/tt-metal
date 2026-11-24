@@ -154,7 +154,12 @@ void kernel_main() {
 
         reduce_sender_sem.set(INVALID);
         reduce_receiver_sem.up(noc, in0_remote_noc_x[0], in0_remote_noc_y[0], 1);
-        reduce_sender_sem.wait(VALID);
+        // At least VALID, not equal to it: once every receiver has upped, the sender moves this word on to block + 2
+        // as its reduced blocks go out, and nothing orders that after this core's first poll here (a core that is
+        // not an all-to-all worker gives the sender nothing after this point).  An equal wait that polls after the
+        // first block + 2 lands would wait for good.  INVALID was set before the up, so every value the sender writes
+        // after it is VALID or more.
+        reduce_sender_sem.wait_min(VALID);
 
         // ============================================================================
         // Combine partial results

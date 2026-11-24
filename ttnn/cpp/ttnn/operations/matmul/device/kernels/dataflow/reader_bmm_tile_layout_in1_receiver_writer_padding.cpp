@@ -246,4 +246,8 @@ void kernel_main() {
     // Pop the same number of tiles that were waited for.
     dfb_out.pop_front(out_num_tiles);
 #endif
+    // Drain the mcast-ready atomics (sender_sem.up) before returning, so no non-posted atomic is in flight at kernel
+    // exit (its response would land after the next kernel on this NoC copied the NIU's counters, and that kernel's
+    // atomic barrier would pass early or never). Matches the in0 receiver and the in1 sender / writer (#53329).
+    noc.async_atomic_barrier();
 }

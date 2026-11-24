@@ -569,16 +569,24 @@ void kernel_main() {
                 global_init_semaphore_addr);
             uint32_t local_init_semaphore_addr_ptr = reinterpret_cast<uint32_t>(global_init_semaphore_addr_ptr);
 
+            noc_semaphore_wait(global_init_semaphore_addr_ptr, num_devices - 1);
             if (mcast_size > 1) {
-                noc_semaphore_wait(global_init_semaphore_addr_ptr, num_devices - 1);
-                noc_semaphore_set_multicast_loopback_src(
-                    local_init_semaphore_addr_ptr, local_set_semaphore_noc_addr, mcast_size, false);
+                // The copies to the other senders only: a plain multicast does not write to self (num_dests without it)
+                noc_semaphore_set_multicast(
+                    local_init_semaphore_addr_ptr, local_set_semaphore_noc_addr, mcast_size - 1, false);
                 noc_obj.async_write_barrier();
             }
+            // Take this call's num_devices - 1 increments off instead of zeroing the word. Once the copies land, the
+            // other senders run, and a chip they send to can finish this call and send its next call's increment here
+            // before this core gets on (with direction-owned streams this stream sends that chip nothing, so nothing
+            // orders it after this core); zeroing the word would wipe that increment and hang the next call.
+            noc_semaphore_inc(
+                init_semaphore_noc_addr_in_pkt, static_cast<uint32_t>(-static_cast<int32_t>(num_devices - 1)));
+            noc_async_atomic_barrier();
+        } else {
+            noc_semaphore_wait(global_init_semaphore_addr_ptr, num_devices - 1);
+            noc_semaphore_set(global_init_semaphore_addr_ptr, 0);
         }
-
-        noc_semaphore_wait(global_init_semaphore_addr_ptr, num_devices - 1);
-        noc_semaphore_set(global_init_semaphore_addr_ptr, 0);
     }
 
     {

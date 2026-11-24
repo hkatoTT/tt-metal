@@ -45,7 +45,7 @@ void kernel_main() {
     // Fused with a batched producer (fuse_op, B > 1): one ring traversal per batch, so the reduce-scatter
     // of batch b overlaps the matmul producing batch b+1, which is what the fused op batches for. In every
     // other case a single traversal carries all of the worker's units, one ring step at a time.
-    constexpr uint32_t num_traversals = (fuse_op && input_tensor_B > 1) ? input_tensor_B : 1;
+    constexpr uint32_t num_traversals = get_named_compile_time_arg_val("per_batch") ? input_tensor_B : 1;
     for (uint32_t t = 0; t < num_traversals; ++t) {
         // Units of this traversal: the worker's whole range, or its intersection with batch t.
         const uint32_t t_unit_start =

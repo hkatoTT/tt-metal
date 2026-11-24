@@ -35,6 +35,23 @@ struct AllReduceAsyncParams {
     // preserves existing bf16 behavior; opted into per-call (e.g. the Llama LM-head all_reduce, whose
     // ring-order-dependent bf16 sum caused per-row logit non-determinism).
     bool fp32_dest_acc = false;
+    // On a ring of 3 or more devices with unequal multicast distances each way (e.g. 2 forward, 1 backward on 4),
+    // the output cores alternate between the two splits (even cores this device's, odd cores the other way round),
+    // so every link carries the same bytes: the busiest link 1.5 of a device's per-link share instead of 2 (4 devices).
+    // The values land in the same slots: the sums are the same.  Set from TT_AR_ASYNC_MCAST_SPLIT (1 on, 0 off).
+    uint32_t mcast_split = 0;
+    // One tile row of tokens with only its first t (8 or 16) rows real: each output core's share sent as those rows
+    // alone (t x 64 bytes a tile: faces 0 and 1's first t rows, packed) in place of whole tiles, summed packed and put
+    // back into the tiles' rows 0 .. t - 1 there, rows t .. 31 zero.  The sums of the token rows the same bit for bit
+    // (the same 4 values added in the same order).  t, or 0 for whole tiles; set from TT_AR_ASYNC_COMPACT (1 on) where
+    // the input fits (ttnn::prim::all_reduce_async)
+    uint32_t compact_rows = 0;
+    // On the 2D fabric the writer's packet headers' multicast routes (4 with mcast_split) made on the host
+    // (tt::tt_fabric::get_2d_mcast_route_maps) and passed as runtime args, in place of encoding them in the kernel
+    // (encode_2d_mcast_maps, ~1.9 us a call before the first packet).  The same header bytes: the same sends.  1 on, 2
+    // check (the kernel encodes them as before, compares and prints with DPRINT whether the host's bytes are the same),
+    // 0 off; set from TT_AR_ASYNC_HOST_ROUTES at each call
+    uint32_t host_routes = 0;
 
     AllReduceAsyncParams(
         uint32_t num_links,
@@ -65,7 +82,7 @@ struct AllReduceAsyncParams {
     // Add attributes method for reflection
     auto attributes() const {
         using ttsl::reflection::Attribute;
-        constexpr std::size_t kNumAttributes = 9;
+        constexpr std::size_t kNumAttributes = 10;
         std::vector<std::tuple<std::string, Attribute>> attrs;
         attrs.reserve(kNumAttributes);
 
@@ -79,6 +96,9 @@ struct AllReduceAsyncParams {
         attrs.emplace_back("use_optimal_ccl_for_llama", use_optimal_ccl_for_llama);
         attrs.emplace_back("cluster_axis", cluster_axis);
         attrs.emplace_back("fp32_dest_acc", fp32_dest_acc);
+        attrs.emplace_back("mcast_split", mcast_split);
+        attrs.emplace_back("compact_rows", compact_rows);
+        attrs.emplace_back("host_routes", host_routes);
         return attrs;
     }
 
@@ -96,7 +116,10 @@ struct AllReduceAsyncParams {
         "use_optimal_ccl_for_llama",
         "cluster_axis",
         "sub_device_id",
-        "fp32_dest_acc");
+        "fp32_dest_acc",
+        "mcast_split",
+        "compact_rows",
+        "host_routes");
     auto attribute_values() const {
         return std::make_tuple(
             num_links,
@@ -108,7 +131,10 @@ struct AllReduceAsyncParams {
             use_optimal_ccl_for_llama,
             cluster_axis,
             sub_device_id,
-            fp32_dest_acc);
+            fp32_dest_acc,
+            mcast_split,
+            compact_rows,
+            host_routes);
     }
 };
 

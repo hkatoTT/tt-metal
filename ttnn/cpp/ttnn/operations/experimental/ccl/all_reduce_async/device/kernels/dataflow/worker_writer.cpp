@@ -14,7 +14,11 @@
 #include "cpp/ttnn/operations/ccl/kernel_common/worker_routing_utils.hpp"
 #include "cpp/ttnn/operations/ccl/common/kernels/minimal_ccl_common.hpp"
 #include <cstdint>
+#include <type_traits>
 #include <utility>
+#ifdef AR_ROUTE_CHECK
+#include "api/debug/dprint.h"
+#endif
 
 using address_t = uint32_t;
 
@@ -34,6 +38,66 @@ constexpr ccl_routing_utils::line_multicast_route_info_t forward_multicast_route
     ccl_routing_utils::get_line_multicast_route_info_from_args<8>();
 constexpr ccl_routing_utils::line_multicast_route_info_t backward_multicast_route_info =
     ccl_routing_utils::get_line_multicast_route_info_from_args<8 + ccl_routing_utils::num_line_multicast_args>();
+// mcast_split: the odd output cores (core_id) take the other split of the distances (routes b), so that every link
+// carries the same bytes (the values land where they land without the split)
+constexpr uint32_t split_arg_idx = 8 + 2 * ccl_routing_utils::num_line_multicast_args;
+constexpr bool mcast_split = get_compile_time_arg_val(split_arg_idx) != 0;
+constexpr ccl_routing_utils::line_multicast_route_info_t forward_multicast_route_info_b =
+    ccl_routing_utils::get_line_multicast_route_info_from_args<split_arg_idx + 1>();
+constexpr ccl_routing_utils::line_multicast_route_info_t backward_multicast_route_info_b =
+    ccl_routing_utils::get_line_multicast_route_info_from_args<
+        split_arg_idx + 1 + ccl_routing_utils::num_line_multicast_args>();
+// AllReduceAsyncParams::host_routes: the headers' route maps made on the host (tt::tt_fabric::get_2d_mcast_route_maps),
+// host_route_bytes bytes each (the mesh's Y + X), in runtime args after the multicast ranges (forward, backward,
+// forward_b, backward_b; whole words); 0: encoded here (fabric_set_line_multicast_route)
+constexpr uint32_t host_route_bytes =
+    get_compile_time_arg_val(split_arg_idx + 1 + 2 * ccl_routing_utils::num_line_multicast_args);
+constexpr uint32_t host_route_words = (host_route_bytes + 3) / 4;
+
+// A header's multicast route: with the host's maps, the fields fabric_set_2d_mcast_route writes for a multicast in this
+// chip's mesh (the anchor, the hops, the routing fields cleared, the maps' bytes), the same bytes without the encode
+template <typename Header>
+FORCE_INLINE void set_route(
+    volatile tt_l1_ptr Header* hdr,
+    const ccl_routing_utils::line_multicast_route_info_t& route,
+    [[maybe_unused]] const uint32_t* maps) {
+#ifndef AR_ROUTE_CHECK
+    if constexpr (host_route_bytes != 0 && std::is_same_v<Header, tt::tt_fabric::HybridMeshPacketHeader>) {
+        const uint16_t mesh = route.dst_mesh_id, chip = route.dst_chip_id;
+        const uint16_t e = route.e_num_hops, w = route.w_num_hops, n = route.n_num_hops, s = route.s_num_hops;
+        hdr->dst_start_node_id = ((uint32_t)mesh << 16) | (uint32_t)chip;
+        hdr->mcast_params_64 = ((uint64_t)s << 48) | ((uint64_t)n << 32) | ((uint64_t)w << 16) | ((uint64_t)e);
+        hdr->routing_fields.value = 0;
+        tt::tt_fabric::route_2d_detail::copy_2d_map_to_l1(hdr->route_buffer, maps, host_route_bytes);
+        return;
+    }
+#endif
+    ccl_routing_utils::fabric_set_line_multicast_route(hdr, route);
+}
+
+#ifdef AR_ROUTE_CHECK
+// (host_routes 2) how many of the header's route fields differ from what the host's maps give (the header encoded here)
+template <typename Header>
+uint32_t route_differs(
+    volatile tt_l1_ptr Header* hdr, const ccl_routing_utils::line_multicast_route_info_t& route, const uint32_t* maps) {
+    uint32_t n_diff = 0;
+    if constexpr (std::is_same_v<Header, tt::tt_fabric::HybridMeshPacketHeader>) {
+        const uint16_t mesh = route.dst_mesh_id, chip = route.dst_chip_id;
+        const uint16_t e = route.e_num_hops, w = route.w_num_hops, n = route.n_num_hops, s = route.s_num_hops;
+        n_diff += hdr->dst_start_node_id != (((uint32_t)mesh << 16) | (uint32_t)chip);
+        n_diff +=
+            hdr->mcast_params_64 != (((uint64_t)s << 48) | ((uint64_t)n << 32) | ((uint64_t)w << 16) | ((uint64_t)e));
+        n_diff += hdr->routing_fields.value != 0;
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(maps);
+        for (uint32_t i = 0; i < host_route_bytes; ++i) {
+            n_diff += hdr->route_buffer[i] != bytes[i];
+        }
+    } else {
+        n_diff = 1000;  // (not the 2D header: nothing to compare)
+    }
+    return n_diff;
+}
+#endif
 
 void kernel_main() {
     ///////////////////////////////////////////////////
@@ -80,8 +144,14 @@ void kernel_main() {
     arg_idx += num_mcast_ranges;
     tt_l1_ptr uint32_t* mcast_dest_noc_end_y = (tt_l1_ptr uint32_t*)(get_arg_addr(arg_idx));
     arg_idx += num_mcast_ranges;
+    // (host_routes: the 4 headers' route maps)
+    [[maybe_unused]] const uint32_t* host_routes = (const uint32_t*)(get_arg_addr(arg_idx));
+    arg_idx += 4 * host_route_words;
 
     size_t arg_for_fab = arg_idx;
+    // (zones, a profiler build only: the connection's open, each output core's wait for the reader, the sends, the
+    // local increments, the close)
+    DeviceZoneScopedN("AR-W-ALL");
     // Open the fabric connection at the same time we build but only start the "open" process and don't
     // require it to finish before exiting because open_finish requires a barrier which can impact performance
     // We do open_finish later - deferred as late as possible
@@ -97,16 +167,56 @@ void kernel_main() {
     auto packet_header_buffer_addr_backward = cb_packet_header.get_write_ptr();
     cb_packet_header.push_back(1);
     cb_packet_header.reserve_back(1);
+    auto packet_header_buffer_addr_forward_b = cb_packet_header.get_write_ptr();
+    cb_packet_header.push_back(1);
+    cb_packet_header.reserve_back(1);
+    auto packet_header_buffer_addr_backward_b = cb_packet_header.get_write_ptr();
+    cb_packet_header.push_back(1);
+    cb_packet_header.reserve_back(1);
 
     // pre-populate packet headers
     volatile PACKET_HEADER_TYPE* pkt_hdr_forward =
         reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_forward);
     volatile PACKET_HEADER_TYPE* pkt_hdr_backward =
         reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_backward);
-    ccl_routing_utils::fabric_set_line_multicast_route(pkt_hdr_forward, forward_multicast_route_info);
-    ccl_routing_utils::fabric_set_line_multicast_route(pkt_hdr_backward, backward_multicast_route_info);
+    set_route(pkt_hdr_forward, forward_multicast_route_info, host_routes);
+    set_route(pkt_hdr_backward, backward_multicast_route_info, host_routes + host_route_words);
+    volatile PACKET_HEADER_TYPE* pkt_hdr_forward_b =
+        reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_forward_b);
+    volatile PACKET_HEADER_TYPE* pkt_hdr_backward_b =
+        reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_backward_b);
+    if constexpr (mcast_split) {
+        set_route(pkt_hdr_forward_b, forward_multicast_route_info_b, host_routes + 2 * host_route_words);
+        set_route(pkt_hdr_backward_b, backward_multicast_route_info_b, host_routes + 3 * host_route_words);
+    }
+#ifdef AR_ROUTE_CHECK
+    {
+        const uint32_t d0 = route_differs(pkt_hdr_forward, forward_multicast_route_info, host_routes);
+        const uint32_t d1 =
+            route_differs(pkt_hdr_backward, backward_multicast_route_info, host_routes + host_route_words);
+        const uint32_t d2 =
+            mcast_split
+                ? route_differs(pkt_hdr_forward_b, forward_multicast_route_info_b, host_routes + 2 * host_route_words)
+                : 0;
+        const uint32_t d3 =
+            mcast_split
+                ? route_differs(pkt_hdr_backward_b, backward_multicast_route_info_b, host_routes + 3 * host_route_words)
+                : 0;
+        DPRINT(
+            "AR-ROUTE-CHECK chip {} link {} split {} bytes {}: differ {} {} {} {}\n",
+            my_chip_id,
+            link,
+            (uint32_t)mcast_split,
+            host_route_bytes,
+            d0,
+            d1,
+            d2,
+            d3);
+    }
+#endif
 
     if (fabric_connection.is_logically_connected()) {
+        DeviceZoneScopedN("AR-W-OPEN");
         fabric_connection.open_finish();
     }
 
@@ -119,7 +229,10 @@ void kernel_main() {
     while (tiles_read < num_tiles_to_read) {
         uint32_t num_tiles_to_read_this_core = std::min(num_tiles_per_core - shard_tile_id, packet_size_in_pages);
         num_tiles_to_read_this_core = std::min(num_tiles_to_read - tiles_read, num_tiles_to_read_this_core);
-        cb0.wait_front(num_tiles_to_read_this_core);
+        {
+            DeviceZoneScopedN("AR-W-CB");
+            cb0.wait_front(num_tiles_to_read_this_core);
+        }
         size_t l1_read_addr = cb0.get_read_ptr();
 
         uint64_t noc0_dest_noc_addr =
@@ -130,13 +243,18 @@ void kernel_main() {
         // Within-shard offset
         noc0_dest_noc_addr += shard_tile_id * tensor0_page_size;
 
+        // the routes of this output core (mcast_split: the odd ones the other way round)
+        const bool other = mcast_split && (core_id & 1);
+        volatile PACKET_HEADER_TYPE* hdr_forward = other ? pkt_hdr_forward_b : pkt_hdr_forward;
+        volatile PACKET_HEADER_TYPE* hdr_backward = other ? pkt_hdr_backward_b : pkt_hdr_backward;
+
         // This issues a flush barrier
         if (shard_tile_id + num_tiles_to_read_this_core >= num_tiles_per_core ||
             tiles_read + num_tiles_to_read_this_core >= num_tiles_to_read) {
             fused_write_atomic_and_advance_local_read_address_for_fabric_write(
                 noc0_dest_noc_addr,
-                pkt_hdr_forward,
-                pkt_hdr_backward,
+                hdr_forward,
+                hdr_backward,
                 fabric_connection,
                 l1_read_addr,
                 num_tiles_to_read_this_core * tensor0_page_size,
@@ -147,8 +265,8 @@ void kernel_main() {
         } else {
             write_and_advance_local_read_address_for_fabric_write(
                 noc0_dest_noc_addr,
-                pkt_hdr_forward,
-                pkt_hdr_backward,
+                hdr_forward,
+                hdr_backward,
                 fabric_connection,
                 l1_read_addr,
                 num_tiles_to_read_this_core * tensor0_page_size);
@@ -166,15 +284,24 @@ void kernel_main() {
     // 2. local semaphore increment
     // Device 2.0 migration: legacy primitive retained: out_ready_sem_bank_addr is the address of a GlobalSemaphore.
     // Semaphore<> binds to per-program ids via get_semaphore<>(id), so it cannot wrap a GlobalSemaphore.
-    for (uint32_t i = 0; i < core_id; i++) {
-        noc_semaphore_inc(safe_get_noc_addr(core_noc_x[i], core_noc_y[i], out_ready_sem_bank_addr), 1);
+    {
+        DeviceZoneScopedN("AR-W-INC");
+        for (uint32_t i = 0; i < core_id; i++) {
+            noc_semaphore_inc(safe_get_noc_addr(core_noc_x[i], core_noc_y[i], out_ready_sem_bank_addr), 1);
+        }
     }
-    if (fabric_connection.is_logically_connected()) {
-        fabric_connection.close_start();
-    }
-    if (fabric_connection.is_logically_connected()) {
-        fabric_connection.close_finish();
-    }
+    {
+        DeviceZoneScopedN("AR-W-CLOSE");
+        if (fabric_connection.is_logically_connected()) {
+            fabric_connection.close_start();
+        }
+        if (fabric_connection.is_logically_connected()) {
+            fabric_connection.close_finish();
+        }
 
-    noc_obj.async_write_barrier();
+        noc_obj.async_write_barrier();
+        // (the local semaphore increments' acks in before the kernel ends: the next program's NIU atomic count
+        // starts from the kernel's start)
+        noc_async_atomic_barrier();
+    }
 }

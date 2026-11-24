@@ -109,6 +109,7 @@ std::unordered_map<std::string, uint32_t> get_ring_reader_named_compile_args(
         {"slice_Ht", slice_Ht},
         {"slice_Wt", slice_Wt},
         {"fuse_op", fuse_op},
+        {"per_batch", fuse_op && input_tensor_B > 1},
         {"dim", normalized_dim},
     };
 }
@@ -169,6 +170,8 @@ std::unordered_map<std::string, uint32_t> get_ring_writer_named_compile_args(
         {"slice_Wt", slice_Wt},
         {"dim", normalized_dim},
         {"fuse_op", fuse_op},
+        {"per_batch", fuse_op && input_tensor_B > 1},
+        {"signal_consumer", 0},
     };
 }
 
@@ -204,6 +207,7 @@ std::unordered_map<std::string, uint32_t> get_ring_compute_named_compile_args(
         {"input_tensor_B", input_tensor_B},
         {"slice_C", slice_C},
         {"fuse_op", fuse_op},
+        {"per_batch", fuse_op && input_tensor_B > 1},
     };
 }
 
@@ -1225,7 +1229,12 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
     std::optional<uint32_t> num_workers_per_direction_opt,
     std::optional<uint32_t> num_buffers_per_channel,
     const CoreCoord core_grid_offset,
-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
+    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
+    // (for col_row_reduce_scatter) one traversal per batch without a fused producer; and a consumer
+    // in the same program told when each traversal's outputs are final: {its NoC x, y, semaphore id}, one increment a
+    // writer and traversal, after the writer's local output writes
+    bool force_per_batch = false,
+    std::optional<std::array<uint32_t, 3>> consumer_signal = std::nullopt) {
     auto* mesh_device = input_tensor.device();
     [[maybe_unused]] bool is_first_chip = ring_index == 0;
     [[maybe_unused]] bool is_last_chip = ring_index == ring_size - 1;
@@ -1362,7 +1371,7 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
     const uint32_t input_tensor_num_pages = input_tensor.buffer()->num_pages();
     const uint32_t output_tensor_num_pages = input_tensor_num_pages / ring_size;
     const uint32_t input_batch_num_pages = input_tensor_num_pages / input_tensor_B;
-    const bool per_batch_traversals = fuse_op && input_tensor_B > 1;
+    const bool per_batch_traversals = (fuse_op || force_per_batch) && input_tensor_B > 1;
     const uint32_t output_batch_num_pages = output_tensor_num_pages / slice_B;
     const uint32_t input_channel_num_pages = input_batch_num_pages / input_tensor_C;
     const uint32_t output_channel_num_pages = output_batch_num_pages / slice_C;
@@ -1506,6 +1515,7 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
         slice_Wt,
         fuse_op,
         normalized_dim);
+    reader_named_compile_args["per_batch"] = per_batch_traversals ? 1 : 0;
     if (normalized_dim != 0) {
         // Staging-layout switch consumed by the unified ring reader. chunks_per_channel is only read
         // by the chunk-paged branch, but the named arg must always be present for the kernel to
@@ -1570,6 +1580,8 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
         slice_Wt,
         normalized_dim,
         fuse_op);
+    writer_named_compile_args["per_batch"] = per_batch_traversals ? 1 : 0;
+    writer_named_compile_args["signal_consumer"] = consumer_signal.has_value() ? 1 : 0;
     if (normalized_dim != 0) {
         // Staging-layout switch consumed by the unified ring writer. The chunk-paged sizing args are
         // only read by that branch, but must always be present for the kernel to compile.
@@ -1620,7 +1632,7 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
     }
 
     // Compute kernel
-    const auto compute_named_compile_args = operations::experimental::ccl::detail::get_ring_compute_named_compile_args(
+    auto compute_named_compile_args = operations::experimental::ccl::detail::get_ring_compute_named_compile_args(
         input_cb_index,
         intermediate_cb_index,
         intermediate_2_cb_index,
@@ -1632,6 +1644,7 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
         slice_C,
         normalized_dim,
         fuse_op);
+    compute_named_compile_args["per_batch"] = per_batch_traversals ? 1 : 0;
 
     std::string compute_kernel_path = normalized_dim == 0
                                           ? "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/"
@@ -1854,6 +1867,11 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
         for (const uint32_t semaphore_arg : semaphore_args) {
             common_args.push_back(
                 semaphore_arg);  // smuggled-rta-ok: re-applied via apply_ring_reduce_scatter_semaphore_args()
+        }
+        if (kernel_index == writer_kernel_index && consumer_signal.has_value()) {
+            for (const uint32_t v : *consumer_signal) {
+                common_args.push_back(v);  // (the consumer's NoC x, y, semaphore id: fixed for the program)
+            }
         }
         desc.kernels[kernel_index].emplace_common_runtime_args(common_args);
     }
@@ -2848,6 +2866,56 @@ ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program
         num_buffers_per_channel,
         core_grid_offset,
         compute_kernel_config);
+}
+
+ReduceScatterDescriptorArtifacts build_ring_reduce_scatter_minimal_async_program_descriptor_ext(
+    tt::tt_metal::ProgramDescriptor& desc,
+    const Tensor& input_tensor,
+    const Tensor& intermediate_tensor,
+    const MeshCoordinate& sender_device_coord,
+    const std::optional<MeshCoordinate>& forward_coord,
+    const std::optional<MeshCoordinate>& backward_coord,
+    Tensor& output_tensor,
+    uint32_t dim,
+    uint32_t num_links,
+    uint32_t ring_size,
+    uint32_t ring_index,
+    ttnn::ccl::Topology topology,
+    const std::vector<GlobalSemaphore>& semaphore,
+    const std::optional<GlobalSemaphore>& barrier_semaphore,
+    std::optional<ttnn::experimental::ccl::ReduceScatterFusedOpSignaler>& fused_op_signaler,
+    std::optional<uint32_t> chunks_per_sync,
+    std::optional<uint32_t> num_workers_per_direction_opt,
+    CoreCoord core_grid_offset,
+    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
+    bool force_per_batch,
+    std::optional<std::array<uint32_t, 3>> consumer_signal) {
+    return ::ttnn::build_ring_reduce_scatter_minimal_async_program_descriptor(
+        desc,
+        input_tensor,
+        intermediate_tensor,
+        std::nullopt,
+        sender_device_coord,
+        forward_coord,
+        backward_coord,
+        output_tensor,
+        dim,
+        num_links,
+        ring_size,
+        ring_index,
+        topology,
+        semaphore,
+        barrier_semaphore,
+        /*using_persistent_buffers=*/true,
+        std::nullopt,
+        fused_op_signaler,
+        chunks_per_sync,
+        num_workers_per_direction_opt,
+        std::nullopt,
+        core_grid_offset,
+        compute_kernel_config,
+        force_per_batch,
+        consumer_signal);
 }
 
 void apply_ring_reduce_scatter_semaphore_args(

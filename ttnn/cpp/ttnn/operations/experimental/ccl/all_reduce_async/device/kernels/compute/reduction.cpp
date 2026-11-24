@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "api/compute/eltwise_binary.h"
 #include "api/dataflow/circular_buffer.h"
+#include "api/debug/kernel_profiler.hpp"
 
 void kernel_main() {
     constexpr uint32_t cb_in0 = get_compile_time_arg_val(0);
@@ -26,7 +27,11 @@ void kernel_main() {
     CircularBuffer cb_in(cb_in0);
     CircularBuffer cb_out(cb_out0);
 
-    cb_in.wait_front(num_blocks * block_num_tiles);
+    {
+        DeviceZoneScopedN("AR-C-WAIT");  // (the shares)
+        cb_in.wait_front(num_blocks * block_num_tiles);
+    }
+    DeviceZoneScopedN("AR-C-SUM");
     cb_out.reserve_back(block_num_tiles);
 
     compute_kernel_hw_startup(cb_in0, cb_in1, cb_out0);

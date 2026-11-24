@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "all_reduce_async_device_operation.hpp"
+
+#include <cstdlib>
 #include "all_reduce_async_device_operation_types.hpp"
 
 #include "ttnn/operations/math.hpp"
@@ -13,6 +15,8 @@
 #include "ttnn/operations/ccl/common/host/ccl_topology_utils.hpp"
 #include "ttnn/operations/data_movement/common/common.hpp"  // for roofline calculation
 
+#include <tt-metalium/constants.hpp>
+#include <tt-metalium/experimental/fabric/fabric.hpp>
 #include <tt-metalium/host_api.hpp>
 
 namespace ttnn::experimental::prim {
@@ -65,11 +69,16 @@ void AllReduceAsyncDeviceOperation::validate_on_program_cache_miss(
         args.output_mem_config.shard_spec()->shape[0] * args.output_mem_config.shard_spec()->shape[1];
     const uint32_t buffer_shard_shape_volume =
         buffer_tensor.memory_config().shard_spec()->shape[0] * buffer_tensor.memory_config().shard_spec()->shape[1];
+    // compact_rows: the landing holds each chip's packed pages only (t x 64 bytes a tile, `packed_pages` a core: the
+    // program factory), so a buffer that holds ring_size x those pages is enough (its reduction CB then that size)
+    const uint32_t needed_volume =
+        args.compact_rows ? output_shard_shape_volume / tt::constants::TILE_HEIGHT * args.compact_rows * args.ring_size
+                          : output_shard_shape_volume * args.ring_size;
     TT_FATAL(
-        output_shard_shape_volume * args.ring_size <= buffer_shard_shape_volume,
+        needed_volume <= buffer_shard_shape_volume,
         "The shard size for the buffer must be large enough to hold the intermediate tensor. Require at least {} but "
         "has {}",
-        output_shard_shape_volume * args.ring_size,
+        needed_volume,
         buffer_shard_shape_volume);
 }
 
@@ -285,6 +294,35 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
         cluster_axis,
         &mesh_device,
         fp32_dest_acc);
+    // the multicast split by output core (AllReduceAsyncParams::mcast_split): read at each call, so a process can
+    // switch it (it is part of the program's cache key)
+    const char* split_env = std::getenv("TT_AR_ASYNC_MCAST_SPLIT");
+    operation_attributes.mcast_split = (split_env != nullptr && split_env[0] == '1') ? 1u : 0u;
+    // the token rows only (AllReduceAsyncParams::compact_rows): read at each call as the split; where the input is one
+    // tile row of 8 or 16 tokens (bf16, 32 x 32 tiles, width-sharded in one tile row, a whole number of packed tiles a
+    // core), else whole tiles
+    // the writer's multicast routes made on the host (AllReduceAsyncParams::host_routes): read at each call, 2D fabric
+    if (const char* routes_env = std::getenv("TT_AR_ASYNC_HOST_ROUTES");
+        routes_env != nullptr && (routes_env[0] == '1' || routes_env[0] == '2') &&
+        tt::tt_fabric::is_2d_fabric_config(tt::tt_fabric::GetFabricConfig())) {
+        operation_attributes.host_routes = routes_env[0] == '1' ? 1u : 2u;
+    }
+    const char* compact_env = std::getenv("TT_AR_ASYNC_COMPACT");
+    if (compact_env != nullptr && compact_env[0] == '1') {
+        const uint32_t t = input_tensor.logical_shape()[-2];
+        const auto& tile = input_tensor.tensor_spec().tile();
+        const auto& shard = input_tensor.memory_config().shard_spec();
+        const auto out_shard = operation_attributes.output_mem_config.shard_spec();
+        if ((t == 8 || t == 16) && input_tensor.padded_shape()[-2] == tt::constants::TILE_HEIGHT &&
+            input_tensor.dtype() == DataType::BFLOAT16 && operation_attributes.dtype == DataType::BFLOAT16 &&
+            input_tensor.layout() == Layout::TILE && tile.get_height() == tt::constants::TILE_HEIGHT &&
+            tile.get_width() == tt::constants::TILE_WIDTH && shard.has_value() &&
+            shard->shape[0] == tt::constants::TILE_HEIGHT && out_shard.has_value() &&
+            out_shard->shape == shard->shape &&
+            ((shard->shape[1] / tt::constants::TILE_WIDTH) * t) % tt::constants::TILE_HEIGHT == 0) {
+            operation_attributes.compact_rows = t;
+        }
+    }
     auto tensor_args = OperationType::tensor_args_t{.input_tensor = input_tensor, .buffer_tensor = buffer_tensor};
 
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);

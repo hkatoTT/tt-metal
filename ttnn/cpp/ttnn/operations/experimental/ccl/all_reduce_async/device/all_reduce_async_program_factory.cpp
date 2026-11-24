@@ -198,6 +198,50 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
         ttnn::ccl::get_forward_backward_line_mcast_distance(ring_size, device_index, topology, true);
     auto [forward_args, backward_args] = ttnn::ccl::get_forward_backward_line_mcast_configuration(
         coord, forward_coord, backward_coord, num_targets_forward, num_targets_backward, mesh_device);
+    // mcast_split: the odd output cores (of each link) take the other split of the distances, so that every link
+    // carries the same bytes (only where both splits reach every device: a ring of 3 or more, unequal distances)
+    const bool mcast_split = operation_attributes.mcast_split != 0 && topology == ttnn::ccl::Topology::Ring &&
+                             num_targets_forward >= 1 && num_targets_backward >= 1 &&
+                             num_targets_forward != num_targets_backward && forward_coord.has_value() &&
+                             backward_coord.has_value();
+    auto [forward_args_b, backward_args_b] = ttnn::ccl::get_forward_backward_line_mcast_configuration(
+        coord,
+        forward_coord,
+        backward_coord,
+        mcast_split ? num_targets_backward : num_targets_forward,
+        mcast_split ? num_targets_forward : num_targets_backward,
+        mesh_device);
+
+    // host_routes (AllReduceAsyncParams): the writer's headers' multicast routes made here, in its order (forward,
+    // backward, then mcast_split's forward and backward), each route map's bytes in whole words (little-endian, the
+    // last padded with zeros), passed after the multicast ranges; the kernel copies the maps' bytes as its encode
+    // writes them. Only where every route stays in this chip's mesh (the encode's remote-mesh leg is not made here)
+    std::vector<uint32_t> route_words;
+    uint32_t route_bytes = 0;
+    if (operation_attributes.host_routes != 0) {
+        const auto src_node = mesh_device->get_fabric_node_id(coord);
+        const std::array<const std::array<uint32_t, 6>*, 4> routes = {
+            &forward_args, &backward_args, &forward_args_b, &backward_args_b};
+        bool same_mesh = true;
+        for (const auto* r : routes) {
+            same_mesh &= (*r)[0] == *src_node.mesh_id;
+        }
+        if (same_mesh) {
+            for (const auto* r : routes) {
+                const auto maps = tt::tt_fabric::get_2d_mcast_route_maps(src_node, (*r)[2], (*r)[3], (*r)[4], (*r)[5]);
+                route_bytes = static_cast<uint32_t>(maps.size());
+                for (size_t i = 0; i < maps.size(); i += 4) {
+                    uint32_t word = 0;
+                    for (size_t b = 0; b < 4 && i + b < maps.size(); ++b) {
+                        word |= static_cast<uint32_t>(maps[i + b]) << (8 * b);
+                    }
+                    route_words.push_back(word);
+                }
+            }
+        } else {
+            log_warning(tt::LogOp, "all_reduce_async host_routes: a route leaves the mesh; the kernel encodes them");
+        }
+    }
 
     // Tensor Info
     [[maybe_unused]] const auto input_tensor_num_pages = input_tensor.buffer()->num_pages();
@@ -225,6 +269,22 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     const auto output_tensor_shard_shape = output_tensor.memory_config().shard_spec()->shape;
     const auto output_tensor_shard_num_pages = output_tensor_shard_shape[0] * output_tensor_shard_shape[1] / TILE_HW;
     const auto num_output_cores = output_tensor_cores.num_cores();
+    // compact_rows (AllReduceAsyncParams, the device operation's invoke): each core's shares as its tiles' token rows
+    // packed into `packed_pages` whole pages (t x 64 bytes a tile), sent, landed and summed as those, put back into the
+    // output tiles by the reduction receiver (its padding rows zero).  The sums of the token rows the same bit for bit
+    const uint32_t compact = operation_attributes.compact_rows;
+    const uint32_t packed_pages = compact ? output_tensor_shard_num_pages * compact / TILE_HEIGHT : 0;
+    TT_FATAL(
+        !compact || (input_tensor_shard_num_pages == output_tensor_shard_num_pages &&
+                     packed_pages * TILE_HEIGHT == output_tensor_shard_num_pages * compact &&
+                     num_input_cores == num_output_cores),
+        "all_reduce_async compact_rows {}: the input and output shards alike, whole packed pages a core "
+        "({} / {} pages, {} / {} cores)",
+        compact,
+        input_tensor_shard_num_pages,
+        output_tensor_shard_num_pages,
+        num_input_cores,
+        num_output_cores);
 
     auto sub_device_cores = mesh_device->worker_cores(
         tt::tt_metal::HalProgrammableCoreType::TENSIX, sub_device_id.value_or(mesh_device->get_sub_device_ids().at(0)));
@@ -401,6 +461,12 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     uint32_t reduction_CB_single_tile_size = output_tensor.tensor_spec().tile().get_tile_size(df);
     uint32_t reduction_CB_tiles = output_tensor_shard_num_pages * ring_size;
     uint32_t reduction_CB_size = reduction_CB_tiles * reduction_CB_single_tile_size;
+    // compact_rows with a landing smaller than the whole tiles' (validate: ring_size x the packed pages fit): the CB
+    // over the packed pages only, the pages the senders write and the compute reads.  A landing that holds the whole
+    // tiles keeps the CB as before (the same program)
+    if (compact && reduction_CB_size > buffer_tensor.buffer()->aligned_size_per_bank()) {
+        reduction_CB_size = ring_size * packed_pages * reduction_CB_single_tile_size;
+    }
 
     uint32_t reduction_cb_index = tt::CBIndex::c_1;
     desc.cbs.push_back(tt::tt_metal::CBDescriptor{
@@ -431,6 +497,20 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
         .buffer = output_tensor.buffer(),  // TODO: Remove once new cb attached for output
     });
 
+    /* compact_rows: the compute's packed sums, before the receiver puts them back into the output tiles */
+    const uint32_t staged_cb_index = tt::CBIndex::c_4;
+    if (compact) {
+        desc.cbs.push_back(tt::tt_metal::CBDescriptor{
+            .total_size = packed_pages * out_CB_single_tile_size,
+            .core_ranges = output_tensor_cores,
+            .format_descriptors = {{tt::tt_metal::CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(staged_cb_index),
+                .data_format = output_df,
+                .page_size = out_CB_single_tile_size,
+            }}},
+        });
+    }
+
     const std::vector<uint32_t> no_work_rt_args = {static_cast<uint32_t>(!has_work), 0u, 0u};
 
     // Create reduction dataflow kernel
@@ -441,8 +521,12 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     reduction_reader_kernel_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     reduction_reader_kernel_desc.core_ranges = output_cores_all;
     reduction_reader_kernel_desc.compile_time_args = {
-        reduction_cb_index,  // reduction_cb_index
-        reduction_CB_tiles,  // total_num_reduction_tiles
+        reduction_cb_index,                                       // reduction_cb_index
+        compact ? ring_size * packed_pages : reduction_CB_tiles,  // total_num_reduction_tiles
+        compact,                                                  // compact_rows
+        out_cb_index,                                             // out_cb_id
+        staged_cb_index,                                          // staged_cb_id
+        output_tensor_shard_num_pages,                            // out_tiles
     };
     reduction_reader_kernel_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
         .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
@@ -462,8 +546,8 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     reduction_compute_kernel_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     reduction_compute_kernel_desc.core_ranges = output_cores_all;
     reduction_compute_kernel_desc.compile_time_args = {
-        reduction_cb_index,  // reduction_cb_index
-        out_cb_index,        // out_cb_index
+        reduction_cb_index,                        // reduction_cb_index
+        compact ? staged_cb_index : out_cb_index,  // out_cb_index (compact_rows: the packed sums')
     };
     tt::tt_metal::ComputeConfigDescriptor reduction_compute_config{
         .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
@@ -476,7 +560,8 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     }
     reduction_compute_kernel_desc.config = reduction_compute_config;
     desc.kernels.push_back(std::move(reduction_compute_kernel_desc));
-    const std::vector<uint32_t> reduction_compute_rt_args = {1u, ring_size, output_tensor_shard_num_pages};
+    const std::vector<uint32_t> reduction_compute_rt_args = {
+        1u, ring_size, compact ? packed_pages : output_tensor_shard_num_pages};
     emplace_uint32_runtime_args(desc.kernels[kReductionCompute], output_tensor_cores, reduction_compute_rt_args);
     if (!output_cores_unused.empty()) {
         emplace_uint32_runtime_args(desc.kernels[kReductionCompute], output_cores_unused, no_work_rt_args);
@@ -487,6 +572,7 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
         device_index,               // my_chip_id
         src0_cb_index,              // cb0_id
         op_config.get_page_size(),  // tensor0_page_size
+        compact,                    // compact_rows
     };
     log_trace(tt::LogOp, "Reader Compile Args:");
     tt::tt_metal::KernelDescriptor worker_sender_reader_kernel_desc;
@@ -516,6 +602,10 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     };
     writer_compile_args.insert(writer_compile_args.end(), forward_args.begin(), forward_args.end());
     writer_compile_args.insert(writer_compile_args.end(), backward_args.begin(), backward_args.end());
+    writer_compile_args.push_back(static_cast<uint32_t>(mcast_split));  // mcast_split
+    writer_compile_args.insert(writer_compile_args.end(), forward_args_b.begin(), forward_args_b.end());
+    writer_compile_args.insert(writer_compile_args.end(), backward_args_b.begin(), backward_args_b.end());
+    writer_compile_args.push_back(route_bytes);  // host_route_bytes (host_routes; 0: the kernel encodes the routes)
     log_trace(tt::LogOp, "Writer Compile Args:");
     tt::tt_metal::KernelDescriptor worker_sender_writer_kernel_desc;
     worker_sender_writer_kernel_desc.kernel_source =
@@ -524,6 +614,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
     worker_sender_writer_kernel_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     worker_sender_writer_kernel_desc.core_ranges = sender_worker_core_range;
     worker_sender_writer_kernel_desc.compile_time_args = std::move(writer_compile_args);
+    if (operation_attributes.host_routes == 2 && route_bytes != 0) {  // (check: encode as before, compare, DPRINT)
+        worker_sender_writer_kernel_desc.defines.emplace_back("AR_ROUTE_CHECK", "1");
+    }
     worker_sender_writer_kernel_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
         .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
         .noc = writer_noc,
@@ -538,6 +631,12 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
         uint32_t worker_num_tiles_to_read = output_tensor_pages_in_link[link];
 
         uint32_t input_first_core_tile_start_offset = input_tensor_tile_offset_per_link[link];
+        TT_FATAL(
+            !compact || (input_first_core_tile_start_offset == 0 &&
+                         input_cores_idx_per_link[link].second - input_cores_idx_per_link[link].first ==
+                             num_output_cores_in_link[link]),
+            "all_reduce_async compact_rows: link {}'s input cores not its output cores'",
+            link);
         uint32_t output_first_core_tile_start_offset = 0;
 
         const uint32_t num_input_cores_in_link =
@@ -610,9 +709,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
 
         uint32_t out_ready_sem_wait_value = ring_size;
         std::vector<uint32_t> writer_rt_args = {
-            reduction_cb_index,                   // tensor_address0
-            output_tensor_shard_num_pages,        // num_tiles_per_core
-            worker_num_tiles_to_read,             // num_tiles_to_read
+            reduction_cb_index,                                      // tensor_address0
+            compact ? packed_pages : output_tensor_shard_num_pages,  // num_tiles_per_core (compact_rows: packed pages)
+            compact ? packed_pages * num_output_cores_in_link[link] : worker_num_tiles_to_read,  // num_tiles_to_read
             output_first_core_tile_start_offset,  // first_core_tile_start_offset
             output_tensor_cores_x.size(),         // num_cores
             num_mcast_cores,                      // num_mcast_cores
@@ -630,6 +729,7 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
         writer_rt_args.insert(writer_rt_args.end(), mcast_start_y.begin(), mcast_start_y.end());
         writer_rt_args.insert(writer_rt_args.end(), mcast_end_x.begin(), mcast_end_x.end());
         writer_rt_args.insert(writer_rt_args.end(), mcast_end_y.begin(), mcast_end_y.end());
+        writer_rt_args.insert(writer_rt_args.end(), route_words.begin(), route_words.end());  // (host_routes)
 
         log_trace(tt::LogOp, "Writer Runtime Args:");
         for ([[maybe_unused]] const auto& arg : writer_rt_args) {

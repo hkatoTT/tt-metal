@@ -495,4 +495,16 @@ bool is_1d_fabric_config(tt::tt_fabric::FabricConfig fabric_config);
 
 bool is_2d_fabric_config(tt::tt_fabric::FabricConfig fabric_config);
 
+// The 2D fabric's multicast route maps that a worker on `src` writes into a packet header for a multicast of the given
+// hops in each direction around `src`, within its own mesh (the kernels' fabric_set_2d_mcast_route:
+// encode_2d_mcast_maps over the chip's reverse trees), made on the host from the control plane's tables: the header's
+// route_buffer bytes 0 .. Y + X - 1 (the Y map, then the X map; Y x X the mesh's shape).  A kernel given them writes
+// the header's route without encoding it.  2D fabric only.
+std::vector<std::uint8_t> get_2d_mcast_route_maps(
+    const FabricNodeId& src,
+    std::uint32_t e_num_hops,
+    std::uint32_t w_num_hops,
+    std::uint32_t n_num_hops,
+    std::uint32_t s_num_hops);
+
 }  // namespace tt::tt_fabric

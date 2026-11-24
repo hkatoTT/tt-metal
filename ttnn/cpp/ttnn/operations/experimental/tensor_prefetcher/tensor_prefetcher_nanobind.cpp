@@ -9,6 +9,10 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/string.h>
+
+#include <tt-metalium/experimental/glm_drisc.hpp>
+#include <tt-metalium/mesh_device.hpp>
 
 #include <tt-metalium/experimental/prefetcher_pipe.hpp>
 
@@ -341,6 +345,93 @@ void bind_tensor_prefetcher(nb::module_& mod) {
             nb::arg("program_config"),
             nb::arg("weight"),
             nb::arg("prefetcher_pipes")));
+
+    // GLM-5.3-Flash's expert prefetch reader: a custom long-lived DRISC kernel (tt-metalium/experimental/glm_drisc.hpp)
+    namespace metal_exp = tt::tt_metal::experimental;
+    using MeshDevice = tt::tt_metal::distributed::MeshDevice;
+    mod.def(
+        "glm_drisc_region",
+        [](MeshDevice* mesh) { return metal_exp::GlmDriscRegion(*mesh); },
+        nb::arg("mesh_device"),
+        "The DRISC kernel working region (base, size) on every bank.");
+    mod.def(
+        "glm_drisc_sender_cores",
+        [](MeshDevice* mesh) {
+            std::vector<std::vector<std::pair<uint32_t, uint32_t>>> out;
+            for (const auto& bank : metal_exp::GlmDriscSenderCores(*mesh)) {
+                std::vector<std::pair<uint32_t, uint32_t>> cores;
+                for (const auto& c : bank) {
+                    cores.emplace_back(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y));
+                }
+                out.push_back(cores);
+            }
+            return out;
+        },
+        nb::arg("mesh_device"),
+        "The DRAM-logical cores (x, y) a bank's DRISC kernels may run on, bank by bank.");
+    mod.def(
+        "glm_drisc_start",
+        [](MeshDevice* mesh,
+           const std::string& kernel_path,
+           const std::vector<std::pair<uint32_t, uint32_t>>& cores,
+           const std::vector<uint32_t>& compile_args,
+           const std::vector<std::vector<uint32_t>>& runtime_args) {
+            std::vector<CoreCoord> logical;
+            for (const auto& [x, y] : cores) {
+                logical.emplace_back(x, y);
+            }
+            metal_exp::GlmDriscStart(*mesh, kernel_path, logical, compile_args, runtime_args);
+        },
+        nb::arg("mesh_device"),
+        nb::arg("kernel_path"),
+        nb::arg("cores"),
+        nb::arg("compile_args"),
+        nb::arg("runtime_args"),
+        "Launch a DRISC kernel on logical DRAM cores (x, y) of every chip; runtime_args per (chip, core).");
+    mod.def(
+        "glm_drisc_noc_coords",
+        [](MeshDevice* mesh, const std::vector<std::pair<uint32_t, uint32_t>>& cores) {
+            std::vector<CoreCoord> logical;
+            for (const auto& [x, y] : cores) {
+                logical.emplace_back(x, y);
+            }
+            std::vector<std::pair<uint32_t, uint32_t>> out;
+            for (const auto& c : metal_exp::GlmDriscNocCoords(*mesh, logical)) {
+                out.emplace_back(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y));
+            }
+            return out;
+        },
+        nb::arg("mesh_device"),
+        nb::arg("cores"),
+        "The NoC (virtual) coordinates of logical DRAM cores.");
+    mod.def(
+        "glm_drisc_wait",
+        [](MeshDevice* mesh) { metal_exp::GlmDriscWait(*mesh); },
+        nb::arg("mesh_device"),
+        "Wait for the launched DRISC kernels to return.");
+    mod.def(
+        "glm_drisc_write_l1",
+        [](MeshDevice* mesh, int chip, std::pair<uint32_t, uint32_t> core, uint32_t address,
+           const std::vector<uint32_t>& words) {
+            metal_exp::GlmDriscWriteL1(*mesh, chip, CoreCoord(core.first, core.second), address, words);
+        },
+        nb::arg("mesh_device"),
+        nb::arg("chip"),
+        nb::arg("core"),
+        nb::arg("address"),
+        nb::arg("words"),
+        "Write words into a DRAM core's L1 on one chip (or every chip: chip < 0).");
+    mod.def(
+        "glm_drisc_read_l1",
+        [](MeshDevice* mesh, int chip, std::pair<uint32_t, uint32_t> core, uint32_t address, uint32_t words) {
+            return metal_exp::GlmDriscReadL1(*mesh, chip, CoreCoord(core.first, core.second), address, words);
+        },
+        nb::arg("mesh_device"),
+        nb::arg("chip"),
+        nb::arg("core"),
+        nb::arg("address"),
+        nb::arg("words"),
+        "Read words from a DRAM core's L1 on one chip.");
 }
 
 }  // namespace ttnn::operations::experimental

@@ -15,7 +15,13 @@
 #include <tt-metalium/bfloat8.hpp>
 #include <tt-metalium/buffer_distribution_spec.hpp>
 #include <tt-metalium/hal.hpp>
+#include <tt-metalium/host_buffer.hpp>
+#include <tt-metalium/tensor/host_tensor.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt_stl/span.hpp>
+
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/tensor/types.hpp"
 
 namespace ttnn::bfp_utils {
 
@@ -123,6 +129,74 @@ void py_module(nb::module_& mod) {
         nb::arg("row_major_output") = false,
         nb::arg("is_exp_a") = false,
         R"doc(Unpack raw BFP2 tile data back to float32.)doc");
+
+    mod.def(
+        "pack_transposed_slices",
+        [](const std::vector<nb::ndarray<nb::ndim<2>, nb::device::cpu>>& slices,
+           int dim,
+           tt::tt_metal::DataType dtype) -> ttnn::Tensor {
+            TT_FATAL(!slices.empty(), "pack_transposed_slices: no slices");
+            TT_FATAL(
+                dtype == tt::tt_metal::DataType::BFLOAT8_B || dtype == tt::tt_metal::DataType::BFLOAT4_B,
+                "pack_transposed_slices: BFLOAT8_B or BFLOAT4_B, not {}",
+                dtype);
+            const size_t rows = slices[0].shape(0);
+            const size_t cols = slices[0].shape(1);
+            std::vector<const uint16_t*> bases;
+            std::vector<size_t> strides;
+            bases.reserve(slices.size());
+            strides.reserve(slices.size());
+            for (const auto& s : slices) {
+                TT_FATAL(
+                    s.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Bfloat) && s.dtype().bits == 16 &&
+                        s.dtype().lanes == 1,
+                    "pack_transposed_slices: bfloat16 slices only");
+                TT_FATAL(
+                    s.shape(0) == rows && s.shape(1) == cols && s.stride(1) == 1 && s.stride(0) >= 0 &&
+                        static_cast<size_t>(s.stride(0)) >= cols,
+                    "pack_transposed_slices: each slice [{}, {}] with unit column stride and rows at least that wide",
+                    rows,
+                    cols);
+                bases.push_back(static_cast<const uint16_t*>(s.data()));
+                strides.push_back(static_cast<size_t>(s.stride(0)));
+            }
+            std::vector<uint32_t> packed;
+            {
+                nb::gil_scoped_release release;  // (the slices stay alive in `slices`)
+                packed = dtype == tt::tt_metal::DataType::BFLOAT8_B
+                             ? pack_transposed_slices_as_bfp8_tiles(bases, strides, rows, cols, dim)
+                             : pack_transposed_slices_as_bfp4_tiles(bases, strides, rows, cols, dim);
+            }
+            const uint32_t out_rows = dim == 1 ? cols : slices.size() * cols;
+            const uint32_t out_cols = dim == 1 ? slices.size() * rows : rows;
+            // the spec from_torch gives a [1, 1, out_rows, out_cols] tensor of this dtype in tiles (default tile and
+            // memory config), as the one-pass row-major packing builds it (host_tensor_factory.cpp)
+            const auto shape = tt::tt_metal::Shape({1, 1, out_rows, out_cols});
+            const tt::tt_metal::TensorSpec requested(
+                shape,
+                tt::tt_metal::TensorLayout(
+                    dtype, tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE), tt::tt_metal::MemoryConfig{}));
+            auto spec = tt::tt_metal::TensorSpec(
+                requested.logical_shape(),
+                tt::tt_metal::TensorLayout(
+                    dtype,
+                    tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE, requested.tile()),
+                    requested.memory_config(),
+                    requested.tensor_layout().get_alignment()));
+            TT_FATAL(
+                packed.size() * sizeof(uint32_t) == spec.compute_packed_buffer_size_bytes(),
+                "pack_transposed_slices: packed {} bytes, the spec {}",
+                packed.size() * sizeof(uint32_t),
+                spec.compute_packed_buffer_size_bytes());
+            return ttnn::Tensor(
+                tt::tt_metal::HostTensor::from_buffer(tt::tt_metal::HostBuffer(std::move(packed)), std::move(spec)));
+        },
+        nb::arg("slices"),
+        nb::arg("dim"),
+        nb::arg("dtype"),
+        R"doc(The concatenation of transposed bfloat16 slices ([rows, cols] each, row-major with any row stride) as a host
+        tensor [1, 1, ..] of block-float tiles, packed in one pass: the bytes from_torch(torch.cat([s.T for s in
+        slices], dim)[None, None], dtype, TILE) gives.  dim 1: [cols, n rows]; dim 0: [n cols, rows].)doc");
 
     mod.def("get_l1_alignment", &tt::tt_metal::hal::get_l1_alignment, R"doc(Get L1 memory alignment in bytes.)doc");
     mod.def(

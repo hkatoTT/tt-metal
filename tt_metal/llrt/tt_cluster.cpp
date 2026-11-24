@@ -20,6 +20,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>  // for get
 #include <unordered_map>
 #include <filesystem>
@@ -473,6 +474,33 @@ void Cluster::get_metal_desc_from_tt_desc() {
         }
         this->sdesc_per_chip_.emplace(id, std::move(sdesc));
     }
+    static const bool coord_cache = [] {
+        const char* v = std::getenv("TT_COORD_CACHE");
+        return v == nullptr || std::string_view(v) != "0";
+    }();
+    if (coord_cache) {
+        for (const auto& [id, sdesc] : this->sdesc_per_chip_) {
+            const tt_xy_pair grid = sdesc.get_grid_size(CoreType::TENSIX);
+            TensixVirtualTable table;
+            table.width = grid.x;
+            table.height = grid.y;
+            table.coords.resize(grid.x * grid.y);
+            table.valid.assign(grid.x * grid.y, 0);
+            for (size_t y = 0; y < grid.y; ++y) {
+                for (size_t x = 0; x < grid.x; ++x) {
+                    try {
+                        tt::umd::CoreCoord translated = sdesc.translate_coord_to(
+                            {tt_xy_pair{x, y}, CoreType::TENSIX, CoordSystem::LOGICAL}, CoordSystem::TRANSLATED);
+                        table.coords[y * grid.x + x] = {translated.x, translated.y};
+                        table.valid[y * grid.x + x] = 1;
+                    } catch (const std::exception&) {
+                        // (not a logical core: left to the lookups, which throw)
+                    }
+                }
+            }
+            this->tensix_virtual_by_chip_[id] = std::move(table);
+        }
+    }
 }
 
 const std::unordered_map<tt::tt_metal::CoreCoord, int32_t>& Cluster::get_virtual_routing_to_profiler_flat_id(ChipId chip_id) const {
@@ -727,6 +755,19 @@ tt::tt_metal::CoreCoord Cluster::get_virtual_coordinate_from_logical_coordinates
     if (core_type_to_use != CoreType::TENSIX && core_type != CoreType::DRAM && core_type != CoreType::ETH &&
         core_type != CoreType::DISPATCH) {
         TT_THROW("Undefined conversion for core type.");
+    }
+
+    if (core_type_to_use == CoreType::TENSIX && !this->tensix_virtual_by_chip_.empty()) {  // (TT_COORD_CACHE)
+        auto it = this->tensix_virtual_by_chip_.find(chip_id);
+        if (it != this->tensix_virtual_by_chip_.end()) {
+            const auto& table = it->second;
+            if (logical_coord.x < table.width && logical_coord.y < table.height) {
+                const size_t i = logical_coord.y * table.width + logical_coord.x;
+                if (table.valid[i]) {
+                    return table.coords[i];
+                }
+            }
+        }
     }
 
     const auto& soc_desc = this->get_soc_desc(chip_id);

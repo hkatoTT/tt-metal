@@ -39,3 +39,16 @@ std::vector<uint32_t> pack_as_bfp_tiles(
     bool row_major_input,
     bool is_exp_a,
     const std::optional<tt::tt_metal::Tile>& tile = std::nullopt);
+
+// A row-major [rows, cols] matrix (T bfloat16 or float) packed into BFP tiles in one pass: the bytes tilizing it
+// (to_tile_major_layout: tile rows, then tile columns, faces in order) and then pack_as_bfp_tiles give, without the
+// tilized copy.  std::nullopt where the one-pass form does not apply (another tile or face shape, transposed faces,
+// rows or cols not multiples of 32, is_exp_a, padded exponents, another T, or TT_BFP_PACK_FAST=0): the caller takes the
+// general way.
+template <tt::DataFormat BfpFormat, typename T>
+std::optional<std::vector<uint32_t>> pack_row_major_as_bfp_tiles(
+    ttsl::Span<const T> input_data,
+    size_t rows,
+    size_t cols,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile = std::nullopt);

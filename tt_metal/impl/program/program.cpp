@@ -18,6 +18,7 @@
 #include <atomic>
 #include <bitset>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -3395,7 +3396,82 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
     Inspector::program_compile_finished(this, device, build_env.build_key());
 }
 
+namespace {
+// TT_METAL_CB_MARGIN_LOG=1 (a diagnostic: it prints only, nothing else changes): at each program's compile-and-allocate
+// (every enqueue, and a trace's capture), each core range's static circular buffers' end against the lowest occupied L1
+// address at that moment (the margin the L1 buffers below could still take), printed to stdout as
+// "CB_MARGIN|tag|margin|cb end|lowest|core range|kernels" when its (tag, core range, kernels) sees a new lowest margin.
+// The tag is TT_METAL_CB_MARGIN_TAG at that moment (a test sets it per phase; "-" when unset).
+bool cb_margin_log_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("TT_METAL_CB_MARGIN_LOG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+struct CbMarginAtExit {
+    std::function<void()> log;
+    ~CbMarginAtExit() {
+        if (log) {
+            try {
+                log();
+            } catch (...) {
+            }
+        }
+    }
+};
+}  // namespace
+
 void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_dispatch) {
+    // TT_METAL_CB_MARGIN_LOG (above): the margins once this call is done, whichever way it returns
+    std::optional<CbMarginAtExit> cb_margin_at_exit;
+    if (cb_margin_log_on()) {
+        cb_margin_at_exit.emplace();
+        cb_margin_at_exit->log = [this, device]() {
+            static std::mutex mutex;
+            static std::map<std::string, int64_t> lowest_seen;
+            const auto lowest = device->lowest_occupied_compute_l1_address(this->determine_sub_device_ids(device));
+            const uint64_t floor = lowest.has_value() ? *lowest : device->l1_size_per_core();
+            const char* tag_env = std::getenv("TT_METAL_CB_MARGIN_TAG");
+            const std::string tag = tag_env != nullptr && tag_env[0] != '\0' ? tag_env : "-";
+            std::set<std::string> names;
+            for (auto& by_handle : this->kernels_) {
+                for (auto& [handle, kernel] : by_handle) {
+                    names.insert(kernel->name());
+                }
+            }
+            std::string kernels;
+            for (const auto& n : names) {
+                kernels += (kernels.empty() ? "" : "+") + n;
+            }
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto* allocators : {&this->cb_allocators_, &this->dfb_allocators_}) {
+                for (const auto& a : *allocators) {
+                    if (a.l1_regions.empty()) {
+                        continue;
+                    }
+                    const uint64_t end = a.l1_regions.back().second;
+                    const int64_t margin = static_cast<int64_t>(floor) - static_cast<int64_t>(end);
+                    const std::string key = tag + "|" + a.core_range.str() + "|" + kernels;
+                    auto it = lowest_seen.find(key);
+                    if (it != lowest_seen.end() && it->second <= margin) {
+                        continue;
+                    }
+                    lowest_seen[key] = margin;
+                    std::fprintf(
+                        stdout,
+                        "CB_MARGIN|%s|%lld|%llu|%llu|%s|%s\n",
+                        tag.c_str(),
+                        static_cast<long long>(margin),
+                        static_cast<unsigned long long>(end),
+                        static_cast<unsigned long long>(floor),
+                        a.core_range.str().c_str(),
+                        kernels.c_str());
+                }
+            }
+            std::fflush(stdout);
+        };
+    }
     // The compile and allocation steps below are individually guarded and would early-return:
     // nothing has changed since this program was compiled and laid out for this device. Skip them
     // outright, since this is called on every enqueue and the guards alone cost microseconds per

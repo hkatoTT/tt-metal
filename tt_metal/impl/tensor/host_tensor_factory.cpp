@@ -15,16 +15,56 @@
 #include <tt-metalium/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/distributed_tensor/topology/tensor_topology.hpp>
 #include "tensor_impl.hpp"
+#include "impl/data_format/blockfloat_common.hpp"
 
 #include <tt_stl/span.hpp>
 #include <tt_stl/fmt.hpp>
 
 #include <algorithm>
+#include <optional>
+#include <type_traits>
 
 namespace tt::tt_metal {
 
 namespace {
 namespace CMAKE_UNIQUE_NAMESPACE {
+
+// A block-float host tensor from row-major bfloat16 / float data in one pass (pack_row_major_as_bfp_tiles), where the
+// spec asks no padding: the tensor encode_tensor_data (tilizing) and then to_dtype give, the same spec and bytes,
+// without the tilized copy.  std::nullopt where it does not apply (the caller takes the general way).
+template <typename T>
+std::optional<HostTensor> bfp_from_row_major(ttsl::Span<const T> buffer, const TensorSpec& spec) {
+    if constexpr (!std::is_same_v<T, bfloat16> && !std::is_same_v<T, float>) {
+        return std::nullopt;
+    } else {
+        const DataType dtype = spec.data_type();
+        if ((dtype != DataType::BFLOAT8_B && dtype != DataType::BFLOAT4_B) || spec.layout() != Layout::TILE ||
+            spec.logical_2d_shape() != spec.physical_shape() || buffer.empty()) {
+            return std::nullopt;
+        }
+        const auto& tile = spec.tile();
+        const auto& physical = spec.physical_shape();
+        auto packed = dtype == DataType::BFLOAT8_B
+                          ? pack_row_major_as_bfp_tiles<tt::DataFormat::Bfp8_b, T>(
+                                buffer, physical.height(), physical.width(), /*is_exp_a=*/false, tile)
+                          : pack_row_major_as_bfp_tiles<tt::DataFormat::Bfp4_b, T>(
+                                buffer, physical.height(), physical.width(), /*is_exp_a=*/false, tile);
+        if (!packed.has_value()) {
+            return std::nullopt;
+        }
+        // to_dtype's output spec from the tilized buffer's (same shape, page config, memory config and alignment)
+        auto output_spec = TensorSpec(
+            spec.logical_shape(),
+            TensorLayout(
+                dtype, PageConfig(Layout::TILE, tile), spec.memory_config(), spec.tensor_layout().get_alignment()));
+        TT_FATAL(
+            packed->size() * sizeof(uint32_t) == output_spec.compute_packed_buffer_size_bytes(),
+            "bfp_from_row_major: packed {} bytes, the spec {}",
+            packed->size() * sizeof(uint32_t),
+            output_spec.compute_packed_buffer_size_bytes());
+        return HostTensor::from_buffer(HostBuffer(std::move(*packed)), std::move(output_spec));
+    }
+}
 
 template <typename T>
 HostTensor from_span_impl(std::span<const T> buffer, const TensorSpec& spec, T pad_value) {
@@ -43,6 +83,9 @@ HostTensor from_span_impl(std::span<const T> buffer, const TensorSpec& spec, T p
         buffer.size() == volume, "Current buffer size is {} different from shape volume {}", buffer.size(), volume);
     if (spec.data_type() == DataType::BFLOAT8_B || spec.data_type() == DataType::BFLOAT4_B) {
         TT_FATAL(spec.layout() == Layout::TILE, "Block float types are only supported in TILE layout");
+        if (auto packed = bfp_from_row_major(ttsl::make_const_span(buffer), spec)) {
+            return std::move(*packed);
+        }
     }
 
     auto host_buffer = HostBuffer(tensor_impl::encode_tensor_data(ttsl::make_const_span(buffer), spec, pad_value));
@@ -96,6 +139,9 @@ HostTensor host_tensor_from_vector_with_pad_value(std::vector<T>&& buffer, Tenso
 
     if (spec.data_type() == DataType::BFLOAT8_B || spec.data_type() == DataType::BFLOAT4_B) {
         TT_FATAL(spec.layout() == Layout::TILE, "Block float types only supported in TILE layout");
+        if (auto packed = CMAKE_UNIQUE_NAMESPACE::bfp_from_row_major(ttsl::make_const_span(buffer), spec)) {
+            return std::move(*packed);
+        }
     }
 
     auto buffer_dtype = convert_to_data_type<T>();

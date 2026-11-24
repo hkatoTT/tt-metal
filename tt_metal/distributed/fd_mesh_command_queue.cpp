@@ -16,6 +16,8 @@
 #include <tt-metalium/experimental/fabric/control_plane.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <array>
 #include <functional>
 #include <mutex>
@@ -1579,6 +1581,14 @@ void FDMeshCommandQueue::record_end() {
         exec_buf_end.push_back(static_cast<uint32_t*>(command_sequence.data())[i]);
     }
     size_t max_trace_size = 0;
+    // TT_TRACE_RESERVE (default 1): each device range's command stream (the bypass buffer, grown a command at a time)
+    // after the first reserved up front at the largest size so far in this capture, so it is not moved to bigger buffers
+    // as it grows; 0: grown as it goes (tt-metal's form).  The same bytes
+    static const bool reserve_streams = [] {
+        const char* v = std::getenv("TT_TRACE_RESERVE");
+        return v == nullptr || std::string_view(v) != "0";
+    }();
+    size_t reserve_hint = 0;
     std::set<SubDeviceId> sub_device_ids;
     std::optional<std::unordered_map<SubDeviceId, TraceWorkerDescriptor>> overall_trace_worker_descriptors;
     for (const auto& range : device_ranges) {
@@ -1638,6 +1648,9 @@ void FDMeshCommandQueue::record_end() {
         this->reset_prefetcher_cache_manager();
 
         auto& sysmem_manager_for_trace = mesh_device_->get_device(range.start_coord())->sysmem_manager();
+        if (reserve_hint > 0) {
+            sysmem_manager_for_trace.get_bypass_data().reserve(reserve_hint);
+        }
         auto& worker_launch_message_buffer_state = cq_shared_state_->worker_launch_message_buffer_state;
         for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
             worker_launch_message_buffer_state[sub_device_id].reset();
@@ -1761,6 +1774,9 @@ void FDMeshCommandQueue::record_end() {
         }
 
         auto& bypass_data = sysmem_manager_for_trace.get_bypass_data();
+        if (reserve_streams) {
+            reserve_hint = std::max(reserve_hint, bypass_data.size() + exec_buf_end.size());
+        }
         bypass_data.insert(bypass_data.end(), exec_buf_end.begin(), exec_buf_end.end());
 
         max_trace_size = std::max(max_trace_size, bypass_data.size());

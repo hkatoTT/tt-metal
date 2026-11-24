@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <tt_stl/fmt.hpp>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <tt-logger/tt-logger.hpp>
 #include <mesh_command_queue.hpp>
@@ -1762,7 +1765,16 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id) 
         *trace_id,
         this->mesh_id_,
         active_sub_device_manager->id());
+    // TT_TRACE_CAPTURE_STATS=1: each capture's device ranges (the mesh's parts with their own command stream), its
+    // bytes and the time of record_end and of the trace's write to the device, to stderr; 2: with a hash of the
+    // trace's bytes and ranges (the same commands across changes to the recording)
+    static const int capture_stats = [] {
+        const char* v = std::getenv("TT_TRACE_CAPTURE_STATS");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    const auto stats_t0 = std::chrono::steady_clock::now();
     this->mesh_command_queues_[cq_id]->record_end();
+    const auto stats_t1 = std::chrono::steady_clock::now();
 
     // End DRAM high water mark tracking if trace_region_size is 0 (dynamic allocation mode)
     auto trace_region_size = this->allocator_impl()->get_config().trace_region_size;
@@ -1781,6 +1793,40 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id) 
         dram_allocation_high_water_mark,
         dram_deletion_high_water_mark,
         max_live_trace_high_water_mark);
+    if (capture_stats > 0) {
+        const auto stats_t2 = std::chrono::steady_clock::now();
+        const auto& data = trace_buffer->desc->ordered_trace_data;
+        size_t total = 0;
+        size_t biggest = 0;
+        uint64_t hash = 0x9E3779B97F4A7C15ull;
+        for (const auto& d : data) {
+            total += d.data.size() * sizeof(uint32_t);
+            biggest = std::max(biggest, d.data.size() * sizeof(uint32_t));
+            if (capture_stats > 1) {
+                for (const auto& coord : d.device_range) {
+                    for (size_t i = 0; i < coord.dims(); ++i) {
+                        hash = (hash ^ coord[i]) * 0x100000001B3ull;
+                    }
+                }
+                hash = (hash ^ 0xFFFFFFFFull) * 0x100000001B3ull;
+                for (uint32_t w : d.data) {
+                    hash = (hash ^ w) * 0x100000001B3ull;
+                }
+            }
+        }
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::fprintf(
+            stderr,
+            "TRACE_CAPTURE_STATS trace %u ranges %zu bytes %zu max_range_bytes %zu record_end_ms %.1f populate_ms %.1f "
+            "hash %016llx\n",
+            static_cast<unsigned>(*trace_id),
+            data.size(),
+            total,
+            biggest,
+            ms(stats_t0, stats_t1),
+            ms(stats_t1, stats_t2),
+            static_cast<unsigned long long>(capture_stats > 1 ? hash : 0));
+    }
 }
 
 void MeshDeviceImpl::replay_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id, bool blocking) {

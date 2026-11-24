@@ -33,6 +33,7 @@
 #include "fabric_host_utils.hpp"
 #include "fabric_context.hpp"
 #include "fabric_builder_context.hpp"
+#include "mcast_reverse_tree.hpp"
 
 namespace tt::tt_metal {
 class Program;
@@ -597,6 +598,55 @@ bool is_2d_fabric_config(tt::tt_fabric::FabricConfig fabric_config) {
            fabric_config == tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_X ||
            fabric_config == tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_Y ||
            fabric_config == tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_XY;
+}
+
+std::vector<std::uint8_t> get_2d_mcast_route_maps(
+    const FabricNodeId& src,
+    std::uint32_t e_num_hops,
+    std::uint32_t w_num_hops,
+    std::uint32_t n_num_hops,
+    std::uint32_t s_num_hops) {
+    TT_FATAL(is_2d_fabric_config(GetFabricConfig()), "get_2d_mcast_route_maps: a 2D fabric only");
+    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+    const auto& mesh_graph = control_plane.get_mesh_graph();
+    // As the control plane fills the chip's routing info (write_routing_info_to_devices): the mesh's global shape for
+    // the map sizes and the root, the chip's mesh coordinate for its reverse trees
+    const auto shape = control_plane.get_physical_mesh_shape(src.mesh_id, MeshScope::GLOBAL);
+    const std::uint32_t y_size = shape[0], x_size = shape[1];
+    const auto* y_topo = control_plane.axis_topology(src.mesh_id, 0);
+    const auto* x_topo = control_plane.axis_topology(src.mesh_id, 1);
+    TT_FATAL(
+        y_topo != nullptr && x_topo != nullptr, "get_2d_mcast_route_maps: mesh {} has no axis topology", *src.mesh_id);
+    const auto coord = mesh_graph.chip_to_coordinate(src.mesh_id, src.chip_id);
+    std::vector<std::uint8_t> trees(Routing2DCodec::MCAST_TREE_CAPACITY_BYTES, 0);
+    std::string failure;
+    TT_FATAL(
+        embed_mcast_reverse_trees(
+            mesh_graph,
+            src.mesh_id,
+            *y_topo,
+            *x_topo,
+            static_cast<int>(coord[0]),
+            static_cast<int>(coord[1]),
+            trees.data(),
+            &failure),
+        "get_2d_mcast_route_maps: mesh {} chip {}: {}",
+        *src.mesh_id,
+        src.chip_id,
+        failure);
+    std::vector<std::uint8_t> maps(y_size + x_size, 0);
+    encode_2d_mcast_maps(
+        maps.data(),
+        trees.data(),
+        y_size,
+        x_size,
+        src.chip_id / x_size,
+        src.chip_id % x_size,
+        n_num_hops,
+        s_num_hops,
+        e_num_hops,
+        w_num_hops);
+    return maps;
 }
 
 namespace experimental {

@@ -9,12 +9,18 @@
 #include <tt-metalium/mesh_buffer.hpp>
 
 #include "impl/buffers/semaphore.hpp"
+#include "kernels/kernel.hpp"
+#include "program_impl.hpp"
 #include "tt_stl/overloaded.hpp"
 #include <tt_stl/reflection.hpp>
 
 #include <tt-metalium/tensor/mesh_tensor.hpp>
 #include <tt-metalium/tensor/tensor_types.hpp>
 #include <bitset>
+#include <memory>
+#include <string_view>
+#include <cstdlib>
+#include <algorithm>
 
 namespace tt::tt_metal {
 
@@ -185,13 +191,44 @@ static inline ttsl::hash::hash_t hash_semaphore_descriptor(const SemaphoreDescri
         semaphore.core_ranges, semaphore.core_type, semaphore.initial_value);
 }
 
+// TT_RTA_FAST (default 1): apply_descriptor_runtime_args looks each kernel up once (not once a core: a search of the
+// program's kernel maps and a shared_ptr copy each) and copies each core's arguments in one go after one bounds check
+// (not one assertion call per argument).  0: tt-metal's form.  The same values written
+static bool runtime_args_fast_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("TT_RTA_FAST");
+        return v == nullptr || std::string_view(v) != "0";
+    }();
+    return on;
+}
+
 void apply_descriptor_runtime_args(Program& program, const ProgramDescriptor& desc) {
+    const bool fast = runtime_args_fast_on();
     for (uint32_t k = 0; k < desc.kernels.size(); ++k) {
         const auto& kernel = desc.kernels[k];
-        for (const auto& [core, args] : kernel.runtime_args) {
-            auto& prog_args = GetRuntimeArgs(program, k, core);
-            for (uint32_t i = 0; i < static_cast<uint32_t>(args.size()); ++i) {
-                prog_args[i] = args[i];
+        if (fast && !kernel.runtime_args.empty()) {
+            TT_FATAL(
+                !program.impl().has_metal2_registry(),
+                "GetRuntimeArgs cannot be used with a Program created from a Metal 2.0 ProgramSpec. "
+                "Use experimental::SetProgramRunArgs or experimental::UpdateProgramRunArgs instead.");
+            const std::shared_ptr<Kernel> program_kernel = program.impl().get_kernel(k);
+            for (const auto& [core, args] : kernel.runtime_args) {
+                auto& prog_args = program_kernel->runtime_args_data(core);
+                TT_FATAL(
+                    args.size() <= prog_args.size(),
+                    "Runtime args of kernel {} on core {}: {} given, {} in the program",
+                    k,
+                    core.str(),
+                    args.size(),
+                    prog_args.size());
+                std::copy(args.begin(), args.end(), prog_args.data());
+            }
+        } else {
+            for (const auto& [core, args] : kernel.runtime_args) {
+                auto& prog_args = GetRuntimeArgs(program, k, core);
+                for (uint32_t i = 0; i < static_cast<uint32_t>(args.size()); ++i) {
+                    prog_args[i] = args[i];
+                }
             }
         }
         if (!kernel.common_runtime_args.empty()) {

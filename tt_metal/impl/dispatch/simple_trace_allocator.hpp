@@ -114,6 +114,25 @@ private:
             regions_.clear();
         }
 
+        // TT_METAL_TRACE_ALLOC_BEAM (the planned placement, allocate_trace_programs_on_subdevice): every placement
+        // `allocate_region`'s walk evaluates for a region of `size` (the same slots, the same Belady cost without the
+        // stall term, the sync it would need), none when the slot holds this trace index's own data
+        struct Candidate {
+            uint32_t addr;
+            float cost;
+            std::optional<uint32_t> sync;
+        };
+        std::vector<Candidate> candidates(uint32_t size, uint32_t trace_idx, bool top_down) const;
+        // ... and a region placed at `addr` (the regions it overlaps evicted, `sync` the sync it needs); false (nothing
+        // changed) when that would overwrite this trace index's own data or not fit the ringbuffer
+        bool place_at(
+            uint32_t addr,
+            uint32_t size,
+            uint32_t trace_idx,
+            uint32_t data_type,
+            uint64_t program_id,
+            std::optional<uint32_t>& sync);
+
     private:
         uint32_t ringbuffer_size_;
         std::array<std::map<uint64_t, uint32_t>, ExtraData::kNumTypes> program_ids_memory_map_;
@@ -123,6 +142,16 @@ private:
 
     void allocate_trace_programs_on_subdevice(
         const Hal& hal, std::vector<TraceNode*>& trace_nodes, SubDeviceId sub_device_id);
+
+    // TT_METAL_TRACE_ALLOC_BEAM=B (B > 1): the Tensix binaries' placements planned over the whole trace by a beam
+    // search of width B that keeps the states with the fewest bytes written right after a stall on a recent program
+    // (weights 1 / 0.25 / 0.05 for the previous / 2 / 3 programs back), each node's non-binary entry placed by the
+    // default walk.  One entry a node: kPlanFree (allocate by the default walk: cached, no binary, another sub-device),
+    // kPlanReset (the ring reset, as the default walk does it), else the binary's address.
+    static constexpr int64_t kPlanFree = -1;
+    static constexpr int64_t kPlanReset = -2;
+    std::vector<int64_t> plan_binaries(
+        const Hal& hal, std::vector<TraceNode*>& trace_nodes, SubDeviceId sub_device_id, uint32_t beam);
 
     std::vector<ExtraData> extra_data_;
     std::vector<RegionAllocator> region_allocators_;

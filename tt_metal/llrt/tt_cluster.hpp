@@ -452,6 +452,17 @@ private:
     // There is an entry for every device that can be targeted (MMIO and remote)
     std::unordered_map<ChipId, metal_SocDescriptor> sdesc_per_chip_;
 
+    // TT_COORD_CACHE (default 1): each chip's Tensix cores' virtual (translated) coordinates by logical coordinate, made
+    // once from the soc descriptor when it is loaded, for get_virtual_coordinate_from_logical_coordinates (two
+    // ordered-map lookups in UMD a call, made for every core of every program dispatched; the same values).  0: not
+    // made (the lookups each time, tt-metal's form)
+    struct TensixVirtualTable {
+        size_t width = 0, height = 0;
+        std::vector<tt::tt_metal::CoreCoord> coords;  // [y width + x]
+        std::vector<uint8_t> valid;                   // the translation succeeded (else the lookups, which throw)
+    };
+    std::unordered_map<ChipId, TensixVirtualTable> tensix_virtual_by_chip_;
+
     // Data Structures Tracking Virtual Coordinates
     std::unordered_map<tt_cxy_pair, tt_cxy_pair> virtual_to_umd_coord_mapping_;
     std::unordered_map<ChipId, std::unordered_set<tt::tt_metal::CoreCoord>> virtual_worker_cores_;

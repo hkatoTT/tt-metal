@@ -11,10 +11,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -152,23 +155,56 @@ void MeshTrace::populate_mesh_buffer(
         }
     }
 
+    // Each device range's trace bytes, padded to whole pages.  TT_TRACE_POPULATE_FAST (default 1): the whole pages
+    // written from the trace data as it is and only the last, partial page from a padded copy, every write but the last
+    // not waited for (the writes copy their data into the command queue before they return: one finish at the end waits
+    // for them all); 0: a padded copy of each range's data, each write waited for (tt-metal's form).  The same bytes at
+    // the same addresses (a mesh whose chips run their own programs has a range a chip: 32 writes a capture)
+    const char* fast_env = std::getenv("TT_TRACE_POPULATE_FAST");
+    const bool fast = fast_env == nullptr || std::string_view(fast_env) != "0";
     std::unordered_map<MeshCoordinateRange, uint32_t> write_offset_per_device_range = {};
-    for (auto& mesh_trace_data : trace_buffer->desc->ordered_trace_data) {
+    auto& ordered = trace_buffer->desc->ordered_trace_data;
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        auto& mesh_trace_data = ordered[i];
         auto& device_range = mesh_trace_data.device_range;
         if (!write_offset_per_device_range.contains(device_range)) {
             write_offset_per_device_range.insert({device_range, 0});
         }
-        std::vector<uint32_t> write_data = mesh_trace_data.data;
-        auto unpadded_data_size = write_data.size() * sizeof(uint32_t);
-        auto padded_data_size = round_up(unpadded_data_size, page_size);
-        size_t numel_padding = (padded_data_size - unpadded_data_size) / sizeof(uint32_t);
-        if (numel_padding > 0) {
-            write_data.resize(write_data.size() + numel_padding, 0);
+        const uint32_t offset = write_offset_per_device_range.at(device_range);
+        auto unpadded_data_size = mesh_trace_data.data.size() * sizeof(uint32_t);
+        if (fast) {
+            const bool last = i + 1 == ordered.size();
+            const size_t whole = unpadded_data_size / page_size * page_size;
+            const size_t tail = unpadded_data_size - whole;
+            if (whole > 0) {
+                mesh_cq.enqueue_write_shard_to_sub_grid(
+                    *(trace_buffer->mesh_buffer),
+                    mesh_trace_data.data.data(),
+                    device_range,
+                    last && tail == 0,
+                    BufferRegion(offset, whole));
+            }
+            if (tail > 0) {
+                std::vector<uint32_t> tail_page(page_size / sizeof(uint32_t), 0);
+                std::memcpy(tail_page.data(), reinterpret_cast<const uint8_t*>(mesh_trace_data.data.data()) + whole, tail);
+                mesh_cq.enqueue_write_shard_to_sub_grid(
+                    *(trace_buffer->mesh_buffer),
+                    tail_page.data(),
+                    device_range,
+                    last,
+                    BufferRegion(offset + whole, page_size));
+            }
+        } else {
+            std::vector<uint32_t> write_data = mesh_trace_data.data;
+            auto padded_data_size = round_up(unpadded_data_size, page_size);
+            size_t numel_padding = (padded_data_size - unpadded_data_size) / sizeof(uint32_t);
+            if (numel_padding > 0) {
+                write_data.resize(write_data.size() + numel_padding, 0);
+            }
+            auto write_region = BufferRegion(offset, write_data.size() * sizeof(uint32_t));
+            mesh_cq.enqueue_write_shard_to_sub_grid(
+                *(trace_buffer->mesh_buffer), write_data.data(), device_range, true, write_region);
         }
-        auto write_region =
-            BufferRegion(write_offset_per_device_range.at(device_range), write_data.size() * sizeof(uint32_t));
-        mesh_cq.enqueue_write_shard_to_sub_grid(
-            *(trace_buffer->mesh_buffer), write_data.data(), device_range, true, write_region);
         write_offset_per_device_range.at(device_range) += mesh_trace_data.data.size() * sizeof(uint32_t);
     }
 }

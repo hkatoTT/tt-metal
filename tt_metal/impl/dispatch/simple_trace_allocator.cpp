@@ -4,15 +4,32 @@
 
 #include "simple_trace_allocator.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <set>
+#include <string>
 #include <tuple>
 
 #include "hal/generated/dev_msgs.hpp"
+#include "kernels/kernel.hpp"
 #include "llrt/hal.hpp"
 
 namespace tt::tt_metal {
+
+namespace {
+// TT_METAL_TRACE_ALLOC_LOG=<path>: one line a traced program (appended to the file) with this allocator's choices for
+// the Tensix kernel config ring - the sizes, whether the binary was cached, how many programs back it syncs and the
+// stall kind - for studying the gaps between programs; nothing changes in what is dispatched
+std::FILE* trace_alloc_log() {
+    static const char* path = std::getenv("TT_METAL_TRACE_ALLOC_LOG");
+    if (path == nullptr || *path == '\0') {
+        return nullptr;
+    }
+    return std::fopen(path, "a");
+}
+}  // namespace
 
 std::pair<std::optional<uint32_t>, std::optional<uint32_t>> SimpleTraceAllocator::RegionAllocator::allocate_region(
     uint32_t size, uint32_t trace_idx, uint32_t data_type, uint64_t program_id, bool top_down) {
@@ -184,6 +201,245 @@ std::pair<std::optional<uint32_t>, std::optional<uint32_t>> SimpleTraceAllocator
     return {best_region_sync_idx, best_addr};
 }
 
+std::vector<SimpleTraceAllocator::RegionAllocator::Candidate> SimpleTraceAllocator::RegionAllocator::candidates(
+    uint32_t size, uint32_t trace_idx, bool top_down) const {
+    std::vector<Candidate> out;
+    if (size == 0 || size > ringbuffer_size_) {
+        return out;
+    }
+    auto evaluate = [&](uint32_t addr) {
+        float cost = 0;
+        std::optional<uint32_t> sync;
+        for (const auto& [raddr, region] : regions_) {
+            if (raddr >= addr + size) {
+                break;
+            }
+            if (intersects(addr, size, raddr, region.size)) {
+                if (region.trace_idx == trace_idx) {
+                    return;  // (this node's own data)
+                }
+                const auto& next_use_idx = extra_data_[region.trace_idx].next_use_idx[region.data_type];
+                if (next_use_idx.has_value()) {
+                    cost +=
+                        *next_use_idx == trace_idx ? 1000000000.0f : region.size * 1.0f / (*next_use_idx - trace_idx);
+                }
+                sync = merge_syncs(sync, region.trace_idx);
+            }
+        }
+        out.push_back({addr, cost, sync});
+    };
+    if (top_down) {  // (allocate_region's walks)
+        uint32_t top_addr = ringbuffer_size_ - size;
+        evaluate(top_addr);
+        for (auto rit = regions_.crbegin(); rit != regions_.crend(); ++rit) {
+            if (rit->first < size) {
+                break;
+            }
+            uint32_t addr = rit->first - size;
+            if (addr != top_addr) {
+                evaluate(addr);
+            }
+        }
+    } else {
+        uint32_t addr = 0;
+        auto it = regions_.begin();
+        while (addr + size <= ringbuffer_size_) {
+            evaluate(addr);
+            if (it == regions_.end()) {
+                break;
+            }
+            addr = it->first + it->second.size;
+            ++it;
+        }
+    }
+    return out;
+}
+
+bool SimpleTraceAllocator::RegionAllocator::place_at(
+    uint32_t addr,
+    uint32_t size,
+    uint32_t trace_idx,
+    uint32_t data_type,
+    uint64_t program_id,
+    std::optional<uint32_t>& sync) {
+    if (addr + size > ringbuffer_size_) {
+        return false;
+    }
+    for (const auto& [raddr, region] : regions_) {
+        if (raddr >= addr + size) {
+            break;
+        }
+        if (intersects(addr, size, raddr, region.size) && region.trace_idx == trace_idx) {
+            return false;
+        }
+    }
+    sync = std::nullopt;
+    auto it = regions_.begin();
+    while (it != regions_.end()) {
+        if (intersects(addr, size, it->first, it->second.size)) {
+            sync = merge_syncs(sync, it->second.trace_idx);
+            program_ids_memory_map_[it->second.data_type].erase(it->second.program_id);
+            it = regions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    regions_[addr] = {trace_idx, data_type, size, program_id};
+    return true;
+}
+
+std::vector<int64_t> SimpleTraceAllocator::plan_binaries(
+    const Hal& hal, std::vector<TraceNode*>& trace_nodes, SubDeviceId sub_device_id, uint32_t beam) {
+    // The Tensix ring only, and only when no other core type has kernels in the trace (their syncs are not modelled)
+    std::optional<uint32_t> tensix;
+    for (uint32_t index = 0; index < hal.get_programmable_core_type_count(); index++) {
+        if (hal.get_programmable_core_type(index) == HalProgrammableCoreType::TENSIX) {
+            tensix = index;
+        }
+    }
+    if (!tensix.has_value() || !hal.get_core_kernel_stored_in_config_buffer(HalProgrammableCoreType::TENSIX)) {
+        return {};
+    }
+    for (auto* node : trace_nodes) {
+        if (node->sub_device_id != sub_device_id) {
+            continue;
+        }
+        for (uint32_t index = 0; index < hal.get_programmable_core_type_count(); index++) {
+            if (index != *tensix && !node->program->get_kernel_groups(index).empty()) {
+                return {};
+            }
+        }
+    }
+    constexpr uint32_t max_queued_programs = dev_msgs::launch_msg_buffer_num_entries - 1;
+    constexpr uint32_t desired_write_ahead = std::min(dev_msgs::launch_msg_buffer_num_entries, 7u);
+    const uint32_t children = std::min<uint32_t>(4, beam);
+    struct State {
+        RegionAllocator alloc;
+        std::deque<size_t> window;
+        std::optional<uint32_t> last_stall;
+        bool first_dispatched;
+        double cost;
+    };
+    std::vector<State> states;
+    states.push_back({region_allocators_[*tensix], {}, std::nullopt, false, 0.0});
+    // per node, per kept state: (its parent among the states kept at the node before, its choice)
+    std::vector<std::vector<std::pair<uint32_t, int64_t>>> history(trace_nodes.size());
+    for (size_t i = 0; i < trace_nodes.size(); i++) {
+        auto& node = *trace_nodes[i];
+        if (node.sub_device_id != sub_device_id) {
+            continue;
+        }
+        ProgramConfig& program_config = node.program->get_program_config(*tensix);
+        const uint32_t nb_size = program_config.kernel_text_offset;
+        const uint32_t bin_size = program_config.kernel_text_size;
+        const uint64_t pid = node.program->get_id();
+        const bool bin_top_down = !extra_data_[i].next_use_idx[ExtraData::kBinary].has_value();
+        std::vector<State> next;
+        std::vector<std::pair<uint32_t, int64_t>> origin;
+        for (uint32_t s = 0; s < states.size(); s++) {
+            const State& st = states[s];
+            RegionAllocator base = st.alloc;
+            auto [nb_sync, nb_addr] = base.allocate_region(nb_size, i, ExtraData::kNonBinary, pid, /*top_down=*/true);
+            struct Choice {
+                RegionAllocator alloc;
+                std::optional<uint32_t> nb_sync, bin_sync;
+                int64_t plan;
+                bool sent;
+            };
+            std::vector<Choice> choices;
+            if (bin_size == 0) {
+                choices.push_back({base, nb_sync, std::nullopt, kPlanFree, false});
+            } else if (auto cached = base.get_region(ExtraData::kBinary, pid)) {
+                base.update_region_trace_idx(*cached, i);
+                choices.push_back({base, nb_sync, std::nullopt, kPlanFree, false});
+            } else {
+                auto cands = base.candidates(bin_size, i, bin_top_down);
+                if (cands.empty()) {  // (the main loop's reset)
+                    RegionAllocator reset = base;
+                    reset.reset_allocator();
+                    reset.allocate_region(nb_size, i, ExtraData::kNonBinary, pid, /*top_down=*/true);
+                    auto res = reset.allocate_region(bin_size, i, ExtraData::kBinary, pid, bin_top_down);
+                    if (!res.second.has_value() || st.window.empty()) {
+                        return {};
+                    }
+                    reset.add_region(ExtraData::kBinary, pid, *res.second);
+                    std::optional<uint32_t> last = static_cast<uint32_t>(st.window.back());
+                    choices.push_back(
+                        {reset, merge_syncs(nb_sync, last), merge_syncs(res.first, last), kPlanReset, true});
+                } else {
+                    // the oldest sync first (none, or 7 or more programs back, ties), then the Belady cost
+                    auto key = [&](const RegionAllocator::Candidate& c) {
+                        uint32_t recency = c.sync.has_value() ? std::min<uint32_t>(i - *c.sync, desired_write_ahead)
+                                                              : desired_write_ahead;
+                        return std::make_pair(-static_cast<int>(recency), c.cost);
+                    };
+                    std::stable_sort(
+                        cands.begin(), cands.end(), [&](const auto& a, const auto& b) { return key(a) < key(b); });
+                    for (uint32_t c = 0; c < std::min<size_t>(children, cands.size()); c++) {
+                        RegionAllocator placed = base;
+                        std::optional<uint32_t> sync;
+                        if (!placed.place_at(cands[c].addr, bin_size, i, ExtraData::kBinary, pid, sync)) {
+                            continue;
+                        }
+                        placed.add_region(ExtraData::kBinary, pid, cands[c].addr);
+                        choices.push_back({placed, nb_sync, sync, static_cast<int64_t>(cands[c].addr), true});
+                    }
+                    if (choices.empty()) {
+                        return {};
+                    }
+                }
+            }
+            for (auto& ch : choices) {
+                std::deque<size_t> window = st.window;
+                std::optional<uint32_t> bin_sync = ch.bin_sync;
+                if (window.size() >= max_queued_programs) {
+                    bin_sync = merge_syncs(bin_sync, static_cast<uint32_t>(window.front()));
+                }
+                std::optional<uint32_t> last = st.last_stall;
+                double cost = st.cost;
+                const bool need_nb = ch.nb_sync.has_value() && (!last.has_value() || *ch.nb_sync > *last);
+                const bool need_bin = bin_sync.has_value() && (!last.has_value() || *bin_sync > *last);
+                if (need_nb || need_bin) {
+                    uint32_t combined = *merge_syncs(ch.nb_sync, bin_sync);
+                    const size_t ago = i - combined;
+                    const double weight = ago == 1 ? 1.0 : ago == 2 ? 0.25 : ago == 3 ? 0.05 : 0.0;
+                    cost += weight * ((ch.sent ? bin_size : 0) + (need_nb ? nb_size : 0) + 512);
+                    last = combined;
+                }
+                window.push_back(i);
+                if (window.size() > max_queued_programs) {
+                    window.pop_front();
+                }
+                next.push_back({std::move(ch.alloc), std::move(window), last, true, cost});
+                origin.emplace_back(s, ch.plan);
+            }
+        }
+        std::vector<uint32_t> order(next.size());
+        for (uint32_t k = 0; k < order.size(); k++) {
+            order[k] = k;
+        }
+        std::stable_sort(
+            order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return next[a].cost < next[b].cost; });
+        order.resize(std::min<size_t>(order.size(), beam));
+        states.clear();
+        for (uint32_t k : order) {
+            states.push_back(std::move(next[k]));
+            history[i].push_back(origin[k]);
+        }
+    }
+    // the best final state's choices, back to the first node
+    std::vector<int64_t> plan(trace_nodes.size(), kPlanFree);
+    uint32_t s = 0;
+    for (size_t i = trace_nodes.size(); i-- > 0;) {
+        if (history[i].empty()) {
+            continue;
+        }
+        plan[i] = history[i][s].second;
+        s = history[i][s].first;
+    }
+    return plan;
+}
+
 void SimpleTraceAllocator::allocate_trace_programs(const Hal& hal, std::vector<TraceNode*>& trace_nodes) {
     std::map<uint64_t, uint32_t> program_ids_use_map;
     extra_data_.resize(trace_nodes.size());
@@ -221,6 +477,22 @@ void SimpleTraceAllocator::allocate_trace_programs_on_subdevice(
     bool first_program_dispatched = false;
     std::optional<uint32_t> last_stall_idx;
     std::deque<size_t> subdevice_launch_window;
+    std::FILE* log = trace_alloc_log();
+    // TT_METAL_TRACE_ALLOC_BEAM=B (B > 1, read at each trace): the Tensix binaries placed by `plan_binaries`
+    std::vector<int64_t> plan;
+    if (const char* beam_env = std::getenv("TT_METAL_TRACE_ALLOC_BEAM"); beam_env != nullptr) {
+        const long beam = std::strtol(beam_env, nullptr, 10);
+        if (beam > 1) {
+            plan = plan_binaries(hal, trace_nodes, sub_device_id, static_cast<uint32_t>(std::min(beam, 64L)));
+        }
+    }
+    if (log != nullptr) {
+        std::fprintf(
+            log,
+            "# trace alloc: sub-device %u, %zu nodes\n",
+            static_cast<unsigned>(*sub_device_id),
+            trace_nodes.size());
+    }
 
     for (size_t i = 0; i < trace_nodes.size(); i++) {
         auto& node = *trace_nodes[i];
@@ -238,6 +510,12 @@ void SimpleTraceAllocator::allocate_trace_programs_on_subdevice(
         node.dispatch_metadata.nonbinary_kernel_config_addrs.resize(programmable_core_count);
 
         bool all_binaries_cached = true;
+        // (TT_METAL_TRACE_ALLOC_LOG: the Tensix ring's choices)
+        struct {
+            uint32_t nb = 0, bin = 0, nb_addr = 0, bin_addr = 0;
+            int cached = -1, reset = 0;
+            std::optional<uint32_t> nb_sync, bin_sync;
+        } tlog;
 
         for (uint32_t index = 0; index < programmable_core_count; index++) {
             auto core_type = hal.get_programmable_core_type(index);
@@ -279,17 +557,32 @@ void SimpleTraceAllocator::allocate_trace_programs_on_subdevice(
                 if (auto mem_addr = allocator.get_region(ExtraData::kBinary, pid)) {
                     binary_addr = *mem_addr;
                     allocator.update_region_trace_idx(*mem_addr, i);
+                    if (core_type == HalProgrammableCoreType::TENSIX) {
+                        tlog.cached = 1;
+                    }
                 } else {
+                    if (core_type == HalProgrammableCoreType::TENSIX) {
+                        tlog.cached = 0;
+                    }
                     all_binaries_cached = false;
                     // If this binary won't be used again later in the trace, treat it as
                     // short-lived and pack it top-down. Otherwise allocate bottom-up so it can
                     // remain cached for future invocations of the same program.
                     bool binary_top_down = !extra_data_[i].next_use_idx[ExtraData::kBinary].has_value();
-                    auto res = allocator.allocate_region(binary_size, i, ExtraData::kBinary, pid, binary_top_down);
+                    std::pair<std::optional<uint32_t>, std::optional<uint32_t>> res;
+                    std::optional<uint32_t> planned_sync;
+                    if (core_type == HalProgrammableCoreType::TENSIX && i < plan.size() && plan[i] >= 0 &&
+                        allocator.place_at(
+                            static_cast<uint32_t>(plan[i]), binary_size, i, ExtraData::kBinary, pid, planned_sync)) {
+                        res = {planned_sync, static_cast<uint32_t>(plan[i])};  // (the plan's place, its sync)
+                    } else {
+                        res = allocator.allocate_region(binary_size, i, ExtraData::kBinary, pid, binary_top_down);
+                    }
                     if (!res.second.has_value()) {
                         // Clear the allocator and try again. Should succeed unless the total size
                         // of the program is larger than the config buffer.
                         allocator.reset_allocator();
+                        tlog.reset = 1;
                         std::tie(rta_sync_idx, rta_addr) = allocator.allocate_region(
                             non_binary_size, i, ExtraData::kNonBinary, pid, /*top_down=*/true);
                         res = allocator.allocate_region(binary_size, i, ExtraData::kBinary, pid, binary_top_down);
@@ -320,6 +613,14 @@ void SimpleTraceAllocator::allocate_trace_programs_on_subdevice(
                 all_binaries_cached = false;
             }
 
+            if (log != nullptr && core_type == HalProgrammableCoreType::TENSIX) {
+                tlog.nb = non_binary_size;
+                tlog.bin = binary_size;
+                tlog.nb_addr = rta_addr.value_or(0);
+                tlog.bin_addr = binary_addr;
+                tlog.nb_sync = rta_sync_idx;
+                tlog.bin_sync = binary_sync_idx;
+            }
             TT_ASSERT(rta_addr.has_value(), "Failed to allocate non-binary region");
             node.dispatch_metadata.nonbinary_kernel_config_addrs[index] = {
                 .addr = *rta_addr + ringbuffer_starts_[index]};
@@ -377,11 +678,57 @@ void SimpleTraceAllocator::allocate_trace_programs_on_subdevice(
             }
             last_stall_idx = combined_sync_idx;
         }
+        if (log != nullptr) {
+            std::string names;
+            for (uint32_t index = 0; index < programmable_core_count; index++) {
+                if (hal.get_programmable_core_type(index) != HalProgrammableCoreType::TENSIX) {
+                    continue;
+                }
+                for (const auto& [handle, kernel] : node.program->get_kernels(index)) {
+                    if (!names.empty()) {
+                        names += "+";
+                    }
+                    names += kernel->name();
+                }
+            }
+            size_t rta_bytes = 0;
+            for (const auto& v : node.rta_data) {
+                rta_bytes += v.size();
+            }
+            auto ago = [&](std::optional<uint32_t> idx) { return idx.has_value() ? static_cast<long>(i) - *idx : -1L; };
+            const bool stalled = node.dispatch_metadata.stall_first || node.dispatch_metadata.stall_before_program;
+            std::fprintf(
+                log,
+                "%zu rid %u pid %llu workers %u nb %u bin %u cached %d reset %d nb_addr %u bin_addr %u "
+                "nb_sync_ago %ld bin_sync_ago %ld stall_first %u stall_before %u sync_ago %ld send_binary %d "
+                "rta_bytes %zu kernels %s\n",
+                i,
+                node.program_runtime_id,
+                static_cast<unsigned long long>(node.program->get_id()),
+                node.num_workers,
+                tlog.nb,
+                tlog.bin,
+                tlog.cached,
+                tlog.reset,
+                tlog.nb_addr,
+                tlog.bin_addr,
+                ago(tlog.nb_sync),
+                ago(tlog.bin_sync),
+                static_cast<unsigned>(node.dispatch_metadata.stall_first),
+                static_cast<unsigned>(node.dispatch_metadata.stall_before_program),
+                stalled ? ago(last_stall_idx) : -1L,
+                node.dispatch_metadata.send_binary ? 1 : 0,
+                rta_bytes,
+                names.c_str());
+        }
         expected_workers_completed += node.num_workers;
         subdevice_launch_window.push_back(i);
         if (subdevice_launch_window.size() > max_queued_programs) {
             subdevice_launch_window.pop_front();
         }
+    }
+    if (log != nullptr) {
+        std::fclose(log);
     }
 }
 

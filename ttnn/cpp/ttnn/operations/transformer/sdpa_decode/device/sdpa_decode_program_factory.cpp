@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "sdpa_decode_device_operation.hpp"
 
 #include <bit>
@@ -66,6 +67,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     // SdpaDecodeParams::spec_multi_pos_tiles.
     const uint32_t spec_multi_pos_tiles = operation_attributes.spec_multi_pos_tiles;
     const bool spec_multi_pos = spec_multi_pos_tiles > 0;
+    // Heads-first Q [1, NH, B, D] and output [1, NH, B, vD] (SdpaDecodeParams::heads_first, validated): the reader
+    // and the writer move face rows (dataflow/heads_first.hpp); the rest of the program is the legacy one.
+    const bool heads_first = operation_attributes.heads_first;
 
     // V tensor: use K if MLA (V is subset of K), otherwise require explicit V
     TT_FATAL(use_mla || tensor_args.v.has_value(), "V tensor must be provided when MLA is disabled.");
@@ -100,7 +104,8 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     const auto& geo = operation_attributes.paged_cache_geometry;
     const bool apply_geometry_override = !use_mla && geo.active();
     uint32_t B = q_shape[1];
-    uint32_t PNH = q_shape[2];
+    // (heads_first: Q's dim 1 is the heads, dim 2 the tokens; B comes from the page table below)
+    uint32_t PNH = heads_first ? tt::round_up(q_shape_unpadded[1], tt::constants::TILE_HEIGHT) : q_shape[2];
     uint32_t S = k_shape[2];
     uint32_t DH = apply_geometry_override ? q_shape[3] : k_shape[3];
     uint32_t vDH = use_mla ? head_dim_v : (apply_geometry_override ? q_shape[3] : v_shape[3]);
@@ -113,7 +118,7 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     // reduction grid the same way the legacy cache shape did.
     uint32_t num_kv_heads = apply_geometry_override ? geo.num_kv_heads : k_shape[1];
     TT_FATAL(num_kv_heads > 0, "num_kv_heads must be > 0");
-    uint32_t num_q_heads = q_shape_unpadded[2];
+    uint32_t num_q_heads = heads_first ? q_shape_unpadded[1] : q_shape_unpadded[2];
     uint32_t page_block_size_t = 0;
     uint32_t q_heads_parallel_factor = 1;
     uint32_t original_block_size = 0;
@@ -490,8 +495,16 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     // the pre-tree-reduction flat gather. Legacy sizing is kept verbatim off the spec path;
     // in spec mode each block is T times larger and the over-provisioning alone would blow
     // L1 (110 tiles/block * 63 blocks = 14 MB at T=11, 64 cores/head).
-    const uint32_t intermed_output_blocks =
-        spec_multi_pos ? std::min(num_cores_per_head - 1, num_tree_reduction_rounds) : (num_cores_per_head - 1);
+    // TT_SDPA_DECODE_TREE_CB=1 (a switch read at the program's creation, not in the key; off by default): the rounds'
+    // blocks off the spec path too (writer_decode_all.cpp addresses c_19 only at round * block, round below
+    // num_tree_reduction_rounds, both as receiver and as sender): the same values, (num_cores_per_head - 1 - rounds)
+    // blocks less L1 (the GLM-5.3-Flash drafter's decode at 8 users: room for the L1 landing of expert weights,
+    // GLM53_W1)
+    const char* tree_cb_env = std::getenv("TT_SDPA_DECODE_TREE_CB");
+    const bool tree_cb = tree_cb_env != nullptr && *tree_cb_env != '\0' && *tree_cb_env != '0';
+    const uint32_t intermed_output_blocks = (spec_multi_pos || tree_cb)
+                                                ? std::min(num_cores_per_head - 1, num_tree_reduction_rounds)
+                                                : (num_cores_per_head - 1);
     const uint32_t intermed_output_tiles = (out_tiles + 2 * PNHt) * intermed_output_blocks;
 
     // ========== Data Formats ==========
@@ -774,6 +787,39 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     desc.semaphores.push_back(SemaphoreDescriptor{
         .id = k_mcast_semaphore_id, .core_type = tt::CoreType::WORKER, .core_ranges = core_grid, .initial_value = 0});
 
+    // ========== Heads-first ==========
+    // Token b's row in each head's matrix is row b % 32 of tile row b / 32 (hf_bt tile rows a head). The reader moves
+    // the rows of heads [0, hf_q_reader) of Q and [hf_out_writer, NH) of the output, the writer the others; when both
+    // put Q's rows, the writer tells the reader (hf_q_semaphore_id) that its reads landed, and the reader pushes Q.
+    // Tokens past B in the last tile row (rows hf_pad_r0 .. 31) are zeroed in the output by every active core.
+    const uint32_t hf_heads = heads_first ? num_q_heads : 0;
+    const uint32_t hf_bt = heads_first ? q_shape[2] / TILE_HEIGHT : 0;
+    // (defaults: Q's rows all by the writer, while the reader goes straight to the K chunks, which take longer to
+    // arrive from DRAM than the rows from L1 at 32 / 64 tokens; the output's split in halves, at the op's end)
+    auto hf_split = [&](uint32_t v, uint32_t given) { return std::min(v == UINT32_MAX ? given : v, hf_heads); };
+    const uint32_t hf_q_reader = heads_first ? hf_split(operation_attributes.heads_first_q_reader, 0) : 0;
+    const uint32_t hf_out_reader =
+        heads_first ? hf_split(operation_attributes.heads_first_out_reader, hf_heads / 2) : 0;
+    const uint32_t hf_out_writer = hf_heads - hf_out_reader;  // the writer's: heads [0, hf_out_writer)
+    const uint32_t hf_pad_r0 = heads_first ? B % TILE_HEIGHT : 0;
+    const uint32_t hf_q_semaphore_id = 3;
+    const auto hf_cb_zeros = CBIndex::c_32;
+    constexpr uint32_t hf_zeros_bytes = 1024;  // the longest run of padding: faces 2 and 3 of a bf16 tile
+    if (heads_first) {
+        TT_FATAL(q_heads_parallel_factor == 1 && num_kv_heads == 1, "heads_first: one KV head, Q heads not split");
+        TT_FATAL(B <= hf_bt * TILE_HEIGHT, "heads_first: {} tokens in {} tile rows", B, hf_bt);
+        if (hf_q_reader > 0 && hf_q_reader < hf_heads) {
+            desc.semaphores.push_back(SemaphoreDescriptor{
+                .id = hf_q_semaphore_id,
+                .core_type = tt::CoreType::WORKER,
+                .core_ranges = core_grid,
+                .initial_value = 0});
+        }
+        if (hf_pad_r0 > 0) {
+            add_cb(hf_cb_zeros, hf_zeros_bytes, tt::DataFormat::Float16_b, hf_zeros_bytes);
+        }
+    }
+
     // If q is sharded, directly read in q_chunk_size_bytes if q is row major or tilized but with full tiles
     // If q is tilized and want to use tiny tiles, this is ignored since we need to skip bottom half of tiles
     const uint32_t q_chunk_size_bytes =
@@ -832,6 +878,26 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     } else {
         tt_metal::TensorAccessorArgs(static_cast<const Buffer*>(nullptr)).append_to(reader_compile_time_args_common);
     }
+    // heads_first (SDPA_HEADS_FIRST): after the accessors; the same list for the writer below
+    const std::vector<uint32_t> hf_compile_time_args = {
+        hf_heads,
+        hf_bt,
+        hf_q_reader,
+        hf_out_writer,
+        hf_q_semaphore_id,
+        hf_pad_r0,
+        static_cast<uint32_t>(hf_cb_zeros),
+        DHt,
+        full_tile.get_tile_size(q_df),    // Q's pages
+        full_tile.get_tile_size(out_df),  // the output's pages
+        num_active_cores,
+        static_cast<uint32_t>(output_tensor.buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM),
+        static_cast<uint32_t>(operation_attributes.heads_first_lean),
+    };
+    if (heads_first) {
+        reader_compile_time_args_common.insert(
+            reader_compile_time_args_common.end(), hf_compile_time_args.begin(), hf_compile_time_args.end());
+    }
 
     std::vector<uint32_t> writer_compile_time_args_common = {
         PNHt,
@@ -859,6 +925,10 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
         spec_multi_pos_tiles,
     };
     tt_metal::TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_time_args_common);
+    if (heads_first) {
+        writer_compile_time_args_common.insert(
+            writer_compile_time_args_common.end(), hf_compile_time_args.begin(), hf_compile_time_args.end());
+    }
 
     std::vector<uint32_t> compute_compile_time_args_common = {
         St,
@@ -929,6 +999,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     reader_desc.core_ranges = core_grid;
     reader_desc.compile_time_args = std::move(reader_compile_time_args_common);
     reader_desc.config = ReaderConfigDescriptor{};
+    if (heads_first) {
+        reader_desc.defines.emplace_back("SDPA_HEADS_FIRST", "1");
+    }
 
     KernelDescriptor writer_desc;
     writer_desc.kernel_source = kernel_path + "dataflow/writer_decode_all.cpp";
@@ -936,6 +1009,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     writer_desc.core_ranges = core_grid;
     writer_desc.compile_time_args = std::move(writer_compile_time_args_common);
     writer_desc.config = WriterConfigDescriptor{};
+    if (heads_first) {
+        writer_desc.defines.emplace_back("SDPA_HEADS_FIRST", "1");
+    }
 
     KernelDescriptor compute_desc;
     compute_desc.kernel_source = kernel_path + "compute/sdpa_flash_decode.cpp";
@@ -1057,6 +1133,11 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
         reader_rt_args.push_back(num_dests);
         reader_rt_args.append(output_core_physical_xs);
         reader_rt_args.append(output_core_physical_ys);
+        if (heads_first) {
+            // the output (its rows, the padding's zeros) and this core's place among the active ones
+            reader_rt_args.push_back(out_buffer);
+            reader_rt_args.push_back(i);
+        }
 
         // writer runtime args (do_reduce is NOT included — writer doesn't use it)
         // The output address is passed as Buffer* (BufferBinding) so it is re-patched on the fast
@@ -1088,6 +1169,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
         writer_rt_args.append(reduce_core_physical_ys);
         writer_rt_args.append(output_core_physical_xs);
         writer_rt_args.append(output_core_physical_ys);
+        if (heads_first) {
+            writer_rt_args.push_back(q_buffer);  // (its Q rows)
+        }
 
         // compute runtime args
         KernelDescriptor::RTArgList compute_rt_args;

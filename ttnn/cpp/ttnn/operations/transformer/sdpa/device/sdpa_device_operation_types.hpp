@@ -34,6 +34,9 @@ struct SDPAParams {
     // ttnn::operations::transformer::PagedCacheGeometryOverride.
     ttnn::operations::transformer::PagedCacheGeometryOverride paged_cache_geometry;
     bool output_concat_heads = false;
+    // V the same bytes as K (no V given, or the same buffer as K's with K's shape): the paged chunked form reads each
+    // chunk once into one ring for both (sdpa_program_factory.cpp kv_shared); in the program cache's key
+    bool kv_same = false;
 };
 
 struct SDPAInputs {

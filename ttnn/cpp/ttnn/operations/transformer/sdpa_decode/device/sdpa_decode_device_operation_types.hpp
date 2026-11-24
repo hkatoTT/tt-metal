@@ -51,6 +51,20 @@ struct SdpaDecodeParams {
     // Requires num_kv_heads==1, causal, paged, no sliding window, no MLA, unsharded bf16
     // TILE Q with Tg*32 padded rows per batch.
     uint32_t spec_multi_pos_tiles = 0;
+    // Heads-first Q and output (opt-in; false = the legacy layouts, byte-for-byte). MLA paged decode only: Q is
+    // [1, NH, B, D] (each head's B tokens as rows: the layout of a per-head matmul's output) in L1, the output
+    // [1, NH, B, head_dim_v] interleaved, so the caller needs no transposes around the op. The reader puts each
+    // token's Q tile (heads as rows, what the compute takes) together from 32-byte face rows and the writer puts the
+    // output rows back the same way: the compute and its values are unchanged. See dataflow/heads_first.hpp.
+    bool heads_first = false;
+    // Of the NH heads, how many the reader (NoC 0) moves; the writer (NoC 1) takes the rest: Q's rows at the start,
+    // the output's at the end (heads_first only; TT_SDPA_HF_Q_READER / TT_SDPA_HF_OUT_READER, UINT32_MAX: the
+    // program factory's defaults, 0 and NH / 2).
+    uint32_t heads_first_q_reader = 0;
+    uint32_t heads_first_out_reader = 0;
+    // The face rows issued with the NoC command buffer's state and counted once (else one plain call a row; heads_first
+    // only; TT_SDPA_HF_LEAN=0 for the plain form).
+    bool heads_first_lean = true;
 };
 
 struct SdpaDecodeInputs {

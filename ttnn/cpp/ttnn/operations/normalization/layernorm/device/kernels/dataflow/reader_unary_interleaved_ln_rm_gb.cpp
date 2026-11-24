@@ -17,6 +17,12 @@
 
 namespace generic = norm::kernel_util::generic;
 
+#ifdef FUSE_BETA
+constexpr bool defined_fuse_beta_v = true;
+#else
+constexpr bool defined_fuse_beta_v = false;
+#endif
+
 void kernel_main() {
     const uint32_t NCHt = get_arg(args::NCHt);
     const uint32_t Wt = get_arg(args::Wt);
@@ -157,7 +163,12 @@ void kernel_main() {
         }  // wt loop
 
 #if defined FUSE_GAMMA || defined FUSE_BETA
+#ifdef GAMMA_STREAM
+        static_assert(!defined_fuse_beta_v, "GAMMA_STREAM: gamma only");
+        if (true) {  // (GLM53_LN_GAMMA_STREAM: gamma a width block at a time, every tile row; the compute pops each)
+#else
         if (ncht == 0) {
+#endif
             for (auto block : generic::blocks(Wt, blk)) {
 #ifdef FUSE_GAMMA
                 {

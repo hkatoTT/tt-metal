@@ -7,6 +7,8 @@
 #include "ttnn/device_operation.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
 
 #include <tt-metalium/constants.hpp>
 
@@ -135,9 +137,54 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             q_shape_unpadded[2]);
     }
 
-    // Input 0 must be sharded by height or DRAM interleaved. All other inputs must be in DRAM.
+    if (operation_attributes.heads_first) {
+        // Heads-first Q [1, NH, B, D] and output [1, NH, B, head_dim_v] (see SdpaDecodeParams::heads_first). The
+        // kernels move 32-byte face rows: a NoC read under 64 bytes from DRAM needs the same offset mod 64 at both
+        // ends on Blackhole, which a token's row and a head's row share only for half the heads, so Q is in L1.
+        const auto& q = input_tensors.at(0);
+        TT_FATAL(use_mla, "heads_first is supported with multi-latent attention decode only");
+        TT_FATAL(operation_attributes.paged_attention, "heads_first requires paged attention");
+        TT_FATAL(operation_attributes.is_causal, "heads_first requires is_causal");
+        TT_FATAL(!spec_multi_pos, "heads_first is not supported with spec_multi_pos_tiles");
+        TT_FATAL(
+            q.layout() == Layout::TILE && q.dtype() == DataType::BFLOAT16,
+            "heads_first requires a BFLOAT16 TILE Q, got {} {}",
+            q.dtype(),
+            q.layout());
+        TT_FATAL(
+            !q.is_sharded() && q.buffer()->buffer_type() == tt::tt_metal::BufferType::L1,
+            "heads_first requires an interleaved L1 Q (its 32-byte rows are read at any offset)");
+        TT_FATAL(!operation_attributes.output_mem_config.is_sharded(), "heads_first requires an interleaved output");
+        TT_FATAL(q_shape_unpadded[0] == 1, "heads_first: Q must be [1, NH, B, D], got {}", q_shape_unpadded);
+        TT_FATAL(
+            q_shape_unpadded[1] >= 1 && q_shape_unpadded[1] <= tt::constants::TILE_HEIGHT,
+            "heads_first: 1 to 32 heads, got {}",
+            q_shape_unpadded[1]);
+        TT_FATAL(k_shape[1] == 1, "heads_first requires num_kv_heads == 1, got {}", k_shape[1]);
+        TT_FATAL(
+            tensor_args.page_table_tensor.has_value() && !tensor_args.page_table_tensor->is_sharded(),
+            "heads_first requires an interleaved page_table");
+        TT_FATAL(
+            tensor_args.page_table_tensor->padded_shape()[0] == q_shape_unpadded[2],
+            "heads_first: Q's tokens ({}) must be the page table's rows ({})",
+            q_shape_unpadded[2],
+            tensor_args.page_table_tensor->padded_shape()[0]);
+        TT_FATAL(!tensor_args.attention_sink.has_value(), "heads_first is not supported with an attention sink");
+        TT_FATAL(
+            !operation_attributes.sliding_window_size.has_value() ||
+                operation_attributes.sliding_window_size.value() == 0,
+            "heads_first is not supported with sliding_window_size");
+        TT_FATAL(
+            !tensor_args.cur_pos_tensor.has_value() || !tensor_args.cur_pos_tensor->is_sharded(),
+            "heads_first requires an interleaved cur_pos tensor");
+    }
+
+    // Input 0 must be sharded by height or DRAM interleaved (L1 interleaved with heads_first). All other inputs must
+    // be in DRAM.
     const auto Q_memcfg = input_tensors.at(0).memory_config();
-    if (input_tensors.at(0).is_sharded()) {
+    if (operation_attributes.heads_first) {
+        // (checked above)
+    } else if (input_tensors.at(0).is_sharded()) {
         TT_FATAL(
             Q_memcfg.memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED,
             "Q tensor memory layout must be HEIGHT_SHARDED when sharded but got {}",
@@ -623,8 +670,13 @@ tt::tt_metal::TensorSpec SdpaDecodeDeviceOperation::compute_output_specs(
     }
     Layout output_layout = input.layout() == Layout::ROW_MAJOR ? Layout::ROW_MAJOR : Layout::TILE;
     ttnn::Shape output_shape = input.logical_shape();
-    output_shape[1] = B;
-    output_shape[2] = num_q_heads;
+    if (operation_attributes.heads_first) {
+        // [1, NH, B, head_dim_v]: each head's B tokens as rows, like Q
+        output_shape[2] = B;
+    } else {
+        output_shape[1] = B;
+        output_shape[2] = num_q_heads;
+    }
 
     // Preserve logical head_dim by default; only override in MLA mode.
     if (use_mla) {
@@ -661,8 +713,15 @@ Tensor sdpa_decode(
     std::optional<uint32_t> head_dim_v,
     std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
     std::optional<uint32_t> cache_position_modulo,
-    uint32_t spec_multi_pos_tiles) {
+    uint32_t spec_multi_pos_tiles,
+    bool heads_first) {
     using OperationType = SdpaDecodeDeviceOperation;
+    // heads_first: the heads whose rows the reader moves (the writer the rest), from the environment (a tuning knob;
+    // UINT32_MAX: the program factory's defaults). Part of the attributes, so a new value makes a new program.
+    auto heads_split = [heads_first](const char* name) -> uint32_t {
+        const char* v = heads_first ? std::getenv(name) : nullptr;
+        return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : (heads_first ? UINT32_MAX : 0);
+    };
     auto operation_attributes = OperationType::operation_attributes_t{
         .is_causal = is_causal,
         .paged_attention = paged_attention,
@@ -680,6 +739,11 @@ Tensor sdpa_decode(
             paged_cache_geometry.value_or(ttnn::operations::transformer::PagedCacheGeometryOverride{}),
         .cache_position_modulo = cache_position_modulo,
         .spec_multi_pos_tiles = spec_multi_pos_tiles,
+        .heads_first = heads_first,
+        .heads_first_q_reader = heads_split("TT_SDPA_HF_Q_READER"),
+        .heads_first_out_reader = heads_split("TT_SDPA_HF_OUT_READER"),
+        .heads_first_lean = !heads_first || std::getenv("TT_SDPA_HF_LEAN") == nullptr ||
+                            std::string_view(std::getenv("TT_SDPA_HF_LEAN")) != "0",
     };
 
     auto tensor_args = OperationType::tensor_args_t{

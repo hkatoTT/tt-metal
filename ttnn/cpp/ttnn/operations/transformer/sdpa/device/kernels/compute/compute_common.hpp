@@ -1071,11 +1071,15 @@ ALWI void matmul_blocks(
     const bool& transpose,
     const bool& add_mask = false,
     const uint32_t& mask_cb = 0,
-    const uint32_t& zero_cb = 0) {
+    const uint32_t& zero_cb = 0,
+    const bool in1_n_major = false,
+    const bool pop_in1 = true) {
     // precondition: in0_cb has M*K produced
     // precondition: in1_cb has K*N produced
-    // postcondition: in0_cb is full, in1_cb is empty
+    // postcondition: in0_cb is full, in1_cb is empty (kept with !pop_in1)
     // postcondition: out_cb has M*N produced
+    // in1_n_major: in1's tile (k, n) at n K + k (subblock_w 1: one tile a column; the products and their order as
+    // with the row-major in1), e.g. K^T taken from a K chunk stored row-major for the PV matmul too
 
     CircularBuffer cb_in0(in0_cb);
     CircularBuffer cb_in1(in1_cb);
@@ -1113,7 +1117,7 @@ ALWI void matmul_blocks(
                 matmul_block(
                     in0_cb, in1_cb, in0_index, in1_index, dst_index, transpose, subblock_w, subblock_h, in0_block_w);
                 in0_index++;
-                in1_index += N;
+                in1_index += in1_n_major ? 1 : N;
             }
             if (add_mask) {
                 cb_mask.wait_front(out_subblock_num_tiles);
@@ -1138,14 +1142,16 @@ ALWI void matmul_blocks(
                 }
             }
             tile_regs_release();
-            in1_index_offset += subblock_w;
+            in1_index_offset += in1_n_major ? subblock_w * K : subblock_w;
         }
         in0_index_offset += subblock_h * in0_block_w;
         in0_wait_tiles += in0_subblock_num_tiles;
         // Somewhat granularize the push of in0 subblocks
         cb_out.push_back(in0_subblock_all_cols_num_tiles);
     }
-    cb_in1.pop_front(K * N);
+    if (pop_in1) {
+        cb_in1.pop_front(K * N);
+    }
 }
 
 template <uint32_t M>
@@ -1676,6 +1682,9 @@ void sdpa_inner_loop(
     CircularBuffer cb_q_in_obj(cb_q_in);
     CircularBuffer cb_k_in_obj(cb_k_in);
     CircularBuffer cb_v_in_obj(cb_v_in);
+    // one K / V ring (the factory's kv_shared: V the same bytes as K): the QK matmul takes K^T from it column by column
+    // and keeps it for the PV matmul, which pops it
+    const bool kv_shared = cb_k_in == cb_v_in;
     CircularBuffer cb_qk_im_obj(cb_qk_im);
     CircularBuffer cb_attention_sink_obj(cb_attention_sink);
     CircularBuffer cb_lse_in_obj(cb_lse_in);
@@ -1780,9 +1789,13 @@ void sdpa_inner_loop(
             // the diag stamp uses absolute coords every k_chunk instead).
             if (sdpa_type == RING && !chunked_enabled && k_chunk >= causal_k_limit && is_causal) {
                 cb_k_in_obj.wait_front(k_chunk_tiles);
-                cb_v_in_obj.wait_front(v_chunk_tiles);
+                if (!kv_shared) {
+                    cb_v_in_obj.wait_front(v_chunk_tiles);
+                }
                 cb_k_in_obj.pop_front(k_chunk_tiles);
-                cb_v_in_obj.pop_front(v_chunk_tiles);
+                if (!kv_shared) {
+                    cb_v_in_obj.pop_front(v_chunk_tiles);
+                }
 
                 continue;
             }
@@ -1806,7 +1819,12 @@ void sdpa_inner_loop(
                 qk_in0_block_w,
                 qk_subblock_h,
                 qk_subblock_w,
-                true /*transpose*/);
+                true /*transpose*/,
+                false,
+                0,
+                0,
+                kv_shared /*in1_n_major: K^T column by column from the row-major K chunk*/,
+                !kv_shared /*pop_in1: kept for the PV matmul*/);
 
             /**
              * Note
@@ -2165,17 +2183,25 @@ void sdpa_inner_loop(
                     }
                     KV_chunks_processed_in_iter++;
                     cb_k_in_obj.wait_front(k_chunk_tiles);
+                    if (!kv_shared) {
                     cb_v_in_obj.wait_front(v_chunk_tiles);
+                }
                     cb_k_in_obj.pop_front(k_chunk_tiles);
+                    if (!kv_shared) {
                     cb_v_in_obj.pop_front(v_chunk_tiles);
+                }
                 }
             }
         }
         if (KV_chunks_processed_in_iter % 2 == 0) {
             cb_k_in_obj.wait_front(k_chunk_tiles);
-            cb_v_in_obj.wait_front(v_chunk_tiles);
+            if (!kv_shared) {
+                    cb_v_in_obj.wait_front(v_chunk_tiles);
+                }
             cb_k_in_obj.pop_front(k_chunk_tiles);
-            cb_v_in_obj.pop_front(v_chunk_tiles);
+            if (!kv_shared) {
+                    cb_v_in_obj.pop_front(v_chunk_tiles);
+                }
         }
     }
 }

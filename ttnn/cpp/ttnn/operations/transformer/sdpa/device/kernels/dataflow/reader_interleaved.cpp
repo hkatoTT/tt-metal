@@ -245,6 +245,10 @@ void kernel_main() {
     constexpr uint32_t cb_q_in = get_compile_time_arg_val(cb_arg_offset + 0);
     constexpr uint32_t cb_k_in = get_compile_time_arg_val(cb_arg_offset + 1);
     constexpr uint32_t cb_v_in = get_compile_time_arg_val(cb_arg_offset + 2);
+    // V the same bytes as K, one ring (sdpa_program_factory.cpp kv_shared: the paged chunked form only): each chunk read
+    // once, in V's order (row-major [Sk_chunk_t, DHt] tiles; the compute takes K^T from it column by column)
+    constexpr bool kv_shared = cb_k_in == cb_v_in;
+    static_assert(!kv_shared || is_chunked, "one K / V ring: the paged chunked form only");
     constexpr uint32_t cb_mask_in = get_compile_time_arg_val(cb_arg_offset + 3);
     constexpr uint32_t cb_attention_sink = get_compile_time_arg_val(cb_arg_offset + 4);
     constexpr uint32_t cb_id_page_table = get_compile_time_arg_val(cb_arg_offset + 5);
@@ -689,7 +693,7 @@ void kernel_main() {
                             k_tile_bytes,
                             barrier_threshold,
                             page_table_ptr,
-                            true  // transpose=true for K reads
+                            !kv_shared  // transpose=true for K reads (V's order when K and V share the ring)
                         );
                     } else {
                         if (should_forward) {
@@ -871,6 +875,7 @@ void kernel_main() {
                     }
                 }
 
+                if constexpr (!kv_shared) {  // (one ring: the K chunk above is the V chunk too)
                 if constexpr (writer_forwards) {
                     if (v_slot_fwd_seq[v_slot] != 0) {
                         Semaphore<>(fwd_done_semaphore_id).wait_min(v_slot_fwd_seq[v_slot]);
@@ -1006,6 +1011,7 @@ void kernel_main() {
                         cb_v.push_back(v_chunk_tiles);
                     }
                 }
+                }  // (!kv_shared)
             }  // close k_chunk
         }  // close global_q_iter
         if constexpr (is_chunked) {

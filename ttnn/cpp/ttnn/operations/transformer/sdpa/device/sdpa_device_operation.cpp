@@ -719,6 +719,11 @@ Tensor sdpa(
             .paged_cache_geometry =
                 paged_cache_geometry.value_or(ttnn::operations::transformer::PagedCacheGeometryOverride{}),
             .output_concat_heads = output_concat_heads,
+            .kv_same = !input_tensor_v.has_value() ||
+                       (input_tensor_v->buffer() != nullptr && input_tensor_k.buffer() != nullptr &&
+                        input_tensor_v->buffer()->address() == input_tensor_k.buffer()->address() &&
+                        input_tensor_v->dtype() == input_tensor_k.dtype() &&
+                        input_tensor_v->logical_shape() == input_tensor_k.logical_shape()),
         },
         OperationType::tensor_args_t{
             .q = input_tensor_q,

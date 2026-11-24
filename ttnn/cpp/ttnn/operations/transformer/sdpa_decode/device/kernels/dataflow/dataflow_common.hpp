@@ -417,6 +417,10 @@ void generate_sliding_window_mask(uint32_t Sk_chunk_t, uint32_t window_start) {
         }
     }
 
+    // The -inf tiles before the window's start tile are copies of tile 0 with no barrier after them, and the only
+    // other barrier is at the last copy of the zero tiles, which a window starting in the chunk's last two tiles does
+    // not have: the copies could still be in flight at the push.
+    noc.async_read_barrier();
     cb_mask.push_back(total_read_tiles);
 }
 

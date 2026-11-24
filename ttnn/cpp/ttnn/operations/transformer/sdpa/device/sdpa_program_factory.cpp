@@ -15,6 +15,8 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <hostdevcommon/common_values.hpp>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <bit>
 #include <map>
 #include <optional>
@@ -734,7 +736,39 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
     // Q-chunk space evenly across cores. Pair-distribute when causal + even q_num_chunks so every
     // core gets balanced light/heavy work after the shared zigzag remap (reader/writer/compute CT 32/20/29).
     const uint32_t total_q_chunks = B * NQH * q_num_chunks;
-    const bool global_q_pair_distribute = use_causal_kernel && (q_num_chunks % 2 == 0);
+    // K and V the same bytes (the paged chunked form with V the whole of K: the same tensor twice, or MLA's V = K, as
+    // the absorbed MLA attends over its latent pages): one ring, each chunk read once, in V's order (row-major
+    // [Sk_chunk_t, DHt] tiles), the QK matmul taking its K^T tiles from it column by column (subblock width 1; the
+    // same products in the same order) and leaving it for the PV matmul, which pops it.  No V ring: Sk_chunk_t DHt
+    // tiles a slot less, and half the K / V reads.  TT_SDPA_KV_SHARED=1: on (read at the program's creation; the same
+    // speed as two rings: set where the L1 is wanted, e.g. by GLM-5.3-Flash's L1 landing of the next MoE layer's
+    // expert weights, GLM53_W1); else off.
+    const bool kv_shared = [&] {
+        const char* env = std::getenv("TT_SDPA_KV_SHARED");
+        return env != nullptr && env[0] == '1' && operation_attributes.kv_same && is_chunked &&
+               !can_use_streaming_compute(fp32_dest_acc_en) && vDHt == DHt &&
+               input_tensor_v.dtype() == input_tensor_k.dtype();
+    }();
+    // TT_SDPA_PAIR_FIT=1 (read at the program's creation, not in the program cache's key, like TT_SDPA_Q_SLOTS_MAX: set
+    // it before the first SDPA program of the process): the chunked forms (a later chunk over the paged cache) do not
+    // pair-distribute when every Q chunk has a core of its own.  Pairs then put two chunks (one light, one heavy) on half
+    // as many cores and leave the rest idle: GLM-5.3-Flash's sequence-parallel DSA at 512 tokens a row, Q chunk 128, is 64
+    // chunks, 32 cores doing two and 88 none; on 64 cores of one each the slowest is the heaviest chunk alone.  Each Q
+    // chunk's work is the same whichever core does it (its rows' online softmax over the same K chunks): the same values.
+    // TT_SDPA_PAIR_FIT=2: as 1, and also a chunked causal form with K and V in one ring (kv_shared, above), in Q chunks
+    // of 128 rows or more, with more Q chunks than cores but at most two a core (and no more extras than heads) gets one
+    // chunk a core but for total - cores cores that take a head's two lightest chunks (its first two, in the linear
+    // order: no zigzag remap), so the slowest core is the heaviest chunk alone or two light ones: GLM-5.3-Flash's later
+    // chunk of 1,024 at 1,024 in Q chunks of 128 (128 chunks on 120 cores) 1,439 -> 1,166 us.  Not below 128 rows (the
+    // pairs' cores were as fast: the SP DSA at 512 tokens a row in Q chunks of 64, 440.9 -> 440.6 us) nor with two
+    // rings (1,408 -> 1,470 us there).  The same values.
+    const char* pair_fit_env = std::getenv("TT_SDPA_PAIR_FIT");
+    const bool pair_fit = pair_fit_env != nullptr && (pair_fit_env[0] == '1' || pair_fit_env[0] == '2') && is_chunked &&
+                          total_q_chunks <= num_cores;
+    const bool light_pairs = pair_fit_env != nullptr && pair_fit_env[0] == '2' && kv_shared && use_causal_kernel &&
+                             Sq_chunk_t >= 4 && q_num_chunks >= 2 && total_q_chunks > num_cores &&
+                             total_q_chunks - num_cores <= B * NQH;
+    const bool global_q_pair_distribute = use_causal_kernel && (q_num_chunks % 2 == 0) && !pair_fit && !light_pairs;
     uint32_t global_q_base_chunks_per_core = 0;
     uint32_t global_q_cores_doing_extra = 0;
     uint32_t global_q_extra_chunks_per_core = 0;
@@ -748,17 +782,39 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
         global_q_cores_doing_extra = total_q_chunks % num_cores;
         global_q_extra_chunks_per_core = 1;
     }
+    // (light_pairs: every core one chunk, total - cores of them two: the head g < total - cores takes [g nq, g nq + 2))
+    std::vector<std::pair<uint32_t, uint32_t>> light_pair_ranges;
+    if (light_pairs) {
+        const uint32_t extra = total_q_chunks - num_cores;
+        for (uint32_t g = 0; g < B * NQH; ++g) {
+            const uint32_t base = g * q_num_chunks;
+            uint32_t c = 0;
+            if (g < extra) {
+                light_pair_ranges.emplace_back(base, 2u);
+                c = 2;
+            }
+            for (; c < q_num_chunks; ++c) {
+                light_pair_ranges.emplace_back(base + c, 1u);
+            }
+        }
+        TT_FATAL(
+            light_pair_ranges.size() == num_cores,
+            "SDPA light pairs: {} ranges for {} cores",
+            light_pair_ranges.size(),
+            num_cores);
+    }
     const uint32_t max_global_q_chunks_per_core =
-        global_q_base_chunks_per_core + (global_q_cores_doing_extra > 0 ? global_q_extra_chunks_per_core : 0);
+        light_pairs ? 2u
+                    : global_q_base_chunks_per_core + (global_q_cores_doing_extra > 0 ? global_q_extra_chunks_per_core : 0);
 
-    const uint32_t q_buffer_factor = (max_global_q_chunks_per_core > 1) ? 2 : 1;
+    uint32_t q_buffer_factor = (max_global_q_chunks_per_core > 1) ? 2 : 1;  // (TT_SDPA_Q_SLOTS_MAX below)
 
     // Host code is responsible for determining matmul configuration
     const uint32_t dst_size = fp32_dest_acc_en ? 4 : 8;
     const uint32_t qk_in0_block_w = DHt;
 
     auto [qk_out_subblock_h, qk_out_subblock_w] =
-        detail::determine_largest_subblock_size(Sq_chunk_t, Sk_chunk_t, dst_size);
+        detail::determine_largest_subblock_size(Sq_chunk_t, kv_shared ? 1u : Sk_chunk_t, dst_size);
 
     const uint32_t fp32_tile_bytes = tt::tile_size(tt::DataFormat::Float32);
     const uint32_t l1_budget_bytes =
@@ -806,6 +862,9 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
         input_tensor_q.dtype());
     const uint32_t global_q_first_extra_core = remainder_on_last_cores ? (num_cores - global_q_cores_doing_extra) : 0u;
     auto global_q_range_for_core = [&](uint32_t i) {
+        if (light_pairs) {
+            return light_pair_ranges[i];
+        }
         return global_q_range(
             i,
             global_q_first_extra_core,
@@ -819,10 +878,19 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
     uint32_t mask_tiles = lightweight_mask
                               ? lightweight_mask_tile_count(use_causal_kernel, has_sliding_window, lw_partial_active)
                               : Sq_chunk_t * Sk_chunk_t * 2;  // double buffer
+    // TT_SDPA_Q_SLOTS_MAX=1 (read at the program's creation, not in the program cache's key, like TT_SDPA_KV_SLOTS_MAX
+    // below: set it before the first SDPA program of the process): one Q chunk in L1 where a core has more than one,
+    // not two (its reader then reads the next Q chunk once the compute is done with the current one; the values are the
+    // same).  Only without the K / V chains (kv_chain_mode 0).  A long-lived L1 buffer above the CBs (GLM-5.3-Flash's
+    // L1 landing of expert weights, GLM53_W1) takes the second slot's L1: 128 KB at Sq_chunk_t 4, DHt 16, bf16.
+    if (const char* cap = std::getenv("TT_SDPA_Q_SLOTS_MAX"); cap != nullptr && cap[0] == '1' && kv_chain_mode == 0) {
+        q_buffer_factor = 1;
+    }
     // Upper bound on the non K/V CBs, counting the mask, row maxes and small CBs at fp32.
     const uint32_t kv_chunk_bytes =
         Sk_chunk_t * (DHt * tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(input_tensor_k.dtype())) +
-                      vDHt * tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(input_tensor_v.dtype())));
+                      (kv_shared ? 0u : vDHt) *
+                          tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(input_tensor_v.dtype())));
     const uint32_t other_cb_bytes_bound =
         Sq_chunk_t * DHt * q_buffer_factor *
             tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(input_tensor_q.dtype())) +
@@ -830,12 +898,38 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
             tt::tile_size(fp32_dest_intermediate_dataformat(fp32_dest_acc_en)) +
         Sq_chunk_t * vDHt * tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype())) +
         (mask_tiles + 3 * Sq_chunk_t + 8) * fp32_tile_bytes;
-    const uint32_t kv_slots =
+    // TT_SDPA_KV_SLOTS_MAX (read at the program's creation, not in the program cache's key: set it before the first
+    // SDPA program of the process): caps the K / V ring's slots (at least 2).  The budget above is the whole L1 past
+    // the allocator's base, L1 buffers not counted, so the third slot is taken whenever the CBs alone fit; a long-lived
+    // L1 buffer above them (GLM-5.3-Flash's L1 landing of expert weights, GLM53_W1) needs 2.  The slots only set how
+    // far the reader runs ahead of the compute: the values are the same.
+    uint32_t kv_slots =
         kv_chain_slots(kv_chain_mode, Sk_chunk_t, kv_chunk_bytes, other_cb_bytes_bound, l1_budget_bytes);
+    if (const char* cap = std::getenv("TT_SDPA_KV_SLOTS_MAX"); cap != nullptr && cap[0] != '\0') {
+        kv_slots = std::min(kv_slots, static_cast<uint32_t>(std::max(2, std::atoi(cap))));
+    }
+    // (a diagnostic print with TT_METAL_CB_MARGIN_LOG: the ring's slots and the sizes they come from)
+    if (const char* log = std::getenv("TT_METAL_CB_MARGIN_LOG"); log != nullptr && log[0] != '\0' && log[0] != '0') {
+        std::printf(
+            "SDPA_SLOTS|kv_slots %u|kv_shared %u|kv_chain_mode %u|Sq_chunk_t %u|Sk_chunk_t %u|DHt %u|vDHt %u|"
+            "q_buffer_factor %u|kv_chunk_bytes %u|other_bound %u|budget %u\n",
+            kv_slots,
+            kv_shared ? 1u : 0u,
+            static_cast<uint32_t>(kv_chain_mode),
+            Sq_chunk_t,
+            Sk_chunk_t,
+            DHt,
+            vDHt,
+            q_buffer_factor,
+            kv_chunk_bytes,
+            other_cb_bytes_bound,
+            l1_budget_bytes);
+        std::fflush(stdout);
+    }
     // These tile capacity counts for CBs need to match the number of tiles expected by the kernel (softmax.cpp)
     uint32_t q_tiles = Sq_chunk_t * DHt * q_buffer_factor;
     uint32_t k_tiles = Sk_chunk_t * DHt * kv_slots;
-    uint32_t v_tiles = Sk_chunk_t * vDHt * kv_slots;
+    uint32_t v_tiles = kv_shared ? 0u : Sk_chunk_t * vDHt * kv_slots;
     uint32_t qk_tiles = Sq_chunk_t * Sk_chunk_t;
     uint32_t out_im_tiles = Sq_chunk_t * vDHt;
     uint32_t out0_t = Sq_chunk_t * vDHt;  // finalized below once out_out_subblock_h is known
@@ -913,7 +1007,7 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
 
     const uint32_t scale_packed = std::bit_cast<uint32_t>(scale.value_or(1.0f));
 
-    const bool use_zigzag_balancing = use_causal_kernel;
+    const bool use_zigzag_balancing = use_causal_kernel && !light_pairs;  // (light pairs: the linear order)
 
     std::vector<uint32_t> reader_compile_time_args = {// interleaved accessor args
                                                       B,
@@ -1158,7 +1252,7 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
 
     cb_ids.q_in = allocate_tile_cb(q_tiles, q_tile_size, q_df);
     cb_ids.k_in = allocate_tile_cb(k_tiles, k_tile_size, k_df);
-    cb_ids.v_in = allocate_tile_cb(v_tiles, v_tile_size, v_df);
+    cb_ids.v_in = kv_shared ? cb_ids.k_in : allocate_tile_cb(v_tiles, v_tile_size, v_df);
     // Deep enough that the reader runs out of K/V slots before it runs out of forward request entries.
     cb_ids.kv_fwd_ctrl = cb_ids.q_in;
     if (kv_chain_mode >= 2) {

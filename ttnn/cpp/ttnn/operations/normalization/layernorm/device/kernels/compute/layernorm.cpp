@@ -354,6 +354,16 @@ void kernel_main() {
                         ckl::PopPolicy::PerBlockSize,
                         ckl::InputTileMapping::Block,
                         ckl::DataFormatReconfig::Disabled),
+#ifdef GAMMA_STREAM
+                    // (GLM53_LN_GAMMA_STREAM: the reader pushes gamma's block for each width block of each row)
+                    ckl::input(
+                        dfb_gamma_id,
+                        ckl::BroadcastDim::Row,
+                        ckl::WaitPolicy::PerBlockSize,
+                        ckl::PopPolicy::PerBlockSize,
+                        ckl::InputTileMapping::Block,
+                        ckl::DataFormatReconfig::Disabled)>{dfb_fusion, dfb_gamma, 0u, 0u},
+#else
                     ckl::input(
                         dfb_gamma_id,
                         ckl::BroadcastDim::Row,
@@ -362,6 +372,7 @@ void kernel_main() {
                         ckl::InputTileMapping::Block,
                         ckl::DataFormatReconfig::Disabled,
                         ckl::TileAddressing::Offset)>{dfb_fusion, dfb_gamma, 0u, block.start()},
+#endif
                 // Activation must be applied last. If do_beta != 0 then
                 // activation will be applied after the beta addition.
                 // Otherwise, we can apply the activation here.
@@ -445,7 +456,7 @@ void kernel_main() {
     // one, so pop that padded total rather than Wt. The reader pushes them only on its first row, so a
     // core with no rows has nothing to pop.
     if (NCHt > 0) {
-#ifdef FUSE_GAMMA
+#if defined(FUSE_GAMMA) && !defined(GAMMA_STREAM)  // (streamed: popped a block at a time)
         dfb_gamma.pop_front(total_buffer_size);
 #endif
 #ifdef FUSE_BETA

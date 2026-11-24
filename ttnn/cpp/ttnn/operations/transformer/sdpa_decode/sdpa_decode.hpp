@@ -60,6 +60,8 @@ ttnn::Tensor flash_multi_latent_attention_decode(
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
 
+// heads_first: Q [1, NH, B, D] in L1 and the output [1, NH, B, head_dim_v] (each head's tokens as rows) instead of
+// [1, B, NH, D] and [1, B, NH, head_dim_v]; the same values (see SdpaDecodeParams::heads_first).
 ttnn::Tensor paged_flash_multi_latent_attention_decode(
     const ttnn::Tensor& input_tensor_q,
     const ttnn::Tensor& input_tensor_k,
@@ -74,6 +76,7 @@ ttnn::Tensor paged_flash_multi_latent_attention_decode(
     std::optional<uint32_t> sliding_window_size = std::nullopt,
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
+    bool heads_first = false);
 
 }  // namespace ttnn::transformer

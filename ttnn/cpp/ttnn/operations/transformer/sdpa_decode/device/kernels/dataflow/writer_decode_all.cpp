@@ -11,6 +11,9 @@
 #include "api/debug/assert.h"
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
 #include "dataflow_common.hpp"
+#ifdef SDPA_HEADS_FIRST
+#include "heads_first.hpp"
+#endif
 
 #define MAX_TREE_REDUCTION_ROUNDS 6
 
@@ -48,6 +51,24 @@ void kernel_main() {
     constexpr bool spec_multi_pos = spec_multi_pos_T > 0;
 
     constexpr auto out_args = TensorAccessorArgs<23>();
+#ifdef SDPA_HEADS_FIRST
+    // heads_first (program factory: hf_compile_time_args, the reader's list): Q [1, NH, B, D] in L1, the output
+    // [1, NH, B, vD]
+    constexpr uint32_t hf_ct = out_args.next_compile_time_args_offset();
+    constexpr uint32_t hf_heads = get_compile_time_arg_val(hf_ct);
+    constexpr uint32_t hf_bt = get_compile_time_arg_val(hf_ct + 1);
+    constexpr uint32_t hf_q_reader = get_compile_time_arg_val(hf_ct + 2);    // Q's heads [hf_q_reader, NH) here
+    constexpr uint32_t hf_out_writer = get_compile_time_arg_val(hf_ct + 3);  // the output's [0, hf_out_writer) here
+    constexpr uint32_t hf_q_semaphore_id = get_compile_time_arg_val(hf_ct + 4);
+    constexpr uint32_t hf_dht = get_compile_time_arg_val(hf_ct + 7);
+    constexpr uint32_t hf_q_page_bytes = get_compile_time_arg_val(hf_ct + 8);
+    constexpr uint32_t hf_out_page_bytes = get_compile_time_arg_val(hf_ct + 9);
+    constexpr bool hf_out_dram = get_compile_time_arg_val(hf_ct + 11) == 1;
+    constexpr bool hf_lean = get_compile_time_arg_val(hf_ct + 12) == 1;
+    // Q's address: after the output coordinates in the runtime args
+    constexpr uint32_t hf_rt =
+        6 + 3 + MAX_TREE_REDUCTION_ROUNDS + 2 * num_cores_per_head + 2 * num_reducer_cores + 2 * num_output_cores;
+#endif
 
     constexpr uint32_t cb_mask_in = tt::CBIndex::c_3;
     constexpr uint32_t cb_identity_scale_in = tt::CBIndex::c_5;
@@ -178,6 +199,32 @@ void kernel_main() {
     if (!has_local_data) {
         return;
     }
+#ifdef SDPA_HEADS_FIRST
+    // this token's Q rows of heads [hf_q_reader, NH) (the reader puts the others'): pushed here when the writer puts
+    // them all, else the reader pushes once this says they landed
+    if constexpr (hf_q_reader < hf_heads) {
+        constexpr uint32_t cb_q_in = tt::CBIndex::c_0;
+        constexpr uint32_t q_chunk_tiles = PNHt * hf_dht;
+        CircularBuffer cb_q(cb_q_in);
+        if constexpr (hf_q_reader == 0) {
+            cb_q.reserve_back(q_chunk_tiles);
+        }
+        sdpa_heads_first::read_rows<hf_lean, hf_bt, hf_dht, get_tile_size(cb_q_in)>(
+            get_arg_val<uint32_t>(hf_rt),
+            hf_q_page_bytes,
+            cur_batch,
+            hf_q_reader,
+            hf_heads,
+            cb_q.get_write_ptr(),
+            noc_index);
+        noc_async_read_barrier();
+        if constexpr (hf_q_reader == 0) {
+            cb_q.push_back(q_chunk_tiles);
+        } else {
+            noc_semaphore_set(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(hf_q_semaphore_id)), 1);
+        }
+    }
+#endif
 
     // Determine which children actually participate in reduction (based on chunk allocation)
     // A child at core_num has data if core_num < k_num_chunks
@@ -367,7 +414,15 @@ void kernel_main() {
             CircularBuffer cb_out_m_buf(cb_out_m);
             CircularBuffer cb_out_l_buf(cb_out_l);
             CircularBuffer cb_intermed(cb_intermed_out);
-            cb_out_w.wait_front(out_chunk_tiles);
+            // c_16 ran the other way first when this core received children's O (this writer pushed them, the
+            // compute popped them): its counts then no longer say when the compute's own O is in.  This writer adds
+            // to tiles_received, the packer stores its own count (1 block) over it, and wait_front reads
+            // tiles_acked once: with one child, an unpacker pop before that read leaves received - acked at 0 for
+            // good (a hang; with two, the same after a stall between the two reads).  The packer pushes c_16 before
+            // c_17 and c_18 (sdpa_flash_decode.cpp's last three moves), so their waits order the read of c_16.
+            if (num_active_children == 0) {
+                cb_out_w.wait_front(out_chunk_tiles);
+            }
             cb_out_m_buf.wait_front(PNHt);
             cb_out_l_buf.wait_front(PNHt);
 
@@ -507,13 +562,30 @@ void kernel_main() {
             // MQA (Multi Query Attention):  we don't need to gather outputs for other heads so we can just write entire
             // tiles to memory
             if (!is_out_sharded) {
+#ifdef SDPA_HEADS_FIRST
+                // this token's output rows of heads [0, hf_out_writer) to the heads' matrices (the reader sends the
+                // others'; both wait for the same output tiles, and this pops them after its writes)
+                sdpa_heads_first::write_rows<hf_lean, hf_out_dram, hf_bt, vDHt, tile_bytes>(
+                    out_addr, hf_out_page_bytes, cur_batch, 0, hf_out_writer, cb_out_buf.get_read_ptr(), noc_index);
+#else
                 barrier_count = write_tiles_to_memory<cb_out, out_chunk_tiles, barrier_threshold>(
                     out_tile_id, out_writer, barrier_count);
+#endif
             }
         }
         if constexpr (num_kv_heads > 1 || !is_out_sharded) {
             noc.async_write_barrier();
-            cb_out_buf.pop_front(out_chunk_tiles);
+#ifdef SDPA_HEADS_FIRST
+            // the reader waits for these tiles too (its rows of heads [hf_out_writer, NH)), and its wait_front reads
+            // tiles_acked once: a pop before that read would leave it waiting for good.  Nothing takes c_20 again in
+            // this program (one KV head: one head a core, one token a group), and the counts start at 0 in the next.
+            constexpr bool pop_out = hf_out_writer == hf_heads;
+#else
+            constexpr bool pop_out = true;
+#endif
+            if constexpr (pop_out) {
+                cb_out_buf.pop_front(out_chunk_tiles);
+            }
         }
     }
 }

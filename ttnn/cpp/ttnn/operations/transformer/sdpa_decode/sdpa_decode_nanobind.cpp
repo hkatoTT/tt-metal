@@ -161,6 +161,7 @@ void bind_sdpa_decode(nb::module_& mod) {
         nb::arg("sliding_window_size") = nb::none(),
         nb::arg("memory_config") = nb::none(),
         nb::arg("program_config") = nb::none(),
-        nb::arg("compute_kernel_config") = nb::none());
+        nb::arg("compute_kernel_config") = nb::none(),
+        nb::arg("heads_first") = false);
 }
 }  // namespace ttnn::operations::transformer

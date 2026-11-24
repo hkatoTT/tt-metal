@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -411,6 +412,16 @@ LayerNormInterleavedPlan LayerNormMultiCoreProgramFactory::select_plan(
             plan.input_tiles = read_ahead_input;
             plan.residual_tiles = read_ahead_residual;
         }
+    }
+    // GLM53_LN_GAMMA_STREAM=1 (a GLM-5.3-Flash switch, default off; read when the plan is made: its gamma_tiles are in
+    // the program hash): the regular plan's row-major gamma streamed a width block at a time
+    // every tile row (2 blocks in flight) in place of held whole (a gamma row is one row of each of Wt tiles: 4,096
+    // features held as 128 tiles, 256 KB of L1 for 8 KB of data).  The same gamma tiles multiply the same blocks: the
+    // same values.  Only the regular plan with a row-major gamma and no beta, residual or welford.
+    if (const char* env = std::getenv("GLM53_LN_GAMMA_STREAM"); env != nullptr && env[0] == '1' && !plan.large_tensor &&
+        gamma.has_value() && gamma->layout() == Layout::ROW_MAJOR && !beta.has_value() && !residual.has_value() &&
+        !plan.use_welford && !input_is_row_major && plan.gamma_tiles > 2 * block_size) {
+        plan.gamma_tiles = 2 * block_size;
     }
     return plan;
 }
@@ -887,6 +898,9 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
     }
     if (gamma.has_value()) {
         reader.compiler_options.defines.emplace("FUSE_GAMMA", "1");
+        if (selected_plan.gamma_tiles < selected_plan.width_block_tiles && !selected_plan.large_tensor) {
+            reader.compiler_options.defines.emplace("GAMMA_STREAM", "1");  // (GLM53_LN_GAMMA_STREAM, select_plan)
+        }
     }
     if (beta.has_value()) {
         reader.compiler_options.defines.emplace("FUSE_BETA", "1");
@@ -1063,6 +1077,9 @@ ttnn::device_operation::ProgramArtifacts LayerNormMultiCoreProgramFactory::creat
     // promoted to the preprocessor.
     if (gamma.has_value()) {
         compute.compiler_options.defines.emplace("FUSE_GAMMA", "1");
+        if (selected_plan.gamma_tiles < selected_plan.width_block_tiles && !selected_plan.large_tensor) {
+            compute.compiler_options.defines.emplace("GAMMA_STREAM", "1");  // (GLM53_LN_GAMMA_STREAM, select_plan)
+        }
     }
     if (beta.has_value()) {
         compute.compiler_options.defines.emplace("FUSE_BETA", "1");

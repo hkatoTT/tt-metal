@@ -12,6 +12,9 @@
 
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
 #include "dataflow_common.hpp"
+#ifdef SDPA_HEADS_FIRST
+#include "heads_first.hpp"
+#endif
 
 void kernel_main() {
     Noc noc;
@@ -73,6 +76,24 @@ void kernel_main() {
     constexpr auto pos_args = TensorAccessorArgs<mask_args.next_compile_time_args_offset()>();
     constexpr auto page_table_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset()>();
     constexpr auto attention_sink_args = TensorAccessorArgs<page_table_args.next_compile_time_args_offset()>();
+#ifdef SDPA_HEADS_FIRST
+    // heads_first (program factory: hf_compile_time_args): Q [1, NH, B, D] in L1, the output [1, NH, B, vD]
+    constexpr uint32_t hf_ct = attention_sink_args.next_compile_time_args_offset();
+    constexpr uint32_t hf_heads = get_compile_time_arg_val(hf_ct);
+    constexpr uint32_t hf_bt = get_compile_time_arg_val(hf_ct + 1);
+    constexpr uint32_t hf_q_reader = get_compile_time_arg_val(hf_ct + 2);    // Q's heads [0, hf_q_reader) here
+    constexpr uint32_t hf_out_writer = get_compile_time_arg_val(hf_ct + 3);  // the output's [hf_out_writer, NH) here
+    constexpr uint32_t hf_q_semaphore_id = get_compile_time_arg_val(hf_ct + 4);
+    constexpr uint32_t hf_pad_r0 = get_compile_time_arg_val(hf_ct + 5);
+    constexpr uint32_t hf_cb_zeros = get_compile_time_arg_val(hf_ct + 6);
+    constexpr uint32_t hf_q_page_bytes = get_compile_time_arg_val(hf_ct + 8);
+    constexpr uint32_t hf_out_page_bytes = get_compile_time_arg_val(hf_ct + 9);
+    constexpr uint32_t hf_active_cores = get_compile_time_arg_val(hf_ct + 10);
+    constexpr bool hf_out_dram = get_compile_time_arg_val(hf_ct + 11) == 1;  // the output in DRAM (else L1)
+    constexpr bool hf_lean = get_compile_time_arg_val(hf_ct + 12) == 1;      // rows issued with the NoC state
+    // the writes this kernel issues (the output's rows, the padding's zeros) land before it ends
+    constexpr bool hf_writes = hf_pad_r0 > 0 || hf_out_writer < hf_heads;
+#endif
 
     constexpr uint32_t cb_q_in = tt::CBIndex::c_0;
     constexpr uint32_t cb_k_in = tt::CBIndex::c_1;
@@ -111,6 +132,31 @@ void kernel_main() {
     if (q_addr == 0) {
         return;
     }
+#ifdef SDPA_HEADS_FIRST
+    // (after the output coordinates: the output's address and this core's index among the active cores)
+    const uint32_t hf_out_addr = get_arg_val<uint32_t>(18 + 2 * num_output_cores);
+    if constexpr (hf_pad_r0 > 0) {
+        // the output's rows past the B tokens zeroed (every active core its share), behind the rest of the kernel
+        const uint32_t zeros = get_write_ptr(hf_cb_zeros);
+        for (uint32_t w = 0; w < 1024 / 4; ++w) {
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zeros)[w] = 0;
+        }
+        sdpa_heads_first::zero_padding<hf_out_dram, hf_heads, hf_bt, vDHt, hf_pad_r0>(
+            hf_out_addr,
+            hf_out_page_bytes,
+            zeros,
+            get_arg_val<uint32_t>(19 + 2 * num_output_cores),
+            hf_active_cores,
+            noc_index);
+    }
+    auto hf_finish = [&]() {
+        if constexpr (hf_writes) {
+            noc_async_write_barrier();
+        }
+    };
+#else
+    auto hf_finish = []() {};
+#endif
 
     // Get cur_pos
     constexpr uint32_t cur_pos_base = St * 32 - 1;
@@ -172,6 +218,7 @@ void kernel_main() {
         }
         if (cur_pos == UINT32_MAX) {
             // cur_pos of -1 indicates that the user should be skipped
+            hf_finish();
             return;
         }
     }
@@ -197,6 +244,7 @@ void kernel_main() {
             sliding_window_size > 0 ? std::optional<uint32_t>(sliding_window_size) : std::nullopt);
 
     if (k_chunk_start == k_chunk_end) {
+        hf_finish();
         return;  // early exit because no computes needs to be done
     }
 
@@ -226,6 +274,22 @@ void kernel_main() {
     const uint32_t q_batch_offset = cur_batch * q_chunk_tiles;
 
     // Read Q
+#ifdef SDPA_HEADS_FIRST
+    // this token's rows of heads [0, hf_q_reader); the writer puts the others' and (all of them its own) pushes
+    if constexpr (hf_q_reader > 0) {
+        static_assert(!is_q_sharded && !tilize_q && q_heads_parallel_factor == 1);
+        CircularBuffer cb_q(cb_q_in);
+        cb_q.reserve_back(q_chunk_tiles);
+        sdpa_heads_first::read_rows<hf_lean, hf_bt, DHt, q_tile_bytes>(
+            q_addr, hf_q_page_bytes, cur_batch, 0, hf_q_reader, cb_q.get_write_ptr(), noc_index);
+        noc_async_read_barrier();
+        if constexpr (hf_q_reader < hf_heads) {
+            // the writer's rows landed
+            noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(hf_q_semaphore_id)), 1);
+        }
+        cb_q.push_back(q_chunk_tiles);
+    }
+#else
     read_q<cb_q_in, cb_q_rm, q_tile_bytes, q_chunk_tiles, is_q_sharded, tilize_q, use_half_tile, barrier_threshold>(
         q_locally_available,
         is_output_core,
@@ -236,6 +300,7 @@ void kernel_main() {
         q_args,
         q_page_size_bytes,
         q_batch_offset);
+#endif
 
     const auto k_reader = TensorAccessor(k_args, k_addr);
 
@@ -404,4 +469,19 @@ void kernel_main() {
                 PSt);
         }
     }
+#ifdef SDPA_HEADS_FIRST
+    if constexpr (hf_out_writer < hf_heads) {
+        // the output rows of heads [hf_out_writer, NH) on the tree's root (core 0 of the token's, which always has
+        // K chunks); the writer sends the others' and pops the output
+        if (core_num_in_reduce == 0) {
+            constexpr uint32_t cb_out = tt::CBIndex::c_20;
+            constexpr uint32_t out_chunk_tiles = PNHt * vDHt;
+            CircularBuffer cb_o(cb_out);
+            cb_o.wait_front(out_chunk_tiles);
+            sdpa_heads_first::write_rows<hf_lean, hf_out_dram, hf_bt, vDHt, get_tile_size(cb_out)>(
+                hf_out_addr, hf_out_page_bytes, cur_batch, hf_out_writer, hf_heads, cb_o.get_read_ptr(), noc_index);
+        }
+    }
+#endif
+    hf_finish();
 }

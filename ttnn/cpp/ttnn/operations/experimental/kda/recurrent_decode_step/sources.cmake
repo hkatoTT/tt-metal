@@ -1,0 +1,9 @@
+set(TTNN_OP_EXPERIMENTAL_KDA_RECURRENT_DECODE_STEP_API_HEADERS recurrent_decode_step.hpp)
+
+set(TTNN_OP_EXPERIMENTAL_KDA_RECURRENT_DECODE_STEP_SRCS
+    recurrent_decode_step.cpp
+    device/recurrent_decode_step_device_operation.cpp
+    device/recurrent_decode_step_program_factory.cpp
+)
+
+set(TTNN_OP_EXPERIMENTAL_KDA_RECURRENT_DECODE_STEP_NANOBIND_SRCS recurrent_decode_step_nanobind.cpp)

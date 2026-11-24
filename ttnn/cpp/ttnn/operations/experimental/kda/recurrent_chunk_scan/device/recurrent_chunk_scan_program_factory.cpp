@@ -218,8 +218,6 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
                     summary ? transport_state_dfb_name : final_state_dfb_name, "final_state"),
                 tt::tt_metal::experimental::ConsumerOf(summary_head_output_dfb_name, "summary_head_output"),
                 tt::tt_metal::experimental::ConsumerOf(summary_head_state_dfb_name, "summary_head_state"),
-                tt::tt_metal::experimental::ConsumerOf(
-                    summary ? final_state_dfb_name : transport_state_dfb_name, "unused_state"),
                 tt::tt_metal::experimental::ProducerOf(identity_scratch_dfb_name, "identity_scratch"),
                 tt::tt_metal::experimental::ConsumerOf(identity_scratch_dfb_name, "identity_scratch"),
             },
@@ -249,6 +247,14 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
                   "receivers"}},
         .hw_config = ttnn::create_writer_datamovement_config(),
     };
+
+    // The summary's compute reads its own final state back (extract_paths into output and transport_state), so it
+    // is that buffer's consumer too (a self-loop); the recurrence's final state is the writer's. The state this mode
+    // does not emit still needs a consumer: the writer binds it and never touches it.
+    if (!summary) {
+        writer.dfb_bindings.push_back(
+            tt::tt_metal::experimental::ConsumerOf(transport_state_dfb_name, "unused_state"));
+    }
 
     // The state update's inputs come from whichever kernel multicasts them.
     auto& late_producer = late_on_writer ? writer : reader;
@@ -341,6 +347,9 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
         .runtime_arg_schema = {.runtime_arg_names = {"num_chunks", "group"}},
         .hw_config = std::move(compute_hw),
     };
+    if (summary) {
+        compute.dfb_bindings.push_back(tt::tt_metal::experimental::ConsumerOf(final_state_dfb_name, "final_state"));
+    }
     tt::tt_metal::experimental::KernelRunArgs reader_run_args{.kernel = reader_kernel_name};
     tt::tt_metal::experimental::KernelRunArgs writer_run_args{.kernel = writer_kernel_name};
     tt::tt_metal::experimental::KernelRunArgs compute_run_args{.kernel = compute_kernel_name};

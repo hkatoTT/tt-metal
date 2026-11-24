@@ -39,6 +39,16 @@ void QkvCausalConv1dSiluOperation::validate_on_program_cache_miss(
     if (in.actual_end.has_value()) {
         check_actual_start(in.input, *in.actual_end, operation_name);
     }
+    if (in.real.has_value()) {
+        check_allocated_device_tensor(*in.real, operation_name, "real");
+        check_layout(*in.real, Layout::TILE, operation_name, "real");
+        check_dtype(*in.real, DataType::BFLOAT16, operation_name, "real");
+        check_interleaved(*in.real, operation_name, "real");
+        TT_FATAL(
+            in.real->logical_shape().rank() == 3 && in.real->logical_shape()[1] == in.input.logical_shape()[1] &&
+                in.real->logical_shape()[2] == 1,
+            "qkv_causal_conv1d_silu: real must be [1, T, 1]");
+    }
 
     check_allocated_device_tensor(in.input, operation_name, "input");
     check_layout(in.input, Layout::TILE, operation_name, "input");

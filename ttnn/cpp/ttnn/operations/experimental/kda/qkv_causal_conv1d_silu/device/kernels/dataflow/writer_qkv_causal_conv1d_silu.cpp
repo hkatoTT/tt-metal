@@ -30,7 +30,8 @@ template <
     uint32_t sp_rank,
     uint32_t sp_size,
     uint32_t local_rows,
-    uint32_t has_actual_end>
+    uint32_t has_actual_end,
+    uint32_t has_real>
 TT_KERNEL void writer(uint32_t wi_start, uint32_t wi_count, uint32_t staged_ct_start, uint32_t staged_ct_count) {
     const auto q = TensorAccessor(tensor::q);
     const auto k = TensorAccessor(tensor::k);
@@ -114,6 +115,74 @@ TT_KERNEL void writer(uint32_t wi_start, uint32_t wi_count, uint32_t staged_ct_s
     }
 
     const uint32_t tile_bytes = output.get_entry_size();
+    // has_real: the rows whose mask is 0 (a bit a row of the tile row), read once a tile row; k's and v's tiles get
+    // those rows times 0 before they are written: x * 0 is a zero of x's sign (the bf16 sign bit kept), as k * real
+    uint32_t mask_mt = ~0U, zero_rows = 0;
+    const auto rows_of = [&](uint32_t mt) {
+        if constexpr (has_real) {
+            if (mt != mask_mt) {
+                const auto real = TensorAccessor(*tensor::get_token_if_present<"real">());
+                Scratchpad<uint32_t> rscratch(scratch::real_rows);
+                const uint32_t rbase_raw = local_mem::detail::AddressAccess::address(rscratch.local_mem());
+                const uint32_t rbase = align_up(rbase_raw, read_alignment);
+                for (uint32_t half = 0; half < 2; ++half) {  // faces 0 and 2: rows 0-15 and 16-31, column 0 first
+                    noc.async_read(
+                        real,
+                        rscratch,
+                        face_bytes,
+                        {.page_id = mt, .offset_bytes = half * 2 * face_bytes},
+                        {.offset_bytes = rbase - rbase_raw + half * face_bytes});
+                }
+                noc.async_read_barrier();
+                const auto* values = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rbase);
+                zero_rows = 0;
+                for (uint32_t r = 0; r < tt::constants::TILE_HEIGHT; ++r) {
+                    const uint16_t value = values[(r / face_rows) * face_bytes / element_bytes + (r % face_rows) * face_rows];
+                    if ((value & 0x7FFF) == 0) {
+                        zero_rows |= 1U << r;
+                    }
+                }
+                mask_mt = mt;
+            }
+        }
+        return zero_rows;
+    };
+    // (8 words loaded before any is stored back: the loads of a batch overlap instead of each waiting for the last
+    // store: a tile wholly masked, a row without a request's, took ~17 cycles a word; the same words and the same AND,
+    // so the same bits)
+    const auto mask_words = [](volatile tt_l1_ptr uint32_t* words, uint32_t n) {
+        for (uint32_t i = 0; i < n; i += 8) {
+            const uint32_t w0 = words[i], w1 = words[i + 1], w2 = words[i + 2], w3 = words[i + 3];
+            const uint32_t w4 = words[i + 4], w5 = words[i + 5], w6 = words[i + 6], w7 = words[i + 7];
+            words[i] = w0 & 0x80008000U;
+            words[i + 1] = w1 & 0x80008000U;
+            words[i + 2] = w2 & 0x80008000U;
+            words[i + 3] = w3 & 0x80008000U;
+            words[i + 4] = w4 & 0x80008000U;
+            words[i + 5] = w5 & 0x80008000U;
+            words[i + 6] = w6 & 0x80008000U;
+            words[i + 7] = w7 & 0x80008000U;
+        }
+    };
+    const auto mask_rows = [&](uint32_t address, uint32_t rows) {
+        constexpr uint32_t face_row_words = face_row_bytes / sizeof(uint32_t);
+        static_assert(face_row_words % 8 == 0, "qkv conv: a face row is whole batches of 8 words");
+        if (rows == 0xFFFFFFFFU) {  // every row of the tile (its 4 faces, one run of words)
+            mask_words(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address), 4 * face_bytes / sizeof(uint32_t));
+            return;
+        }
+        for (uint32_t r = 0; rows != 0; ++r, rows >>= 1) {
+            if ((rows & 1) == 0) {
+                continue;
+            }
+            for (uint32_t side = 0; side < 2; ++side) {
+                mask_words(
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        address + ((r / face_rows) * 2 + side) * face_bytes + (r % face_rows) * face_row_bytes),
+                    face_row_words);
+            }
+        }
+    };
     const auto process = [&](uint32_t work) {
         const uint32_t mt = work % Mt;
         const uint32_t ct_start = (work / Mt) * block_ct;
@@ -127,9 +196,15 @@ TT_KERNEL void writer(uint32_t wi_start, uint32_t wi_count, uint32_t staged_ct_s
                 noc.async_write(output, q, tile_bytes, {.offset_bytes = slot * tile_bytes}, {.page_id = mt * Qt + ct});
             } else if (ct < Qt + Kt) {
                 const uint32_t kt = ct - Qt;
+                if constexpr (has_real) {
+                    mask_rows(output.get_read_ptr() + slot * tile_bytes, rows_of(mt));
+                }
                 noc.async_write(output, k, tile_bytes, {.offset_bytes = slot * tile_bytes}, {.page_id = mt * Kt + kt});
             } else {
                 const uint32_t vt = ct - Qt - Kt;
+                if constexpr (has_real) {
+                    mask_rows(output.get_read_ptr() + slot * tile_bytes, rows_of(mt));
+                }
                 noc.async_write(output, v, tile_bytes, {.offset_bytes = slot * tile_bytes}, {.page_id = mt * Vt + vt});
             }
             if (slot + 1 == group) {

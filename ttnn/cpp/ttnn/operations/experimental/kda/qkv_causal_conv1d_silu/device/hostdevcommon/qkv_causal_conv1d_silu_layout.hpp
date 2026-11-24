@@ -84,6 +84,10 @@ inline void for_each_work_item(
     }
 }
 
+// The writer's scratch for the padded tokens' mask (`real`, [1, T, 1] TILE): a tile row's faces 0 and 2 (column 0
+// holds the 32 rows' values), from an aligned base.
+constexpr uint32_t real_rows_bytes = 2 * face_bytes + read_alignment;
+
 // Fabric exchange buffer pages. The predecessor writes rows [predecessor_page, +3) and the final segment's owner
 // writes rows [carry_page, +3); the convolution cores stage this rank's outgoing and end rows for the exchange core.
 constexpr uint32_t predecessor_page = 0;

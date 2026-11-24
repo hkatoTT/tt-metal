@@ -44,6 +44,11 @@ void bind_chain_affine_transforms(nb::module_& mod) {
                 Defaults to HiFi2 with FP32 destination accumulation, which is required.
             sequence_parallel_axis (int, optional): Mesh axis partitioning the sequence. Native mesh
                 coordinates supply each device's rank.
+            rank_mask (ttnn.Tensor, optional): UINT32 row-major, one word per rank (per device): a rank
+                whose word is 0 takes ``identity`` as its transition. Given with ``identity``.
+            identity (ttnn.Tensor, optional): BFLOAT16 TILE ``[1, 1, K, K + V]`` transition (``[I | 0]``).
+            initial_keep (ttnn.Tensor, optional): FLOAT32 TILE, per device: its first element 0 makes the
+                initial state zero (not read), 1 reads it as it is (``initial_state`` times a 0 / 1 keep).
 
         Returns:
             tuple[ttnn.Tensor, ttnn.Tensor]: FLOAT32 TILE-layout ``[B*H, K, V]`` entry state
@@ -61,7 +66,10 @@ void bind_chain_affine_transforms(nb::module_& mod) {
         nb::arg("local_rows"),
         nb::arg("memory_config") = nb::none(),
         nb::arg("compute_kernel_config") = nb::none(),
-        nb::arg("sequence_parallel_axis") = 0);
+        nb::arg("sequence_parallel_axis") = 0,
+        nb::arg("rank_mask") = nb::none(),
+        nb::arg("identity") = nb::none(),
+        nb::arg("initial_keep") = nb::none());
 }
 
 }  // namespace ttnn::operations::experimental::kda::chain_affine_transforms::detail

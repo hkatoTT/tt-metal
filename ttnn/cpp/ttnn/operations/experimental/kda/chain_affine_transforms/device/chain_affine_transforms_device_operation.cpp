@@ -62,6 +62,32 @@ void ChainAffineTransformsOperation::validate_on_program_cache_miss(
             s_shape[2] % tt::constants::TILE_WIDTH == 0,
         "{}: K and V must be positive and tile aligned",
         operation_name);
+    TT_FATAL(
+        in.rank_mask.has_value() == in.identity.has_value(), "{}: rank_mask and identity go together", operation_name);
+    if (in.rank_mask.has_value()) {
+        kda_factory_detail::check_allocated_device_tensor(*in.rank_mask, operation_name, "rank_mask");
+        kda_factory_detail::check_layout(*in.rank_mask, tt::tt_metal::Layout::ROW_MAJOR, operation_name, "rank_mask");
+        kda_factory_detail::check_dtype(*in.rank_mask, tt::tt_metal::DataType::UINT32, operation_name, "rank_mask");
+        TT_FATAL(
+            in.rank_mask->logical_shape()[-1] >= t_shape[0] && in.rank_mask->logical_shape()[-1] * 4 <= 64,
+            "{}: rank_mask needs one word per rank in its first (at most 64-byte) page",
+            operation_name);
+        kda_factory_detail::check_allocated_device_tensor(*in.identity, operation_name, "identity");
+        kda_factory_detail::check_layout(*in.identity, tt::tt_metal::Layout::TILE, operation_name, "identity");
+        kda_factory_detail::check_dtype(*in.identity, tt::tt_metal::DataType::BFLOAT16, operation_name, "identity");
+        kda_factory_detail::check_interleaved(*in.identity, operation_name, "identity");
+        const auto& i_shape = in.identity->logical_shape();
+        TT_FATAL(
+            i_shape[-2] == t_shape[2] && i_shape[-1] == t_shape[3] && i_shape.volume() == t_shape[2] * t_shape[3],
+            "{}: identity must be one transition [K, K + V]",
+            operation_name);
+    }
+    if (in.initial_keep.has_value()) {
+        kda_factory_detail::check_allocated_device_tensor(*in.initial_keep, operation_name, "initial_keep");
+        kda_factory_detail::check_layout(*in.initial_keep, tt::tt_metal::Layout::TILE, operation_name, "initial_keep");
+        kda_factory_detail::check_dtype(*in.initial_keep, tt::tt_metal::DataType::FLOAT32, operation_name, "initial_keep");
+        kda_factory_detail::check_interleaved(*in.initial_keep, operation_name, "initial_keep");
+    }
     const auto* mesh = in.transforms.device();
     TT_FATAL(attrs.sequence_parallel_axis < mesh->shape().dims(), "{}: invalid sequence_parallel_axis", operation_name);
     TT_FATAL(
@@ -131,7 +157,10 @@ std::pair<Tensor, Tensor> chain_affine_transforms(
     const DeviceComputeKernelConfig& compute_kernel_config,
     const Tensor& actual_start,
     uint32_t sequence_parallel_axis,
-    uint32_t local_rows) {
+    uint32_t local_rows,
+    const std::optional<Tensor>& rank_mask,
+    const std::optional<Tensor>& identity,
+    const std::optional<Tensor>& initial_keep) {
     // Cache-miss validation cannot protect attribute construction on cache hits. Keep these guards here because the
     // launcher indexes both shapes before dispatching validation.
     const auto& t_shape = transforms.logical_shape();
@@ -149,7 +178,12 @@ std::pair<Tensor, Tensor> chain_affine_transforms(
             .output_mem_config = memory_config,
             .compute_kernel_config = compute_kernel_config},
         ChainAffineTransformsInputs{
-            .transforms = transforms, .initial_state = initial_state, .actual_start = actual_start});
+            .transforms = transforms,
+            .initial_state = initial_state,
+            .actual_start = actual_start,
+            .rank_mask = rank_mask,
+            .identity = identity,
+            .initial_keep = initial_keep});
     return {outputs[0], outputs[1]};
 }
 

@@ -43,6 +43,9 @@ struct QkvCausalConv1dSiluInputs {
     std::optional<Tensor> predecessor_carry;
     std::optional<Tensor> exchange_buffer;
     std::optional<Tensor> actual_end;
+    // The padded tokens' mask [1, T, 1] BFLOAT16 TILE (1 a real token, 0 a padded one):
+    // the writer gives k's and v's rows of a 0 the value times 0 (the sign kept, as k * real), q as it is
+    std::optional<Tensor> real;
 };
 
 }  // namespace ttnn::experimental::prim

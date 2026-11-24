@@ -105,7 +105,9 @@ ttnn::device_operation::MeshWorkloadArtifacts ChainAffineTransformsProgramFactor
              {"Vt", Vt},
              {"Vt_full", Vt_full},
              {"BH", BH},
-             {"mcast_shared", static_cast<uint32_t>(mcast_shared)}},
+             {"mcast_shared", static_cast<uint32_t>(mcast_shared)},
+             {"has_rank_mask", static_cast<uint32_t>(in.rank_mask.has_value())},
+             {"has_initial_keep", static_cast<uint32_t>(in.initial_keep.has_value())}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"head", "value_block", "peer_x0", "peer_y0", "peer_x1", "peer_y1", "receivers"}},
         // The kernel manages every DFB credit explicitly, including the 4-byte actual_start read.
@@ -193,6 +195,25 @@ ttnn::device_operation::MeshWorkloadArtifacts ChainAffineTransformsProgramFactor
         {final_state_name, final_state},
     };
 
+    if (in.rank_mask.has_value()) {  // (left unbound when absent: the kernel resolves them with get_token_if_present)
+        const m2::TensorParamName rank_mask_name{"rank_mask"};
+        const m2::TensorParamName identity_name{"identity"};
+        spec.tensor_parameters.push_back(
+            m2::TensorParameter{.unique_id = rank_mask_name, .spec = in.rank_mask->mesh_tensor().tensor_spec()});
+        spec.tensor_parameters.push_back(
+            m2::TensorParameter{.unique_id = identity_name, .spec = in.identity->mesh_tensor().tensor_spec()});
+        run_args.tensor_args.emplace(rank_mask_name, in.rank_mask->mesh_tensor());
+        run_args.tensor_args.emplace(identity_name, in.identity->mesh_tensor());
+        dataflow.tensor_bindings.push_back(m2::TensorBinding{rank_mask_name, "rank_mask"});
+        dataflow.tensor_bindings.push_back(m2::TensorBinding{identity_name, "identity"});
+    }
+    if (in.initial_keep.has_value()) {  // (left unbound when absent, as rank_mask)
+        const m2::TensorParamName initial_keep_name{"initial_keep"};
+        spec.tensor_parameters.push_back(
+            m2::TensorParameter{.unique_id = initial_keep_name, .spec = in.initial_keep->mesh_tensor().tensor_spec()});
+        run_args.tensor_args.emplace(initial_keep_name, in.initial_keep->mesh_tensor());
+        dataflow.tensor_bindings.push_back(m2::TensorBinding{initial_keep_name, "initial_keep"});
+    }
     kda_factory_detail::bind_chronology(spec, run_args, in.actual_start, dataflow, compute);
     spec.kernels = {std::move(dataflow), std::move(compute)};
     return kda_factory_detail::chronology_workload(

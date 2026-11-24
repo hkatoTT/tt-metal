@@ -1,0 +1,118 @@
+{
+ "version": "glm53-acceptance-prompts/v1",
+ "prompts": [
+  {
+   "id": "fact",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of Australia? Answer briefly."
+    }
+   ]
+  },
+  {
+   "id": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A train travels 180 km in 2.5 hours. What is its average speed in km/h? Show the calculation."
+    }
+   ]
+  },
+  {
+   "id": "math-low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A train travels 180 km in 2.5 hours. What is its average speed in km/h? Show the calculation."
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "low"
+   }
+  },
+  {
+   "id": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a Python function that returns the n-th Fibonacci number iteratively."
+    }
+   ]
+  },
+  {
+   "id": "json",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Return a JSON object with the keys name, age and city for a fictional person. Output only the JSON."
+    }
+   ]
+  },
+  {
+   "id": "list",
+   "messages": [
+    {
+     "role": "user",
+     "content": "List the three primary colors and the three secondary colors used in painting, as a bulleted list."
+    }
+   ]
+  },
+  {
+   "id": "japanese",
+   "messages": [
+    {
+     "role": "user",
+     "content": "日本の四季について、それぞれ一文で説明してください。"
+    }
+   ]
+  },
+  {
+   "id": "story",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write the opening two sentences of a short story about a lighthouse keeper."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Summarize the following text in one sentence.\n\nPhotosynthesis is the process by which green plants, algae and some bacteria turn light into chemical energy. In the chloroplasts, chlorophyll absorbs mostly red and blue light. That energy splits water molecules, releasing oxygen as a by-product, and drives the production of ATP and NADPH. In the Calvin cycle these carriers power the fixation of carbon dioxide from the air into three-carbon sugars, which the plant then builds into glucose, starch and cellulose. Nearly all the oxygen in the atmosphere and most of the energy in food chains come from this process, and its rate depends on light intensity, carbon dioxide concentration, temperature and the supply of water."
+    }
+   ]
+  },
+  {
+   "id": "multiturn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "I am planning a trip to Kyoto in November."
+    },
+    {
+     "role": "assistant",
+     "content": "November is a great time to visit Kyoto: the autumn leaves are at their peak in the second half of the month."
+    },
+    {
+     "role": "user",
+     "content": "Which two temples should I see first, and why?"
+    }
+   ]
+  },
+  {
+   "id": "translate",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Translate into French: \"The weather is nice today, so we will walk to the park.\""
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "low"
+   }
+  }
+ ]
+}

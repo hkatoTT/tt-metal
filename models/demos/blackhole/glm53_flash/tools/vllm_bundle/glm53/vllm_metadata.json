@@ -1,0 +1,4 @@
+{
+  "arch": "Glm5NextForConditionalGeneration",
+  "main_class": "models.demos.blackhole.glm53_flash.tools.glm53_vllm:Glm53ForCausalLM"
+}

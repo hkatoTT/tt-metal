@@ -3,7 +3,7 @@
 The 11 acceptance records' prompts go in as token ids (each `--repeat` times), temperature 0, as many output tokens as
 each record holds; the generated ids are compared with the records (first divergence per request) and the wall times
 of engine start-up and generation are reported.  Run in the vLLM env with the bundle registered (--model: the
-checkpoint, default $GLM53_CHECKPOINT):
+checkpoint, default $GLM53_CHECKPOINT, else $HF_MODEL):
 
     EXTRA_MODELS_DIR=<tree>/models/demos/blackhole/glm53_flash/tools/vllm_bundle MESH_DEVICE="(8, 4)" \
         python -m models.demos.blackhole.glm53_flash.tools.vllm_offline_check --max-num-seqs 16

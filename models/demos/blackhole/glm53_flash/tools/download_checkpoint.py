@@ -2,7 +2,7 @@
 
     python -m models.demos.blackhole.glm53_flash.tools.download_checkpoint --out <dir>/GLM-5.3-Flash-BF16
 
-then point GLM53_CHECKPOINT at that directory.
+then point GLM53_CHECKPOINT (or HF_MODEL) at that directory.
 
 The revision's listing (path, size, git blob id, LFS SHA-256 per file) comes from the Hub API and is saved as
 ``<out>/.download/files.json``.  ``huggingface_hub`` fetches the files into ``<out>`` (resumable).  Every file is then

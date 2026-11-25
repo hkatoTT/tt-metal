@@ -1,0 +1,10 @@
+[
+    {"prompt": "What is the capital of Australia, and why was it chosen over Sydney and Melbourne?"},
+    {"prompt": "Explain in a few sentences how a refrigerator keeps food cold."},
+    {"prompt": "Write a haiku about a lighthouse in winter."},
+    {"prompt": "What is 17 times 23? Show your working."},
+    {"prompt": "Give three tips for writing clear error messages in software."},
+    {"prompt": "Translate 'Good morning, how are you today?' into French and Spanish."},
+    {"prompt": "Summarize the plot of Romeo and Juliet in two sentences."},
+    {"prompt": "Write a Python function that returns the n-th Fibonacci number without recursion."}
+]

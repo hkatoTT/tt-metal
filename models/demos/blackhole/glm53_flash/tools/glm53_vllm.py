@@ -70,7 +70,7 @@ users per mesh row.
   32}'`, as the README starts the server) to keep it on the device; the start-up warns where the server's defaults
   (the model's generation_config.json: temperature 1.0, top-p 0.95) leave it out (`check_sampling`).
 
-Environment: `MODEL_WEIGHTS_DIR` (default: `--model` as a directory, else `GLM53_CHECKPOINT`),
+Environment: `MODEL_WEIGHTS_DIR` (default: `--model` as a directory, else `GLM53_CHECKPOINT` or `HF_MODEL`),
 `GLM53_PREFILL_CHUNK` (default 128,512,1024: the prefill chunk lengths, chosen per prompt by `Glm53Generator.schedule`;
 1,024 gives the one-row form's waves of 1,024 tokens a row and the sequence-parallel waves in pairs),
 `GLM53_PREFILL_TRACE` (default: every chunk length; the lengths whose prefill forms are captured as

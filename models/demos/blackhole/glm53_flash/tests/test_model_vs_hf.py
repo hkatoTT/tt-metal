@@ -7,19 +7,19 @@ Four layers hold every kind: KDA + dense MLP (0-2) and DSA + MoE (3).
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 
 pytest.importorskip("transformers.models.glm5_next")
 
-from models.demos.blackhole.glm53_flash.checkpoint import Glm53Checkpoint, checkpoint_root  # noqa: E402
+from models.demos.blackhole.glm53_flash.checkpoint import Glm53Checkpoint  # noqa: E402
+from models.demos.blackhole.glm53_flash.paths import checkpoint_skip_reason  # noqa: E402
 from models.demos.blackhole.glm53_flash.tools import hf_reference  # noqa: E402
 from models.demos.blackhole.glm53_flash.tt.model import Glm53TextModel  # noqa: E402
 
-if not os.environ.get("GLM53_CHECKPOINT") or not (checkpoint_root() / "model.safetensors.index.json").exists():
-    pytest.skip("no checkpoint (GLM53_CHECKPOINT)", allow_module_level=True)
+NO_CHECKPOINT = checkpoint_skip_reason()  # (GLM53_CHECKPOINT, else HF_MODEL)
+if NO_CHECKPOINT:
+    pytest.skip(NO_CHECKPOINT, allow_module_level=True)
 
 NUM_LAYERS = 4
 

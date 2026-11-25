@@ -3,9 +3,9 @@
 
 """GLM-5.3-Flash text generation on a Blackhole Galaxy (the 8x4 mesh).
 
-Loads the BF16 checkpoint ($GLM53_CHECKPOINT; the large matrices are converted to BFP8 as they load, a few
-minutes), renders each prompt with the checkpoint's chat template, prefills the prompts and decodes greedily through
-the serving generator (`ttnn/generator.py`).  With $GLM53_DFLASH2_DRAFTER set the decode is DFlash2 speculative
+Loads the BF16 checkpoint ($GLM53_CHECKPOINT, else $HF_MODEL; the large matrices are converted to BFP8 as they load,
+a few minutes), renders each prompt with the checkpoint's chat template, prefills the prompts and decodes greedily
+through the serving generator (`ttnn/generator.py`).  With $GLM53_DFLASH2_DRAFTER set the decode is DFlash2 speculative
 decoding: the drafter on the device proposes K tokens a step and the model keeps those equal to its own greedy choice
 (the greedy output, faster); without it, the plain greedy decode, one token a step.  With the drafter the model is
 built for its DFlash2 step as the vLLM server builds it (`dflash_shape`: the users a mesh row and K + 1 tokens each),
@@ -13,11 +13,22 @@ so it takes that shape's defaults, such as the L1 landing of the next MoE layer'
 each prompt's generation and the decode speed.
 
     pytest models/demos/blackhole/glm53_flash/demo/demo.py
+    pytest models/demos/blackhole/glm53_flash/demo/demo.py \
+        --input_prompts models/demos/blackhole/glm53_flash/demo/sample_prompts/questions.json --max_generated_tokens 128
 
-Environment:
-    GLM53_DEMO_PROMPT       one prompt (default: a short question)
-    GLM53_DEMO_PROMPTS      a JSON file of prompts instead: a list of strings or of {"prompt": ...} (up to 64)
-    GLM53_DEMO_MAX_NEW      new tokens a prompt at most (default 256; a prompt stops earlier at an end token)
+Options (pytest command-line options, named as in the other tt-metal demos; `demo/conftest.py`), each over its
+environment variable, over the default:
+    --input_prompts FILE         GLM53_DEMO_PROMPTS: a JSON file of prompts, a list of strings or of {"prompt": ...}
+                                 (up to 64; prompt i runs on mesh row i % 8); GLM53_DEMO_PROMPT: one prompt (default:
+                                 a short question)
+    --max_generated_tokens N     GLM53_DEMO_MAX_NEW: new tokens a prompt at most (default 256; a prompt stops earlier
+                                 at an end token)
+    --batch_size N               the prompts to run: the prompts repeated (or cut) to N, 1 .. 64 (default: as many
+                                 as given)
+    --max_seq_len N              the cache a user, in tokens (default: room for the longest prompt and its new
+                                 tokens), rounded up to a multiple of 512, at least 1,024.  Past 2,051 tokens the DSA
+                                 cache takes its long-context form, and the warm-up compiles more prefill forms
+Environment only:
     GLM53_DEMO_REASONING    the chat template's reasoning effort: low (default: a short reasoning part), high or max
     GLM53_DEMO_K            DFlash2's drafts a step, 1 .. 7 (default 7)
     GLM53_SYNTHETIC_WEIGHTS=1  random weights made on the device (loads in seconds; the text is noise)
@@ -28,7 +39,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Mapping
 
 import pytest
 import torch
@@ -43,18 +56,84 @@ from models.demos.blackhole.glm53_flash.ttnn.model import TtGlm53Model
 DEFAULT_PROMPT = "Explain in a few sentences why the sky is blue."
 CHUNKS = (128, 512)  # the prefill's chunk lengths (the generator picks them per prompt)
 MAX_PROMPTS = 8 * ROWS  # up to 8 users a mesh row
+MIN_CACHE = 1024
 
 
-def load_prompts() -> list[str]:
-    path = os.environ.get("GLM53_DEMO_PROMPTS")
-    if path:
-        items = json.loads(Path(path).read_text())
-        prompts = [item["prompt"] if isinstance(item, dict) else str(item) for item in items]
-    else:
-        prompts = [os.environ.get("GLM53_DEMO_PROMPT", DEFAULT_PROMPT)]
-    if not 1 <= len(prompts) <= MAX_PROMPTS:
-        raise ValueError(f"{len(prompts)} prompts: 1 to {MAX_PROMPTS}")
+@dataclass(frozen=True)
+class DemoSettings:
+    prompts: list
+    max_new: int
+    reasoning: str
+    k: int
+    max_seq: int | None  # the cache a user asked for (None: from the prompts, `cache_length`)
+    source: str  # where the prompts came from (for the log)
+
+
+def load_prompts(path: str | Path) -> list[str]:
+    """A prompts file: a JSON list of strings or of {"prompt": ...} objects (other keys are ignored)."""
+    items = json.loads(Path(path).read_text())
+    if not isinstance(items, list) or not items:
+        raise ValueError(f'{path}: a JSON list of prompts (strings or {{"prompt": ...}} objects)')
+    prompts = []
+    for i, item in enumerate(items):
+        if isinstance(item, dict) and isinstance(item.get("prompt"), str):
+            prompts.append(item["prompt"])
+        elif isinstance(item, str):
+            prompts.append(item)
+        else:
+            raise ValueError(f'{path}: item {i} is neither a string nor an object with a "prompt" string')
     return prompts
+
+
+def demo_settings(
+    option: Callable[[str], object] = lambda name: None, environ: Mapping[str, str] = os.environ
+) -> DemoSettings:
+    """The demo's settings: each pytest option (`option("--input_prompts")`, ..., None where not given) over its
+    environment variable (GLM53_DEMO_*), over the default."""
+
+    def number(name: str | None, env: str | None, default: int | None) -> int | None:
+        value = option(name) if name else None
+        if value is None and env and environ.get(env):
+            value = environ[env]
+        return default if value is None else int(value)
+
+    path = option("--input_prompts") or environ.get("GLM53_DEMO_PROMPTS")
+    if path:
+        prompts, source = load_prompts(path), str(path)
+    else:
+        prompts = [environ.get("GLM53_DEMO_PROMPT") or DEFAULT_PROMPT]
+        source = "GLM53_DEMO_PROMPT" if environ.get("GLM53_DEMO_PROMPT") else "the default prompt"
+    batch = number("--batch_size", None, None)
+    if batch is not None:
+        if not 1 <= batch <= MAX_PROMPTS:
+            raise ValueError(f"--batch_size {batch}: 1 to {MAX_PROMPTS}")
+        prompts = [prompts[i % len(prompts)] for i in range(batch)]  # (repeated in order, or the first `batch`)
+    if not 1 <= len(prompts) <= MAX_PROMPTS:
+        raise ValueError(f"{len(prompts)} prompts ({source}): 1 to {MAX_PROMPTS} (--batch_size picks the first ones)")
+    max_new = number("--max_generated_tokens", "GLM53_DEMO_MAX_NEW", 256)
+    if max_new < 1:
+        raise ValueError(f"--max_generated_tokens {max_new}: at least 1")
+    max_seq = number("--max_seq_len", None, None)
+    if max_seq is not None and max_seq < 1:
+        raise ValueError(f"--max_seq_len {max_seq}: at least 1")
+    k = number(None, "GLM53_DEMO_K", 7)
+    reasoning = environ.get("GLM53_DEMO_REASONING") or "low"
+    return DemoSettings(prompts, max_new, reasoning, k, max_seq, source)
+
+
+def cache_length(longest_prompt: int, max_new: int, asked: int | None = None) -> int:
+    """The cache a user (the model's max_seq): room for the longest prompt, its new tokens and a few more, in multiples
+    of the longest prefill chunk, at least MIN_CACHE; `asked` (--max_seq_len): that, rounded up the same way, if it
+    has the room."""
+    step = CHUNKS[-1]
+    needed = longest_prompt + max_new + 16
+    if asked is not None and asked < needed:
+        raise ValueError(
+            f"--max_seq_len {asked}: the longest prompt ({longest_prompt} tokens) and --max_generated_tokens "
+            f"({max_new}) need {needed}"
+        )
+    length = needed if asked is None else asked
+    return max(MIN_CACHE, -(-length // step) * step)
 
 
 def render(tokenizer, prompts: list[str], effort: str) -> list[list[int]]:
@@ -130,15 +209,15 @@ def dflash_decode(gen, k, firsts, starts, slots, done) -> tuple[list, int, float
 @pytest.mark.timeout(2400)
 @pytest.mark.parametrize("mesh_device", [MESH_SHAPE], indirect=True)
 @pytest.mark.parametrize("device_params", [DEVICE_PARAMS_TRACE], indirect=True)
-def test_demo(mesh_device):
+def test_demo(mesh_device, request):
     from transformers import AutoTokenizer
 
+    settings = demo_settings(lambda name: request.config.getoption(name, default=None))
     root = checkpoint_dir()
     tokenizer = AutoTokenizer.from_pretrained(str(root))
     eos = set(json.loads((root / "generation_config.json").read_text())["eos_token_id"])
-    max_new = int(os.environ.get("GLM53_DEMO_MAX_NEW", "256"))
-    prompts = load_prompts()
-    ids = render(tokenizer, prompts, os.environ.get("GLM53_DEMO_REASONING", "low"))
+    max_new, prompts = settings.max_new, settings.prompts
+    ids = render(tokenizer, prompts, settings.reasoning)
 
     def trim(seq: list) -> list:
         seq = seq[:max_new]
@@ -149,11 +228,10 @@ def test_demo(mesh_device):
 
     users = -(-len(prompts) // ROWS)  # users a mesh row
     slots = [(i % ROWS) * users + i // ROWS for i in range(len(prompts))]  # prompt i on mesh row i % 8
-    longest = max(len(p) for p in ids) + max_new + 16
-    max_seq = max(1024, -(-longest // CHUNKS[-1]) * CHUNKS[-1])  # the cache, in tokens a user
+    max_seq = cache_length(max(len(p) for p in ids), max_new, settings.max_seq)  # the cache, in tokens a user
     synthetic = os.environ.get("GLM53_SYNTHETIC_WEIGHTS") == "1"
 
-    k, dflash = int(os.environ.get("GLM53_DEMO_K", "7")), None
+    k, dflash = settings.k, None
     drafted = bool(os.environ.get("GLM53_DFLASH2_DRAFTER"))
     if drafted and not 1 <= k <= 7:
         raise ValueError(f"GLM53_DEMO_K={k}: 1 to 7")
@@ -177,7 +255,10 @@ def test_demo(mesh_device):
         dflash = (drafter, k)
     gen = Glm53Generator(model, users, chunk=CHUNKS, dflash=dflash)
     mode = f"DFlash2 with K = {k}" if dflash else "plain greedy decode (GLM53_DFLASH2_DRAFTER not set)"
-    logger.info(f"loaded in {time.time() - t0:.0f} s: {len(prompts)} prompts, {users} a mesh row, cache {max_seq}")
+    logger.info(
+        f"loaded in {time.time() - t0:.0f} s: {len(prompts)} prompts ({settings.source}), {users} a mesh row, "
+        f"cache {max_seq}"
+    )
     t0 = time.time()
     gen.warmup(greedy=dflash is None, logits=False)  # (compiles the prefill, then captures the decode's trace)
     logger.info(f"warmed up in {time.time() - t0:.0f} s; {mode}")

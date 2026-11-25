@@ -3,20 +3,20 @@ torch, on real layer weights (no device; needs the checkpoint)."""
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-from models.demos.blackhole.glm53_flash.checkpoint import Glm53Checkpoint, checkpoint_root
+from models.demos.blackhole.glm53_flash.checkpoint import Glm53Checkpoint
 from models.demos.blackhole.glm53_flash.config import Glm53Config
+from models.demos.blackhole.glm53_flash.paths import checkpoint_skip_reason
 from models.demos.blackhole.glm53_flash.tt.common import unweighted_rms_norm
 from models.demos.blackhole.glm53_flash.tt.mhc import HyperConnection, HyperConnectionWeights
 from models.demos.blackhole.glm53_flash.ttnn.mhc_consts import W, emulate_split_sinkhorn, split_sinkhorn_consts
 
-if not os.environ.get("GLM53_CHECKPOINT") or not (checkpoint_root() / "model.safetensors.index.json").exists():
-    pytest.skip("no checkpoint (GLM53_CHECKPOINT)", allow_module_level=True)
+NO_CHECKPOINT = checkpoint_skip_reason()  # (GLM53_CHECKPOINT, else HF_MODEL)
+if NO_CHECKPOINT:
+    pytest.skip(NO_CHECKPOINT, allow_module_level=True)
 
 
 @pytest.mark.parametrize("layer, block", [(0, "attn"), (20, "ffn"), (44, "attn")])

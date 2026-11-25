@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import threading
 import time
@@ -24,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[5]))  # (the tt-metal root: tools/passkey.py's package)
 
+from models.demos.blackhole.glm53_flash.paths import checkpoint_dir  # noqa: E402
 from models.demos.blackhole.glm53_flash.tools.passkey import DEPTHS, WORDS, filler, prompt_ids  # noqa: E402
 
 MODEL = "glm-5.3-flash"
@@ -79,7 +79,7 @@ def max_gap(events: list, lo: float, hi: float) -> float:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, required=True)
-    p.add_argument("--tokenizer", default=os.path.join(os.environ.get("GLM53_CHECKPOINT", ""), "tokenizer.json"))
+    p.add_argument("--tokenizer", help="tokenizer.json (default: the checkpoint's, GLM53_CHECKPOINT or HF_MODEL)")
     p.add_argument("--short", type=int, default=24, help="short requests, decoding all along")
     p.add_argument("--short-len", type=int, default=1024)
     p.add_argument("--short-out", type=int, default=1536)
@@ -91,7 +91,7 @@ def main() -> None:
     args = p.parse_args()
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(args.tokenizer)
+    tok = Tokenizer.from_file(args.tokenizer or str(checkpoint_dir() / "tokenizer.json"))
     shorts = []
     for i in range(args.short):  # (each its own filler: distinct prompts)
         text = "".join(filler(1000 * i + j) for j in range(args.short_len // 20))

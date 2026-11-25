@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import sys
 import threading
@@ -26,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[5]))  # (the tt-metal root: tools/passkey.py's package)
 
+from models.demos.blackhole.glm53_flash.paths import checkpoint_dir  # noqa: E402
 from models.demos.blackhole.glm53_flash.tools.passkey import DEPTHS, WORDS, filler, prompt_ids  # noqa: E402
 
 MODEL = "glm-5.3-flash"
@@ -95,7 +95,7 @@ def compare(a_path: str, b_path: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int)
-    p.add_argument("--tokenizer", default=os.path.join(os.environ.get("GLM53_CHECKPOINT", ""), "tokenizer.json"))
+    p.add_argument("--tokenizer", help="tokenizer.json (default: the checkpoint's, GLM53_CHECKPOINT or HF_MODEL)")
     p.add_argument("--convs", type=int, default=8, help="conversations at once")
     p.add_argument("--turns", type=int, default=4)
     p.add_argument("--first", type=int, default=30000, help="the first prompt's tokens")
@@ -110,7 +110,7 @@ def main() -> None:
         return
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(args.tokenizer)
+    tok = Tokenizer.from_file(args.tokenizer or str(checkpoint_dir() / "tokenizer.json"))
     firsts, news = [], []
     for i in range(args.convs):
         answer = f"{WORDS[i % len(WORDS)]}-{4000 + 731 * i}"

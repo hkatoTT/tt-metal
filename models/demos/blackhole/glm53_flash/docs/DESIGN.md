@@ -33,9 +33,9 @@ Per user, the KDA state is a fixed size (34 layers x 64 heads x 128 x 128), and 
 | `ttnn/` collectives | `row_all_reduce.py`, `row_ar2.py`, `col_collectives.py`, `col_row_rs.py`, `x2d_gather.py`, `kda_maps_x.py`: collectives over the fabric for the model's shapes |
 | `ttnn/` other ops | `dsa_absorb.py` (DSA's per-head absorb matmuls), `kda_d2.py` (KDA's verify-step prepare with the recurrence's state read ahead), `fc_ksplit.py` (a decode matmul with its K split over 3 cores a column), `w1_landing.py` (+ `w1_popular.json`: the L1 landing of the next MoE layer's expert weights), `prefix_store.py` (+ `prefix_keys.py`: the serving's prefix store) |
 | `ttnn/kernels/` | Kernels of the small device steps run through `ttnn.generic_op` |
-| `checkpoint.py`, `config.py`, `paths.py` | The pinned checkpoint revision and memory-mapped tensor access; the model's shape, checked against what the port implements; where files live |
-| `tools/` | Checkpoint download, CPU reference runs, task sets, the vLLM adapter (`glm53_vllm.py`, `glm53_vllm_scheduler.py`, `vllm_bundle/`) and checks |
-| `tests/`, `demo/` | Tests (CPU and device) and the demo |
+| `checkpoint.py`, `config.py`, `paths.py` | The pinned checkpoint revision and memory-mapped tensor access; the model's shape, checked against what the port implements; where files live (`GLM53_CHECKPOINT`, or `HF_MODEL` checked to be this model's checkpoint) |
+| `tools/` | Checkpoint download, CPU reference runs, task sets, the vLLM adapter (`glm53_vllm.py`, `glm53_vllm_scheduler.py`, `vllm_bundle/`), the server's launcher (`serve.py`) and checks |
+| `tests/`, `demo/` | Tests (CPU and device) and the demo (its options in `demo/conftest.py`, sample prompts in `demo/sample_prompts/`) |
 
 The C++ ops the model uses are under `ttnn/cpp/ttnn/operations/experimental/`: `kda/` (the KDA decode and chunked
 prefill ops), `deepseek_prefill/` (the mHC ops `mhc_stream_read`, `mhc_stream_write`, `mhc_stream_mix`,
@@ -218,6 +218,10 @@ weights.
 
 ## 7. Serving
 
+- `tools/serve.py` writes the server's command out from a few settings (seats, context length, port, paths): the
+  plugin's environment, DFlash2's drafts a step by seats (the rule the adapter enforces), chunked prefill with
+  `Glm53Scheduler`, and the `tt` block with a trace region by context length; it then runs the server in its own
+  process.
 - `tools/glm53_vllm.py` adapts the generator to the vLLM TT plugin: vLLM's seats map to the generator's seats
   interleaved over the mesh rows, so a batch of new requests lands on different rows and prefills in one wave. vLLM's
   paged KV cache is accepted and ignored: the generator keeps every seat's KDA state and DSA cache.

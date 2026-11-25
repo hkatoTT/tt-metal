@@ -62,6 +62,10 @@ export GLM53_CHECKPOINT=<checkpoint dir>
 - `--verify-only` checks the files without fetching. A file that fails is deleted, so running the tool again fetches it;
   files already verified (same size and modification time) are not hashed again.
 
+`HF_MODEL`, the name other tt-metal demos use, works too: it is read when `GLM53_CHECKPOINT` is not set
+(`GLM53_CHECKPOINT` wins when both are), and only if it is a local directory with GLM-5.3-Flash-BF16's `config.json`
+(not a Hugging Face hub id, not another model's directory: the run stops with a message naming both variables).
+
 The DFlash2 drafter for speculative decoding:
 ```
 huggingface-cli download canada-quant/GLM-5.3-Flash-DFlash2-G --local-dir <drafter dir>
@@ -73,7 +77,8 @@ Other paths:
 - `GLM53_OUT_DIR` (default `./glm53_out`): results that tests and tools write.
 
 Loading the real weights takes about 3 minutes (the BF16 matrices are converted to BFP8 as they load, on several
-host threads, with the checkpoint read ahead).
+host threads, with the checkpoint read ahead). How long a first run takes in all is under
+[How long a first run takes](#how-long-a-first-run-takes).
 
 ## How to Run
 ### Running the Demo
@@ -84,22 +89,70 @@ The demo loads the model and the drafter, renders the prompt with the checkpoint
 decodes up to 256 new tokens greedily with DFlash2 (K = 7), then prints the text and the decode speed. Without
 `GLM53_DFLASH2_DRAFTER` it uses the plain greedy decode (one token a step).
 
-Options (environment variables):
-- `GLM53_DEMO_PROMPT`: the prompt (default: a short question).
-- `GLM53_DEMO_PROMPTS`: a JSON file with several prompts instead, a list of strings or of `{"prompt": ...}` objects (up
-  to 64; prompt i runs on mesh row i % 8).
-- `GLM53_DEMO_MAX_NEW`: new tokens per prompt at most (default 256; a prompt stops earlier at an end token).
-- `GLM53_DEMO_REASONING`: the chat template's reasoning effort, `low` (default), `high` or `max` (the template's own
-  default: a long reasoning part first).
-- `GLM53_DEMO_K`: DFlash2's drafts per step, 1 to 7 (default 7).
-- `GLM53_SYNTHETIC_WEIGHTS=1`: random weights made on the device; loads in seconds, the text is noise.
+Options: pytest command-line options named as in the other tt-metal demos, and environment variables. An option
+overrides its environment variable.
 
-For example:
+| Option | Environment variable | Default | Effect |
+|---|---|---|---|
+| `--input_prompts FILE` | `GLM53_DEMO_PROMPTS` | one prompt | A JSON file of prompts: a list of strings or of `{"prompt": ...}` objects, up to 64; prompt i runs on mesh row i % 8 |
+| | `GLM53_DEMO_PROMPT` | a short question | The one prompt when no file is given |
+| `--max_generated_tokens N` | `GLM53_DEMO_MAX_NEW` | 256 | New tokens a prompt at most (a prompt stops earlier at an end token) |
+| `--batch_size N` | | the prompts given | The prompts repeated (or cut) to N, 1 to 64: N users |
+| `--max_seq_len N` | | room for the longest prompt and its new tokens | The cache a user, in tokens, rounded up to a multiple of 512 (at least 1,024). Past 2,051 tokens the DSA cache takes its long-context form, and the warm-up compiles more prefill forms |
+| | `GLM53_DEMO_REASONING` | `low` | The chat template's reasoning effort: `low`, `high` or `max` (the template's own default: a long reasoning part first) |
+| | `GLM53_DEMO_K` | 7 | DFlash2's drafts a step, 1 to 7 |
+| | `GLM53_SYNTHETIC_WEIGHTS=1` | | Random weights made on the device; loads in seconds, the text is noise |
+
+For example, the 8 sample questions of [demo/sample_prompts/questions.json](demo/sample_prompts/questions.json) (one a
+mesh row: 8 users), 128 new tokens each:
 ```
-GLM53_DEMO_PROMPT="Write a haiku about the sea." GLM53_DEMO_MAX_NEW=128 pytest models/demos/blackhole/glm53_flash/demo/demo.py
+pytest models/demos/blackhole/glm53_flash/demo/demo.py \
+  --input_prompts models/demos/blackhole/glm53_flash/demo/sample_prompts/questions.json --max_generated_tokens 128
 ```
-Every decode step runs all 8 x (users per row) seats of the mesh, so with a single prompt the reported speed is that of
-one user in a batch of 8.
+It logs the load and the warm-up, each prompt and its output, and the speed (a first run with the real weights; two of the eight outputs, without the log's time and source columns. With the reasoning effort `low` the answer follows `</think>` at once):
+```
+loaded in 201 s: 8 prompts (models/demos/blackhole/glm53_flash/demo/sample_prompts/questions.json), 1 a mesh row, cache 1024
+warmed up in 244 s; DFlash2 with K = 7
+
+PROMPT: Write a haiku about a lighthouse in winter.
+OUTPUT (23 tokens): </think>Frost grips the white tower—
+its lone beam sweeps frozen waves,
+guiding no ships home.
+
+PROMPT: What is 17 times 23? Show your working.
+OUTPUT (91 tokens): </think># 17 × 23
+
+**Method: Split 23 into 20 + 3**
+
+- 17 × 20 = 340
+- 17 × 3 = 51
+- 340 + 51 = **391**
+
+**Check:** 17 × 23 = 17 × 23... using (20 − 3)(20 + 3) = 400 − 9 = 391 ✓
+
+(... the six other prompts ...)
+prefill: 202 prompt tokens in 0.81 s (eager)
+decode: 770 tokens in 1.23 s, 41 steps of 30.0 ms; 625.7 tok/s in all, 78.2 tok/s a prompt; 3.38 tokens a step a prompt
+```
+Every decode step runs all 8 x (users per row) seats of the mesh, so with fewer than 8 prompts the reported speed is
+that of a batch of 8 users.
+
+### How long a first run takes
+Measured on one Galaxy with the checkpoint on a local NVMe drive, the demo above with the real weights and an empty
+kernel cache:
+- opening the mesh and starting the fabric: about 14 s;
+- loading the weights and the drafter (`loaded in`): 201 s;
+- the warm-up (`warmed up in`: compiling the kernels of the prefill and the decode, capturing the decode's trace):
+  244 s the first time. The compiled kernels stay in the kernel cache (`TT_METAL_CACHE`, default
+  `~/.cache/tt-metal-cache`; 4.0 GB after this run), and with them the warm-up took 33 s;
+- the prompts: under 3 s.
+
+In all 7 min 41 s (pytest's time), about 4 minutes once the kernels are cached.
+
+Starting the vLLM server takes longer: it loads the same weights, then compiles and captures the prefill's forms for
+every chunk start up to `--max-model-len`. With the kernel cache from earlier runs the server was ready after about
+6.5 min at `--max-model-len 2048`, 8 min at 4,096, 10.5 min at 9,216, 13 min at 33,792 and at 65,536 (also at 64
+seats) and 16 min at 132,096 (32 seats); the first start also compiles the kernels.
 
 ## Testing
 ### CPU tests (no device)
@@ -110,6 +163,9 @@ pytest models/demos/blackhole/glm53_flash/tests/test_generator_no_device.py \
   models/demos/blackhole/glm53_flash/tests/test_vllm_adapter_no_device.py \
   models/demos/blackhole/glm53_flash/tests/test_vllm_requests_no_device.py \
   models/demos/blackhole/glm53_flash/tests/test_prefix_no_device.py \
+  models/demos/blackhole/glm53_flash/tests/test_paths_no_device.py \
+  models/demos/blackhole/glm53_flash/tests/test_serve_no_device.py \
+  models/demos/blackhole/glm53_flash/tests/test_demo_options_no_device.py \
   --confcutdir=models/demos/blackhole/glm53_flash -p no:cacheprovider
 ```
 `tests/test_reference_vs_hf.py` and `tests/test_model_vs_hf.py` compare `tt/` with Transformers on the checkpoint (they
@@ -200,6 +256,7 @@ Environment variables read when the model is built (set them before starting the
 | Variable | Default | Effect |
 |---|---|---|
 | `GLM53_CHECKPOINT` | (required) | The BF16 checkpoint directory |
+| `HF_MODEL` | (unset) | Read in place of `GLM53_CHECKPOINT` when that is not set, if it is a local directory with GLM-5.3-Flash-BF16's `config.json` (else the run stops with a message) |
 | `GLM53_DFLASH2_DRAFTER` | (unset) | The DFlash2 drafter's directory |
 | `GLM53_DFLASH2` | `0` | vLLM: decode with DFlash2 speculative decoding |
 | `GLM53_DFLASH2_K` | by seats | vLLM: DFlash2's drafts per step (default 7 up to 32 seats, else 3) |
@@ -250,31 +307,65 @@ a Python environment that can import this tt-metal build, and add the Transforme
 pip install transformers==5.16.1
 ```
 
-Register the model with the plugin and choose the speculative decoding:
+Start the server with the release's settings (32 seats, DFlash2 with 7 drafts a step, contexts up to 33,792
+tokens):
 ```
-export EXTRA_MODELS_DIR=$TT_METAL_HOME/models/demos/blackhole/glm53_flash/tools/vllm_bundle
-export GLM53_DFLASH2=1
+export GLM53_CHECKPOINT=<checkpoint dir>        # (or HF_MODEL)
 export GLM53_DFLASH2_DRAFTER=<drafter dir>
-export MESH_DEVICE="(8, 4)"
-export TT_MESH_GRAPH_DESC_PATH=$TT_METAL_HOME/tt_metal/fabric/mesh_graph_descriptors/single_bh_galaxy_torus_xy_graph_descriptor.textproto
+python -m models.demos.blackhole.glm53_flash.tools.serve --seats 32 --max-model-len 33792
 ```
+- `--seats` (vLLM's `--max_num_seqs`): concurrent requests, a multiple of 8. The drafts a step follow it: 7 up to 32
+  seats, 3 above (`GLM53_DFLASH2_K` overrides both).
+- `--max-model-len`: the longest context a request can reach, prompt and output. The trace region follows it.
+- `--port` (default 8000), `--checkpoint` and `--drafter` (default: the variables above), `--tool-calls` (tool calls,
+  below), `--trace-region BYTES`.
+- `--print` prints the full command and exits. Flags after `--` go to vLLM after the script's own, and one the script
+  also sets replaces its value (e.g. `-- --uvicorn-log-level warning`, or `-- --additional-config '...'`).
+- The script runs the server in its own process, so Ctrl-C (SIGINT) stops the server, which shuts its engine down and
+  closes the mesh.
+- The server is ready after about 6.5 minutes at `--max-model-len 2048` and 13 minutes at 33,792, loading included
+  ([How long a first run takes](#how-long-a-first-run-takes)).
+- Coding agents send long prompts (with OpenCode, about 10K tokens of instructions and tool definitions a request):
+  use `--max-model-len 65536` or more, which starts in about the same 13 minutes. Each concurrent agent or subagent
+  takes a seat; for more than about 30, use `--seats 64` (3 drafts a step). Tried with OpenCode at 64 seats: up to 23
+  subagents running at once, about 50-60 tokens/s each, 81 % of their prefills resumed from the prefix store.
 
-Start the server (32 seats, DFlash2 with 7 drafts):
+The script runs this command (what `--print` shows, written here with `$TT_METAL_HOME`, `$GLM53_CHECKPOINT` and
+`$GLM53_DFLASH2_DRAFTER` for the paths; a `PYTHONPATH` already set follows the tt-metal root):
 ```
-python -m vllm.entrypoints.openai.api_server --model $GLM53_CHECKPOINT --served-model-name glm-5.3-flash \
-  --max_num_seqs 32 --block_size 64 --max-model-len 33792 --no-enable-prefix-caching \
-  --enable-chunked-prefill --max-num-batched-tokens 8192 \
+cd $TT_METAL_HOME && \
+EXTRA_MODELS_DIR=$TT_METAL_HOME/models/demos/blackhole/glm53_flash/tools/vllm_bundle \
+MESH_DEVICE='(8, 4)' \
+TT_MESH_GRAPH_DESC_PATH=$TT_METAL_HOME/tt_metal/fabric/mesh_graph_descriptors/single_bh_galaxy_torus_xy_graph_descriptor.textproto \
+GLM53_DFLASH2=1 \
+GLM53_DFLASH2_DRAFTER=$GLM53_DFLASH2_DRAFTER \
+PYTHONPATH=$TT_METAL_HOME \
+python -m vllm.entrypoints.openai.api_server \
+  --model $GLM53_CHECKPOINT \
+  --served-model-name glm-5.3-flash \
+  --max_num_seqs 32 \
+  --block_size 64 \
+  --max-model-len 33792 \
+  --no-enable-prefix-caching \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 8192 \
   --scheduler-cls models.demos.blackhole.glm53_flash.tools.glm53_vllm_scheduler.Glm53Scheduler \
-  --speculative-config '{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":7}' \
+  --speculative-config '{"method": "custom_class", "model": "vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 7}' \
   --hf-overrides '{"architectures": ["TTGlm5NextForConditionalGeneration"]}' \
-  --additional-config '{"tt": {"l1_small_size": 32768, "trace_region_size": 1073741824, "worker_l1_size": 1436288, "sample_on_device_mode": "decode_only", "prefill_chunk_alignment": 8192, "decode_interleave_prefill_steps": 1}}'
+  --additional-config '{"tt": {"l1_small_size": 32768, "trace_region_size": 1073741824, "worker_l1_size": 1436288, "sample_on_device_mode": "decode_only", "prefill_chunk_alignment": 8192, "decode_interleave_prefill_steps": 1}}' \
+  --override-generation-config '{"top_k": 32}' \
+  --port 8000
 ```
+About its settings:
 - `--max_num_seqs` must be a multiple of 8 (the users are spread over the 8 mesh rows).
 - `num_speculative_tokens` must equal the drafts per step the model uses: 7 up to 32 seats and 3 above, or
   `GLM53_DFLASH2_K`. The server refuses another value at start-up.
 - The trace region (`trace_region_size`, bytes a chip) holds the captured decode and prefill traces, whose number
   grows with `--max-model-len` (a long cache has more prefill forms): 1 GiB for 33,792 as above; 768 MiB is too small
-  there (the server stops at start-up) but enough for 2,048.
+  there (the server stops at start-up) but enough for 2,048; 2 GiB served 132,096 (the 128K rows of
+  [PERF.md](PERF.md#by-concurrency-and-input-length)). The script picks 768 MiB up to 2,048, 1 GiB up to 33,792 and
+  2 GiB above.
+- `--override-generation-config '{"top_k": 32}'` gives sampled requests a top-k the device draws from (below).
 - The model keeps its own per-seat state (KDA states, DSA caches), not vLLM's paged KV cache, so vLLM's own prefix
   caching stays off (`--no-enable-prefix-caching`). The model has its own prefix store instead (below).
 - With DFlash2, the server launches the next decode step while vLLM does its host work, also at the steps where
@@ -286,8 +377,8 @@ python -m vllm.entrypoints.openai.api_server --model $GLM53_CHECKPOINT --served-
   stops waiting once the waiting requests' summed wait reaches what one more prefill call would cost the decoding
   ones (100 ms each, `GLM53_PREFILL_BATCH_CALL_MS`), so at low concurrency a new request is prefilled within a decode
   step or two (`GLM53_PREFILL_BATCH_ADAPT=0`: always wait for 4 or 1.5 s).
-- `GLM53_MTP=1` (in place of `GLM53_DFLASH2=1`, with `"num_speculative_tokens": 1`) uses the model's own MTP layer as
-  the drafter instead (slower).
+- `GLM53_MTP=1` (in place of `GLM53_DFLASH2=1`, with `"num_speculative_tokens": 1`, by hand from the command above)
+  uses the model's own MTP layer as the drafter instead (slower).
 - `GLM53_PREFILL_CHUNK` sets the prefill chunk lengths (default `128,512,1024`).
 
 Send a request:
@@ -296,15 +387,16 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "Write a haiku about the sea."}], "max_tokens": 512, "temperature": 0}'
 ```
 
-**Tool calls**: add `--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47`.
+**Tool calls**: `--tool-calls` adds `--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47`.
 
 **Sampled requests** (temperature, top-p, top-k): on by default with DFlash2 when the installed plugin supports them
 (commit `ca7a182` or later; with an older plugin the server warns at start-up and takes greedy requests only;
-`GLM53_VLLM_SAMPLING=1` makes the start-up stop instead, `0` turns sampling off). Add
-`--override-generation-config '{"top_k": 32}'`. The device draws each token from the step's 32 most likely candidates
-and accepts the drafts against those draws, so speculative decoding keeps working with sampling. A request without a
-top-k (such as the model card's recommended temperature 1.0 / top-p 0.95) needs the whole vocabulary, which the device
-does not handle, so the server's default top-k of 32 keeps those requests on the device. Requests with controls the
+`GLM53_VLLM_SAMPLING=1` makes the start-up stop instead, `0` turns sampling off), with
+`--override-generation-config '{"top_k": 32}'` (the script sets it). The device draws each token from the step's 32
+most likely candidates and accepts the drafts against those draws, so speculative decoding keeps working with
+sampling. A request without a top-k (such as the model card's recommended temperature 1.0 / top-p 0.95, the server's
+defaults from the checkpoint's `generation_config.json`) needs the whole vocabulary, which the device does not handle,
+so the server's default top-k of 32 keeps those requests on the device. Requests with controls the
 device does not draw (repetition penalties, logprobs, a grammar or token filter, min_tokens, a top-k above 32) are
 refused with HTTP 400 naming the control. `GLM53_VLLM_HOST_SAMPLING=allow` serves them instead: while one of them is in
 the batch, every step reads the full logits back to the host for the plugin's acceptance, which slows the whole batch
@@ -335,9 +427,40 @@ e.g. 65536; the prefix store needs chunked prefill).
   GLM53_DFLASH2=0 python -m models.demos.blackhole.glm53_flash.tools.vllm_offline_check --model $GLM53_CHECKPOINT
   ```
 - Against a running server: `python models/demos/blackhole/glm53_flash/tools/vllm_tool_check.py --port <port>` (tool
-  calls), `vllm_sampling_check.py --port <port>` (sampled requests on the device and the host paths) and
-  `vllm_chunked_check.py --port <port>` (long prompts arriving while others decode, with and without chunked prefill),
-  `vllm_prefix_check.py --port <port>` (multi-turn conversations through the prefix store).
+  calls: a server started with `--tool-calls`), `vllm_sampling_check.py --port <port>` (sampled requests on the device
+  and the host paths) and `vllm_chunked_check.py --port <port>` (long prompts arriving while others decode, with and
+  without chunked prefill), `vllm_prefix_check.py --port <port>` (multi-turn conversations through the prefix store).
 
 Shut the engine down when a process that uses vLLM in-process ends (as `vllm_offline_check` does): a mesh left open
 at exit can keep the boards' Ethernet cores busy for the next process.
+
+## Troubleshooting
+Failures seen with this code, by the message they print:
+
+- **The mesh does not open**: `TT_THROW: Device 0: Timed out while waiting for active ethernet core 27-25 to become
+  active again. Try resetting the board.` An earlier process left the mesh open (it was killed, or it used vLLM
+  in-process and ended without shutting the engine down). Reset the Galaxy with `tt-smi -glx_reset` and run again.
+  Stop a server with SIGINT (Ctrl-C), not SIGKILL, so it closes the mesh.
+- **Trace region too small**, at start-up while the traces are captured: `TT_FATAL: Creating trace buffers of size
+  504111104B on MeshDevice 0, but only 503316480B is allocated for trace region.` Give the server a larger trace region
+  (`--trace-region` of `tools/serve.py`, or `trace_region_size` in the `tt` block), the demo and the tests
+  `GLM53_TRACE_REGION_MB`. A longer `--max-model-len` needs more ([vLLM Serving](#vllm-serving)).
+- **DRAM too small** for the seats and the context length: `TT_FATAL: Out of Memory: Not enough space to allocate
+  1610612736 B DRAM buffer across 8 banks, where each bank needs to store 201326592 B, but bank size is 4205232512 B
+  (allocated: ..., free: ..., largest free block: ...)` while the model builds its caches. Lower `--max-model-len` or
+  the seats: the longest context by number of users is in [PERF.md](PERF.md#decode) ("Max context"; 1M tokens a user
+  up to 64 users, 576K at 128), and the server's trace region takes from the same DRAM.
+- **num_speculative_tokens does not match**: `... refused speculation at max_num_seqs=64, num_speculative_tokens=7:
+  DFlash2 at 64 seats drafts 3 a step; supported draft lengths at max_num_seqs=64: [3]. Change --spec-tokens or
+  --max-num-seqs, or drop the speculative flags`. The drafts a step must be 7 up to 32 seats and 3 above (or
+  `GLM53_DFLASH2_K`); `tools/serve.py` sets them from `--seats`.
+- **Seats not a multiple of 8**: `max_num_seqs (12) must be a multiple of the 8 mesh rows`, after the mesh opened.
+  `tools/serve.py` refuses such `--seats` before it starts anything.
+- **Chunked prefill's flags missing**: `GLM-5.3-Flash's chunked prefill (GLM53_VLLM_CHUNKED=1) needs: ...` with what
+  is missing or different (for example `a step's prompt tokens 2048 (--max-num-batched-tokens equal to the
+  alignment)`, or the scheduler). vLLM 0.31 turns chunked prefill on by default, so a command without these flags
+  stops here: use the flags of the command above, or `GLM53_VLLM_CHUNKED=0` / `--no-enable-chunked-prefill` for whole
+  prompts.
+- **No checkpoint**: `GLM53_CHECKPOINT is not set (nor HF_MODEL): ...`, or `HF_MODEL='...' is not a GLM-5.3-Flash-BF16
+  checkpoint directory: ...` when `HF_MODEL` names a hub id or another model (other demos often leave it set): set
+  `GLM53_CHECKPOINT`, which takes precedence.

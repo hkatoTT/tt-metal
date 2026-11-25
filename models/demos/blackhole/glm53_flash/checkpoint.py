@@ -65,7 +65,8 @@ _DTYPES = {
 
 
 def checkpoint_root(root: Path | str | None = None) -> Path:
-    """The checkpoint directory: the argument, else ``$GLM53_CHECKPOINT`` (`paths.checkpoint_dir`)."""
+    """The checkpoint directory: the argument, else ``$GLM53_CHECKPOINT``, else ``$HF_MODEL``
+    (`paths.checkpoint_dir`)."""
     from models.demos.blackhole.glm53_flash.paths import checkpoint_dir
 
     return checkpoint_dir(root)

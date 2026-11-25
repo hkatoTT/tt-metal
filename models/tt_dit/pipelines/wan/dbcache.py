@@ -22,6 +22,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.tt_dit.models.transformers.wan2_2.cfg_batching import join_passes, split_passes
 from models.tt_dit.utils.dbcache import DBCacheConfig, DBCacheContext
 from models.tt_dit.utils.dbcache_runner import ResidualForecaster
 from models.tt_dit.utils.tensor import from_torch
@@ -220,6 +221,30 @@ class ExpertCacheRunner:
             self.prev_fn_norm[branch] = norm
         return norm
 
+    # ------------------------------------------------------------------ cache decision
+    def _decide_branch(self, branch: int, sums_1B12: ttnn.Tensor) -> tuple[bool, float | None, str, float | None]:
+        """Whether ``branch`` reuses its cached residual this step.
+
+        Returns ``(use_cache, cur_norm, decision, diff)``: ``decision`` is the gate's answer, and on a dynamic one
+        ``diff`` is the relative L1 diff of the Fn residual, read back with ``cur_norm`` (sum|fn|, None if not read).
+        """
+        ctx = self.context
+        decision = ctx.gate(branch)
+        if decision != "dynamic":
+            return decision == "cache", None, decision, None
+        diff_sum, cur_norm = self.read_sums(sums_1B12)
+        prev_norm = self._prev_norm(branch)
+        diff = diff_sum / prev_norm if prev_norm > 0.0 else float("inf")
+        return ctx.decide(branch, diff), cur_norm, decision, diff
+
+    def _record_computed(
+        self, branch: int, fn_residual: ttnn.Tensor, cur_norm: float | None, bn_residual: ttnn.Tensor
+    ) -> None:
+        """Keep the residuals of a step in which ``branch`` computed the middle blocks."""
+        ttnn.copy(fn_residual, self.prev_fn_residual[branch])
+        self.prev_fn_norm[branch] = cur_norm  # None if not read this step -> computed lazily
+        self.forecasters[branch].update(bn_residual, self.context.current_step)
+
     def _tick(self, key: str, t0: float) -> float:
         """Profiling helper: synchronize, record elapsed since ``t0`` under ``key``, return now."""
         if not self.profile_enabled:
@@ -323,16 +348,7 @@ class ExpertCacheRunner:
 
             t0 = self._tick("head", t0)
 
-            decision = ctx.gate(branch)
-            diff = None
-            cur_norm: float | None = None
-            if decision == "dynamic":
-                diff_sum, cur_norm = self.read_sums(sums_1B12)
-                prev_norm = self._prev_norm(branch)
-                diff = diff_sum / prev_norm if prev_norm > 0.0 else float("inf")
-                use_cache = ctx.decide(branch, diff)
-            else:
-                use_cache = decision == "cache"
+            use_cache, cur_norm, decision, diff = self._decide_branch(branch, sums_1B12)
             t0 = self._tick("decide", t0)
 
             forecaster = self.forecasters[branch]
@@ -352,9 +368,7 @@ class ExpertCacheRunner:
                     num_bn_blocks=cfg.Bn_compute_blocks,
                     traced=traced,
                 )
-                ttnn.copy(fn_residual, self.prev_fn_residual[branch])
-                self.prev_fn_norm[branch] = cur_norm  # None if not read this step -> computed lazily
-                forecaster.update(bn_residual, ctx.current_step)
+                self._record_computed(branch, fn_residual, cur_norm, bn_residual)
                 ctx.add_computed_step(branch)
                 t0 = self._tick("body", t0)
 
@@ -427,16 +441,7 @@ class ExpertCacheRunner:
         use_cache: list[bool] = []
         cur_norms: list[float | None] = []
         for branch in range(self.NUM_BRANCHES):
-            decision = ctx.gate(branch)
-            diff = None
-            cur_norm: float | None = None
-            if decision == "dynamic":
-                diff_sum, cur_norm = self.read_sums(sums[branch])
-                prev_norm = self._prev_norm(branch)
-                diff = diff_sum / prev_norm if prev_norm > 0.0 else float("inf")
-                branch_use_cache = ctx.decide(branch, diff)
-            else:
-                branch_use_cache = decision == "cache"
+            branch_use_cache, cur_norm, decision, diff = self._decide_branch(branch, sums[branch])
             if branch_use_cache:
                 ctx.add_cached_step(branch)
             else:
@@ -450,16 +455,6 @@ class ExpertCacheRunner:
         t0 = self._tick("decide", t0)
 
         body_kwargs = {"num_fn_blocks": cfg.Fn_compute_blocks, "num_bn_blocks": cfg.Bn_compute_blocks, **rope}
-        n, d = spatial_1BND.shape[2] // 2, spatial_1BND.shape[3]
-
-        def halves(t: ttnn.Tensor) -> list[ttnn.Tensor]:
-            return [ttnn.slice(t, [0, 0, start, 0], [1, 1, start + n, d]) for start in (0, n)]
-
-        def record_computed(branch: int, bn_residual: ttnn.Tensor) -> None:
-            ttnn.copy(fn_residuals[branch], self.prev_fn_residual[branch])
-            self.prev_fn_norm[branch] = cur_norms[branch]  # None if not read this step -> computed lazily
-            self.forecasters[branch].update(bn_residual, ctx.current_step)
-
         if not any(use_cache):
             spatial_1BND, bn_residual = model.cache_body(
                 spatial_1BND,
@@ -469,11 +464,11 @@ class ExpertCacheRunner:
                 negative_prompt_1BLP=negative_prompt_1BLP,
                 **body_kwargs,
             )
-            for branch, branch_bn_residual in enumerate(halves(bn_residual)):
-                record_computed(branch, branch_bn_residual)
+            for branch, branch_bn_residual in enumerate(split_passes(bn_residual)):
+                self._record_computed(branch, fn_residuals[branch], cur_norms[branch], branch_bn_residual)
             t0 = self._tick("body", t0)
         else:
-            parts = halves(spatial_1BND)
+            parts = list(split_passes(spatial_1BND))
             for branch in range(self.NUM_BRANCHES):
                 if use_cache[branch]:
                     parts[branch] = self.forecasters[branch].apply(parts[branch], ctx.current_step)
@@ -481,8 +476,8 @@ class ExpertCacheRunner:
                     parts[branch], bn_residual = model.cache_body(
                         parts[branch], prompts_1BLP[branch], timestep_proj_1BTD, N, **body_kwargs
                     )
-                    record_computed(branch, bn_residual)
-            spatial_1BND = ttnn.concat(parts, dim=2)
+                    self._record_computed(branch, fn_residuals[branch], cur_norms[branch], bn_residual)
+            spatial_1BND = join_passes(*parts)
             t0 = self._tick("body" if not all(use_cache) else "apply_cache", t0)
 
         outputs = model.cache_tail_cfg(

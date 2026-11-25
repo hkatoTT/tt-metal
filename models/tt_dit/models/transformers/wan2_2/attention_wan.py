@@ -19,6 +19,7 @@ from ....parallel.manager import CCLManager
 from ....utils.matmul import get_matmul_config, register_matmul_configs
 from ....utils.substate import pop_substate, rename_substate
 from ....utils.tensor import bf16_tensor
+from .cfg_batching import fold_heads, join_passes, passes_as_batch, split_passes, unfold_heads
 
 # Optimal attention projection blockings for the CFG-batched rows (WanTransformer3DModel.inner_step_cfg) on WH
 # Galaxy 4x8, at 480p and 720p.
@@ -30,12 +31,6 @@ register_matmul_configs(
         }
     }
 )
-
-
-def _fold_heads(t: ttnn.Tensor) -> ttnn.Tensor:
-    """[1, H, 2m, E] -> [1, 2H, m, E] (a view). With the rows of the two CFG passes stacked pass-major within each
-    head, as in the head-split norm output of the stacked rows, head 2h + b becomes pass b of head h."""
-    return ttnn.reshape(t, (1, 2 * t.shape[1], t.shape[2] // 2, t.shape[3]))
 
 
 class WanAttention(Module):
@@ -230,16 +225,24 @@ class WanAttention(Module):
         pass_workers = self.sdpa_worker_grid[0] * self.sdpa_worker_grid[1]
         return math.ceil(2 * chunks / fold_workers) < 2 * math.ceil(chunks / pass_workers)
 
+    def _dummy_joint_input(self, *, folded: bool = False) -> ttnn.Tensor:
+        """The empty joint input of the ring SDPA, cast to its input dtype."""
+        dummy_joint = self.fold_dummy_joint_input if folded else self.dummy_joint_input
+        sdpa_input_dtype = getattr(self, "_sdpa_input_dtype", None)
+        if sdpa_input_dtype is not None and dummy_joint.dtype != sdpa_input_dtype:
+            dummy_joint = ttnn.typecast(dummy_joint, sdpa_input_dtype)
+        return dummy_joint
+
     def _ring_sdpa(
         self,
         q_BHNE: ttnn.Tensor,
         k_BHNE: ttnn.Tensor,
         v_BHNE: ttnn.Tensor,
-        dummy_joint: ttnn.Tensor,
         N: int | ttnn.Tensor,
         *,
-        folded: bool,
+        folded: bool = False,
     ) -> ttnn.Tensor:
+        dummy_joint = self._dummy_joint_input(folded=folded)
         if folded:
             # folded heads: workers on the first rows, CCL on the last row
             program_config = self.fold_ring_sdpa_program_config
@@ -279,6 +282,102 @@ class WanAttention(Module):
             use_column_major_ccl=use_column_major_ccl,
         )
         return spatial_BHNE
+
+    def _sdpa(
+        self,
+        q_BHNE: ttnn.Tensor,
+        k_BHNE: ttnn.Tensor,
+        v_BHNE: ttnn.Tensor,
+        attn_mask: ttnn.Tensor | None = None,
+    ) -> ttnn.Tensor:
+        return ttnn.transformer.scaled_dot_product_attention(
+            q_BHNE,
+            k_BHNE,
+            v_BHNE,
+            is_causal=False,
+            attn_mask=attn_mask,
+            program_config=self.sdpa_program_config,
+            compute_kernel_config=self.sdpa_compute_kernel_config,
+        )
+
+    def _self_attention_sdpa(
+        self,
+        q_BHNE: ttnn.Tensor,
+        k_BHNE: ttnn.Tensor,
+        v_BHNE: ttnn.Tensor,
+        N: int | ttnn.Tensor,
+        *,
+        cfg_batched: bool,
+    ) -> ttnn.Tensor:
+        """Self-attention SDPA. With cfg_batched, Q / K / V hold the rows of both CFG passes ([1, H, 2n, E]) and each
+        pass attends within itself: the passes are folded into the heads for one SDPA call, or, where one ring SDPA
+        per pass splits the work better (see _folds_ring_sdpa), each pass runs its own ring SDPA."""
+        if self.parallel_config.sequence_parallel.factor == 1:
+            if cfg_batched:
+                return unfold_heads(self._sdpa(fold_heads(q_BHNE), fold_heads(k_BHNE), fold_heads(v_BHNE)))
+            return self._sdpa(q_BHNE, k_BHNE, v_BHNE)
+
+        # Q and K already cast by norm kernel; cast V (and, in the ring SDPA calls, the dummy joint inputs) to match
+        sdpa_input_dtype = getattr(self, "_sdpa_input_dtype", None)
+        if sdpa_input_dtype is not None and v_BHNE.dtype != sdpa_input_dtype:
+            v_BHNE = ttnn.typecast(v_BHNE, sdpa_input_dtype)
+
+        # HACK: pass null joint inputs to take advantage of ring attention, even though this is self-attention.
+        if self.use_exp_ring_sdpa:
+            dummy_joint = self._dummy_joint_input()
+            spatial_BHNE, _prompt_BHLE, _lse = ttnn.transformer.exp_ring_joint_scaled_dot_product_attention(
+                q_BHNE,
+                k_BHNE,
+                v_BHNE,
+                dummy_joint,
+                dummy_joint,
+                dummy_joint,
+                persistent_output_buffer_k=self.ccl_manager.get_ag_ping_pong_buffer(
+                    k_BHNE.shape, 2, self.parallel_config.sequence_parallel.mesh_axis, dtype=k_BHNE.dtype
+                ),
+                persistent_output_buffer_v=self.ccl_manager.get_ag_ping_pong_buffer(
+                    v_BHNE.shape, 2, self.parallel_config.sequence_parallel.mesh_axis, dtype=v_BHNE.dtype
+                ),
+                joint_strategy="rear",
+                logical_n=N,
+                program_config=self.exp_ring_sdpa_program_config,
+                compute_kernel_config=self.sdpa_compute_kernel_config,
+                dim=2,
+                multi_device_global_semaphore=self.ccl_manager.get_exp_ring_ping_pong_semaphore(
+                    self.parallel_config.sequence_parallel.mesh_axis
+                ),
+                num_links=self.ccl_manager.num_links,
+                cluster_axis=self.parallel_config.sequence_parallel.mesh_axis,
+                mesh_device=self.mesh_device,
+                topology=self.ccl_manager.topology,
+                subdevice_id=self.ccl_manager.ccl_sub_device_id,
+                num_workers_per_link=5,
+                num_buffers_per_channel=32,
+            )
+            return spatial_BHNE
+
+        if not cfg_batched:
+            return self._ring_sdpa(q_BHNE, k_BHNE, v_BHNE, N)
+        if self._folds_ring_sdpa(q_BHNE.shape[2] // 2):
+            q, k, v = (fold_heads(t) for t in (q_BHNE, k_BHNE, v_BHNE))
+            return unfold_heads(self._ring_sdpa(q, k, v, N, folded=True))
+        passes = zip(split_passes(q_BHNE), split_passes(k_BHNE), split_passes(v_BHNE))
+        return join_passes(*(self._ring_sdpa(q, k, v, N) for q, k, v in passes))
+
+    def _cross_attention_sdpa(
+        self,
+        q_BHNE: ttnn.Tensor,
+        k_BHNE: ttnn.Tensor,
+        v_BHNE: ttnn.Tensor,
+        attn_mask: ttnn.Tensor | None,
+        *,
+        cfg_batched: bool,
+    ) -> ttnn.Tensor:
+        """Cross-attention SDPA. With cfg_batched, Q holds the rows of both CFG passes ([1, H, 2n, E]) and K / V are
+        folded per prompt ([1, 2H, L, E], see _cross_attention_kv), so Q is folded the same way."""
+        if cfg_batched:
+            return unfold_heads(self._sdpa(fold_heads(q_BHNE), k_BHNE, v_BHNE))
+        return self._sdpa(q_BHNE, k_BHNE, v_BHNE, attn_mask=attn_mask)
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "to_out.0", "to_out")
@@ -351,8 +450,9 @@ class WanAttention(Module):
     def _cross_attention_kv(self, prompt_1BLP: ttnn.Tensor, negative_prompt_1BLP: ttnn.Tensor | None = None):
         """Head-split cross-attention K and V of the prompt: [1, H, L, E] each.
 
-        With the uncond prompt as well (CFG batching), the K / V of the two prompts are joined per head and folded
-        like the query: [1, 2H, L, E], head 2h + b holds prompt b (0 = cond, 1 = uncond) of head h.
+        With the uncond prompt as well (CFG batching), the K / V of the two prompts are stacked and folded into the
+        heads like the query (see cfg_batching): [1, 2H, L, E], head 2h + b holds prompt b (0 = cond, 1 = uncond) of
+        head h.
         """
         prompts = (prompt_1BLP,) if negative_prompt_1BLP is None else (prompt_1BLP, negative_prompt_1BLP)
         key = tuple(id(p) for p in prompts)
@@ -367,7 +467,7 @@ class WanAttention(Module):
         if len(prompts) == 1:
             kv = (ks[0], vs[0])
         else:
-            kv = (_fold_heads(ttnn.concat(ks, dim=2)), _fold_heads(ttnn.concat(vs, dim=2)))
+            kv = (fold_heads(join_passes(*ks)), fold_heads(join_passes(*vs)))
         if self._cross_kv_cache_enabled:
             self._cross_kv_cache[key] = (prompts, kv)
         return kv
@@ -464,8 +564,8 @@ class WanAttention(Module):
         trans_mat: ttnn.Tensor | None = None,
         addcmul_residual: ttnn.Tensor | None = None,
         addcmul_gate: ttnn.Tensor | None = None,
-        cfg_batch: int = 1,
         negative_prompt_1BLP: ttnn.Tensor | None = None,
+        cfg_batched: bool = False,
     ) -> ttnn.Tensor:
         """
         spatial_1BND: fractured N on SP, fracturd D on TP
@@ -477,14 +577,10 @@ class WanAttention(Module):
         trans_mat: replicated
         addcmul_residual: (optional) residual tensor for fused matmul+addcmul (self-attn only)
         addcmul_gate: (optional) gate tensor for fused matmul+addcmul (self-attn only)
-        cfg_batch: 2 when spatial_1BND holds the rows of both classifier-free guidance passes, stacked per
-            device ([1, 1, 2n, D]: cond rows, then uncond rows). Row-wise ops run once on the 2n rows, and
-            attention folds the passes into the head dim ([1, 2H, n, E], head 2h + b is pass b of head h):
-            self-attention runs one ring SDPA, and cross-attention gives each folded head the K/V of its
-            own prompt. Where one ring SDPA per pass splits its work better (see _folds_ring_sdpa),
-            self-attention keeps the passes unfolded and runs each on its half of the rows of every head.
-        negative_prompt_1BLP: (cross-attention with cfg_batch == 2) the uncond prompt, laid out like prompt_1BLP,
-            which is then the cond one.
+        negative_prompt_1BLP: (cross-attn with cfg_batched) the uncond prompt, laid out like prompt_1BLP, which is
+            then the cond one
+        cfg_batched: spatial_1BND holds the rows of both classifier-free guidance passes (see cfg_batching); each
+            pass attends within itself, and cross-attention attends to the prompt of its pass
 
         If prompt_1BLP is not provided, run self-attention.
         Otherwise, run cross-attention on prompt.
@@ -503,27 +599,12 @@ class WanAttention(Module):
             assert trans_mat is not None
             assert prompt_1BLP is None
 
-        assert cfg_batch in (1, 2)
-        assert negative_prompt_1BLP is None or (cfg_batch == 2 and not self.is_self_attn)
-        if cfg_batch == 2:
+        if cfg_batched:
             assert not self.use_exp_ring_sdpa, "CFG batching is not supported with the experimental ring SDPA"
-            if not self.is_self_attn:
-                assert negative_prompt_1BLP is not None, "CFG-batched cross-attention needs the uncond prompt"
-                assert cross_attn_mask is None, "CFG batching does not support a cross-attention mask"
-
-        def split_passes(t):
-            # [1, 1, 2n, F] -> [1, 2, n, F], the batched layout the fused distributed RMSNorm accepts (a view)
-            return ttnn.reshape(t, (1, 2, t.shape[2] // 2, t.shape[3])) if cfg_batch == 2 else t
-
-        ring_sdpa_per_pass = (
-            cfg_batch == 2
-            and self.is_self_attn
-            and self.parallel_config.sequence_parallel.factor > 1
-            and not self._folds_ring_sdpa(spatial_1BND.shape[2] // 2)
-        )
-
-        def fold_passes(t):
-            return _fold_heads(t) if cfg_batch == 2 and not ring_sdpa_per_pass else t
+            assert cross_attn_mask is None, "CFG batching does not support a cross-attention mask"
+        assert (negative_prompt_1BLP is not None) == (
+            cfg_batched and not self.is_self_attn
+        ), "CFG-batched cross-attention takes the uncond prompt, and nothing else does"
 
         use_nonfused_agmm = (self.ccl_manager.topology == ttnn.Topology.Linear) and (
             self.parallel_config.tensor_parallel.factor > 1
@@ -538,6 +619,18 @@ class WanAttention(Module):
         use_ring_sdpa = self.parallel_config.sequence_parallel.factor > 1
         norm_output_dtype = sdpa_input_dtype if (use_ring_sdpa and prompt_1BLP is None) else None
 
+        # Norm spatial before splitting heads. Both CFG passes go to the norm as a batch of 2, so that RoPE
+        # applies to each pass; the output keeps the rows of each head in pass order ([1, H, 2n, E]).
+        def norm_heads(norm, x_1BNF):
+            return norm(
+                passes_as_batch(x_1BNF) if cfg_batched else x_1BNF,
+                num_heads_per_device=self.n_local_heads,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                trans_mat=trans_mat,
+                dtype=norm_output_dtype,
+            )
+
         if self.is_self_attn:
             # Fused QKV matmul with split output for self-attention
             q_1BNF, k_1BNF, v_1BNF = self.to_qkv(
@@ -545,6 +638,10 @@ class WanAttention(Module):
                 compute_kernel_config=self.mm_compute_kernel_config,
                 parallel_config=None if use_nonfused_agmm else self.parallel_config,
             )
+            q_BHNE = norm_heads(self.norm_q, q_1BNF)
+            k_BHNE = norm_heads(self.norm_k, k_1BNF)
+            v_BHNE = self._create_heads(v_1BNF)
+            spatial_BHNE = self._self_attention_sdpa(q_BHNE, k_BHNE, v_BHNE, N, cfg_batched=cfg_batched)
         else:
             # Cross-attention: Q from spatial, fused KV from prompt
             assert prompt_1BLP is not None
@@ -553,115 +650,10 @@ class WanAttention(Module):
                 compute_kernel_config=self.mm_compute_kernel_config,
                 parallel_config=None if use_nonfused_agmm else self.parallel_config,
             )
-
-        # Norm spatial before splitting heads
-        q_BHNE = fold_passes(
-            self.norm_q(
-                split_passes(q_1BNF),
-                num_heads_per_device=self.n_local_heads,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                trans_mat=trans_mat,
-                dtype=norm_output_dtype,
-            )
-        )
-        if self.is_self_attn:
-            k_BHNE = fold_passes(
-                self.norm_k(
-                    split_passes(k_1BNF),
-                    num_heads_per_device=self.n_local_heads,
-                    rope_cos=rope_cos,
-                    rope_sin=rope_sin,
-                    trans_mat=trans_mat,
-                    dtype=norm_output_dtype,
-                )
-            )
-            # V of the stacked passes splits into [1, H, 2n, E] like the norm output
-            v_BHNE = fold_passes(self._create_heads(v_1BNF))
-        else:
+            q_BHNE = norm_heads(self.norm_q, q_1BNF)
             k_BHNE, v_BHNE = self._cross_attention_kv(prompt_1BLP, negative_prompt_1BLP)
+            spatial_BHNE = self._cross_attention_sdpa(q_BHNE, k_BHNE, v_BHNE, cross_attn_mask, cfg_batched=cfg_batched)
 
-        if prompt_1BLP is None:
-            # Self attention
-            if self.parallel_config.sequence_parallel.factor > 1:
-                # Q and K already cast by norm kernel; cast V and dummy joint inputs to match
-                folded = cfg_batch == 2 and not ring_sdpa_per_pass
-                dummy_joint = self.fold_dummy_joint_input if folded else self.dummy_joint_input
-                if sdpa_input_dtype is not None:
-                    if v_BHNE.dtype != sdpa_input_dtype:
-                        v_BHNE = ttnn.typecast(v_BHNE, sdpa_input_dtype)
-                    if dummy_joint.dtype != sdpa_input_dtype:
-                        dummy_joint = ttnn.typecast(dummy_joint, sdpa_input_dtype)
-
-                # HACK: pass null joint inputs to take advantage of ring attention, even though this is self-attention.
-                if self.use_exp_ring_sdpa:
-                    spatial_BHNE, prompt_BHLE, _lse = ttnn.transformer.exp_ring_joint_scaled_dot_product_attention(
-                        q_BHNE,
-                        k_BHNE,
-                        v_BHNE,
-                        dummy_joint,
-                        dummy_joint,
-                        dummy_joint,
-                        persistent_output_buffer_k=self.ccl_manager.get_ag_ping_pong_buffer(
-                            k_BHNE.shape, 2, self.parallel_config.sequence_parallel.mesh_axis, dtype=k_BHNE.dtype
-                        ),
-                        persistent_output_buffer_v=self.ccl_manager.get_ag_ping_pong_buffer(
-                            v_BHNE.shape, 2, self.parallel_config.sequence_parallel.mesh_axis, dtype=v_BHNE.dtype
-                        ),
-                        joint_strategy="rear",
-                        logical_n=N,
-                        program_config=self.exp_ring_sdpa_program_config,
-                        compute_kernel_config=self.sdpa_compute_kernel_config,
-                        dim=2,
-                        multi_device_global_semaphore=self.ccl_manager.get_exp_ring_ping_pong_semaphore(
-                            self.parallel_config.sequence_parallel.mesh_axis
-                        ),
-                        num_links=self.ccl_manager.num_links,
-                        cluster_axis=self.parallel_config.sequence_parallel.mesh_axis,
-                        mesh_device=self.mesh_device,
-                        topology=self.ccl_manager.topology,
-                        subdevice_id=self.ccl_manager.ccl_sub_device_id,
-                        num_workers_per_link=5,
-                        num_buffers_per_channel=32,
-                    )
-                elif ring_sdpa_per_pass:
-                    # [1, H, 2n, E]: per head, the rows of pass 0 and then those of pass 1
-                    n = q_BHNE.shape[2] // 2
-                    pass_outputs = []
-                    for start in (0, n):
-                        q, k, v = (
-                            ttnn.slice(t, [0, 0, start, 0], [1, t.shape[1], start + n, t.shape[3]])
-                            for t in (q_BHNE, k_BHNE, v_BHNE)
-                        )
-                        pass_outputs.append(self._ring_sdpa(q, k, v, dummy_joint, N, folded=False))
-                    spatial_BHNE = ttnn.concat(pass_outputs, dim=2)
-                else:
-                    spatial_BHNE = self._ring_sdpa(q_BHNE, k_BHNE, v_BHNE, dummy_joint, N, folded=folded)
-            else:
-                spatial_BHNE = ttnn.transformer.scaled_dot_product_attention(
-                    q_BHNE,
-                    k_BHNE,
-                    v_BHNE,
-                    is_causal=False,
-                    program_config=self.sdpa_program_config,
-                    compute_kernel_config=self.sdpa_compute_kernel_config,
-                )
-        else:
-            # Cross attention
-            spatial_BHNE = ttnn.transformer.scaled_dot_product_attention(
-                q_BHNE,
-                k_BHNE,
-                v_BHNE,
-                is_causal=False,
-                attn_mask=cross_attn_mask,
-                program_config=self.sdpa_program_config,
-                compute_kernel_config=self.sdpa_compute_kernel_config,
-            )
-
-        if cfg_batch == 2 and not ring_sdpa_per_pass:
-            # [1, 2H, n, E] -> [1, H, 2n, E]: per head, the cond rows and then the uncond rows, like the input
-            _, h2, n, e = spatial_BHNE.shape
-            spatial_BHNE = ttnn.reshape(spatial_BHNE, (1, h2 // 2, 2 * n, e))
         spatial_1BND = ttnn.transformer.concatenate_heads(spatial_BHNE)
         spatial_1BND = ttnn.unsqueeze(spatial_1BND, 0)
 

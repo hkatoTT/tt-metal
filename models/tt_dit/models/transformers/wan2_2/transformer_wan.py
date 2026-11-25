@@ -38,6 +38,7 @@ from ....utils.padding import pad_vision_seq_parallel, torch_pad
 from ....utils.substate import pop_substate, rename_substate
 from ....utils.tensor import bf16_tensor, from_torch, unflatten
 from .attention_wan import WanAttention
+from .cfg_batching import split_passes, stack_passes
 
 # Optimal FFN blockings for the CFG-batched rows on WH Galaxy 4x8: ff1 at 720p, and ff2 fused with its reduce-scatter
 # and the residual addcmul at 480p and 720p (matmul on 8x7, reduce-scatter on the rows below it).
@@ -207,7 +208,7 @@ class WanTransformerBlock(Module):
         """
 
         assert temb_1BTD.shape[2] == 6, "wan2.2 14b expects 6 chunks in timestep embedding"
-        cfg_batch = 1 if negative_prompt_1BLP is None else 2
+        cfg_batched = negative_prompt_1BLP is not None
 
         shifted_temb_1BTD = self.scale_shift_table.data + temb_1BTD
         shift_msa_1B1D, scale_msa_1B1D, gate_msa_1B1D, c_shift_msa_1B1D, c_scale_msa_1B1D, c_gate_msa_1B1D = ttnn.chunk(
@@ -232,7 +233,7 @@ class WanTransformerBlock(Module):
             trans_mat=trans_mat,
             addcmul_residual=spatial_1BND,
             addcmul_gate=gate_msa_1B1D,
-            cfg_batch=cfg_batch,
+            cfg_batched=cfg_batched,
         )
 
         # Cross attention on prompt
@@ -244,7 +245,7 @@ class WanTransformerBlock(Module):
             prompt_1BLP=prompt_1BLP,
             negative_prompt_1BLP=negative_prompt_1BLP,
             cross_attn_mask=cross_attn_mask,
-            cfg_batch=cfg_batch,
+            cfg_batched=cfg_batched,
         )
         spatial_1BND = spatial_1BND + attn_output_1BND
 
@@ -689,6 +690,45 @@ class WanTransformer3DModel(Module):
                 rope_sin=rope_sin_1HND,
                 trans_mat=trans_mat,
             )
+        return self._project_out(spatial_1BND, temb_11BD, gather_output=gather_output)
+
+    def inner_step_cfg(
+        self,
+        spatial_1BNI,
+        prompt_1BLP,
+        negative_prompt_1BLP,
+        rope_cos_1HND,
+        rope_sin_1HND,
+        trans_mat,
+        N,
+        timestep,
+        gather_output=True,
+    ):
+        """inner_step for the cond and uncond passes of classifier-free guidance at once.
+
+        Both passes share the latent and the timestep and differ only in the text, so their rows are stacked (see
+        cfg_batching): every row-wise op (norms, projections, FFN) runs once on twice the rows, with one FSDP weight
+        gather instead of two. Returns (cond, uncond), each laid out like the output of inner_step.
+        """
+        temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
+
+        spatial_1BND = stack_passes(self.patch_embedding(spatial_1BNI))
+        spatial_1BND = self._run_blocks(
+            self.blocks,
+            spatial_1BND,
+            prompt_1BLP,
+            timestep_proj_1BTD,
+            N,
+            rope_cos_1HND,
+            rope_sin_1HND,
+            trans_mat,
+            negative_prompt_1BLP=negative_prompt_1BLP,
+        )
+        spatial_1BNI = self._project_out(spatial_1BND, temb_11BD, gather_output=False)
+        return self._split_cfg_output(spatial_1BNI, gather_output=gather_output)
+
+    def _project_out(self, spatial_1BND: ttnn.Tensor, temb_11BD: ttnn.Tensor, *, gather_output: bool) -> ttnn.Tensor:
+        """Output norm and projection of the last block's output (+ optional SP gather)."""
         scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
         shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)
 
@@ -713,70 +753,18 @@ class WanTransformer3DModel(Module):
 
         return spatial_1BNI
 
-    def inner_step_cfg(
-        self,
-        spatial_1BNI,
-        prompt_1BLP,
-        negative_prompt_1BLP,
-        rope_cos_1HND,
-        rope_sin_1HND,
-        trans_mat,
-        N,
-        timestep,
-        gather_output=True,
-    ):
-        """inner_step for the cond and uncond passes of classifier-free guidance at once.
-
-        Both passes share the latent and the timestep and differ only in the text, so the per-device spatial
-        rows of the two passes are stacked into one [1, 1, 2n, D] tensor: every row-wise op (norms, projections,
-        FFN) runs once on 2n rows, with one FSDP weight gather instead of two. The blocks get the prompts as a
-        (cond, uncond) pair; the attention splits the passes where it needs to. Returns (cond, uncond), each laid
-        out like the output of inner_step.
-        """
-        temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep)
-
-        spatial_1BND = self.patch_embedding(spatial_1BNI)
-        spatial_1BND = ttnn.concat([spatial_1BND, spatial_1BND], dim=2)
-
-        for block in self.blocks:
-            spatial_1BND = block(
-                spatial_1BND=spatial_1BND,
-                prompt_1BLP=prompt_1BLP,
-                negative_prompt_1BLP=negative_prompt_1BLP,
-                temb_1BTD=timestep_proj_1BTD,
-                N=N,
-                rope_cos=rope_cos_1HND,
-                rope_sin=rope_sin_1HND,
-                trans_mat=trans_mat,
-            )
-        scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
-        shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)
-
-        spatial_norm_1BND = self.norm_out(
-            spatial_1BND, dynamic_weight=(1 + scale_11BD), dynamic_bias=shift_11BD, dtype=ttnn.float32
-        )
-
-        if self.parallel_config.tensor_parallel.factor > 1:
-            spatial_norm_1BND = self.ccl_manager.all_gather_persistent_buffer(
-                spatial_norm_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
-            )
-
-        spatial_1BNI = self.proj_out(
-            spatial_norm_1BND, compute_kernel_config=self.hifi4_compute_kernel_config, dtype=self.output_dtype
-        )
-
-        n, c = spatial_1BNI.shape[2] // 2, spatial_1BNI.shape[3]
-        outputs = []
-        for start in (0, n):
-            output = ttnn.slice(spatial_1BNI, [0, 0, start, 0], [1, 1, start + n, c])
-            # Gather fp32 spatial output across sequence parallel devices (remains on device)
-            if gather_output:
-                output = self.ccl_manager.all_gather_persistent_buffer(
+    def _split_cfg_output(self, spatial_1BNI: ttnn.Tensor, *, gather_output: bool) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """(cond, uncond) of an output on the stacked rows of both CFG passes, each gathered across SP with
+        gather_output."""
+        outputs = split_passes(spatial_1BNI)
+        if gather_output:
+            outputs = tuple(
+                self.ccl_manager.all_gather_persistent_buffer(
                     output, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
                 )
-            outputs.append(output)
-
-        return outputs[0], outputs[1]
+                for output in outputs
+            )
+        return outputs
 
     def combined_step(
         self,
@@ -972,7 +960,7 @@ class WanTransformer3DModel(Module):
         spatial_0_1BND = self.patch_embedding(spatial_1BNI)
         spatial_1BND = self._run_blocks(
             self.blocks[:num_fn_blocks],
-            ttnn.concat([spatial_0_1BND, spatial_0_1BND], dim=2),
+            stack_passes(spatial_0_1BND),
             prompt_1BLP,
             timestep_proj_1BTD,
             N,
@@ -983,10 +971,8 @@ class WanTransformer3DModel(Module):
         )
         spatial_1BND = ttnn.clone(spatial_1BND)
 
-        n, d = spatial_0_1BND.shape[2], spatial_0_1BND.shape[3]
         fn_residuals_1BND, sums_1B12 = [], []
-        for start, prev_fn_residual_1BND in zip((0, n), prev_fn_residuals_1BND):
-            pass_1BND = ttnn.slice(spatial_1BND, [0, 0, start, 0], [1, 1, start + n, d])
+        for pass_1BND, prev_fn_residual_1BND in zip(split_passes(spatial_1BND), prev_fn_residuals_1BND):
             fn_residual_1BND = ttnn.subtract(pass_1BND, spatial_0_1BND)
             ttnn.deallocate(pass_1BND)
             if valid_11N1 is not None:
@@ -1060,28 +1046,7 @@ class WanTransformer3DModel(Module):
                 negative_prompt_1BLP=negative_prompt_1BLP,
             )
 
-        scale_shift_1BSD = self.scale_shift_table.data + temb_11BD
-        shift_11BD, scale_11BD = ttnn.chunk(scale_shift_1BSD, 2, -2)
-
-        spatial_norm_1BND = self.norm_out(
-            spatial_1BND, dynamic_weight=(1 + scale_11BD), dynamic_bias=shift_11BD, dtype=ttnn.float32
-        )
-
-        if self.parallel_config.tensor_parallel.factor > 1:
-            spatial_norm_1BND = self.ccl_manager.all_gather_persistent_buffer(
-                spatial_norm_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
-            )
-
-        spatial_1BNI = self.proj_out(
-            spatial_norm_1BND, compute_kernel_config=self.hifi4_compute_kernel_config, dtype=self.output_dtype
-        )
-
-        if gather_output:
-            spatial_1BNI = self.ccl_manager.all_gather_persistent_buffer(
-                spatial_1BNI, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
-            )
-
-        return spatial_1BNI
+        return self._project_out(spatial_1BND, temb_11BD, gather_output=gather_output)
 
     def cache_tail_cfg(
         self,
@@ -1112,18 +1077,7 @@ class WanTransformer3DModel(Module):
             gather_output=False,
             negative_prompt_1BLP=negative_prompt_1BLP,
         )
-
-        n, c = spatial_1BNI.shape[2] // 2, spatial_1BNI.shape[3]
-        outputs = []
-        for start in (0, n):
-            output = ttnn.slice(spatial_1BNI, [0, 0, start, 0], [1, 1, start + n, c])
-            if gather_output:
-                output = self.ccl_manager.all_gather_persistent_buffer(
-                    output, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
-                )
-            outputs.append(output)
-
-        return outputs[0], outputs[1]
+        return self._split_cfg_output(spatial_1BNI, gather_output=gather_output)
 
 
 class WanCheckpoint:
